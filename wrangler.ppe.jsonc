@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "watch-pr-ppe-vza-net",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-03",
+  "account_id": "a30acccb05b2f4058c1b13c249056b4c",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "triggers": {
+    "crons": ["*/1 * * * *"]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "HUB", "class_name": "WatchPrHub" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["WatchPrHub"] }
+  ],
+  "vars": {
+    "GITHUB_CLIENT_ID": "Iv23liHqSMjqjP7DdJKj",
+    "PUBLIC_BASE_URL": "https://watch-pr-ppe.vza.net"
+  }
+}

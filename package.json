@@ -1,0 +1,27 @@
+{
+  "name": "watch-pr",
+  "version": "0.1.0",
+  "description": "GitHub pull request lifecycle events over MCP Streamable HTTP",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "deploy:production": "wrangler deploy --config wrangler.production.jsonc",
+    "deploy:ppe": "wrangler deploy --config wrangler.ppe.jsonc"
+  },
+  "dependencies": {
+    "@cfworker/json-schema": "^4.1.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260903.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.128.0"
+  }
+}

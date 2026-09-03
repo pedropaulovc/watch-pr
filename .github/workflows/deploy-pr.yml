@@ -1,0 +1,102 @@
+name: Deploy pull request preview
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: read
+
+env:
+  PREVIEW_WORKER_NAME: watch-pr-pr-${{ github.event.pull_request.number }}
+
+concurrency:
+  group: deploy-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment:
+      name: cloudflare-ppe
+      url: https://watch-pr-pr-${{ github.event.pull_request.number }}.coal-lime.workers.dev
+    steps:
+      - name: Check out pull request source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          persist-credentials: false
+      - name: Check out trusted deployment files
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: deploy
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: deploy/package-lock.json
+      - name: Install trusted Wrangler
+        working-directory: deploy
+        run: npm ci --ignore-scripts
+      - name: Verify target account
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: test "$CLOUDFLARE_ACCOUNT_ID" = "a30acccb05b2f4058c1b13c249056b4c"
+      - name: Deploy preview Worker
+        working-directory: deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: ./node_modules/.bin/wrangler deploy ../source/src/index.ts --config wrangler.ppe.jsonc --name "$PREVIEW_WORKER_NAME"
+      - name: Configure preview Worker secrets
+        working-directory: deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}
+          GITHUB_WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GITHUB_CLIENT_SECRET" | ./node_modules/.bin/wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.ppe.jsonc --name "$PREVIEW_WORKER_NAME"
+          printf '%s' "$GITHUB_WEBHOOK_SECRET" | ./node_modules/.bin/wrangler secret put GITHUB_WEBHOOK_SECRET --config wrangler.ppe.jsonc --name "$PREVIEW_WORKER_NAME"
+
+  cleanup:
+    if: >-
+      github.event.action == 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: cloudflare-ppe
+    steps:
+      - name: Verify target account
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: test "$CLOUDFLARE_ACCOUNT_ID" = "a30acccb05b2f4058c1b13c249056b4c"
+      - name: Delete preview Worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          response_file="$(mktemp)"
+          status="$(curl --silent --show-error \
+            --output "$response_file" \
+            --write-out "%{http_code}" \
+            --request DELETE \
+            --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/services/${PREVIEW_WORKER_NAME}?force=true" \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header "Content-Type: application/json")"
+          if [[ "$status" == 2?? || "$status" == "404" ]]; then
+            rm -f "$response_file"
+            exit 0
+          fi
+          cat "$response_file"
+          rm -f "$response_file"
+          printf 'Cloudflare cleanup failed with HTTP %s\n' "$status" >&2
+          exit 1
