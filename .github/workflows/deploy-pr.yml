@@ -10,14 +10,43 @@ permissions:
 
 env:
   PREVIEW_WORKER_NAME: watch-pr-pr-${{ github.event.pull_request.number }}
-
+  PREVIEW_BASE_URL: https://watch-pr-pr-${{ github.event.pull_request.number }}.coal-lime.workers.dev
 concurrency:
   group: deploy-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  verify:
     if: >-
+      github.event.action != 'closed' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pull request source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+      - name: Install pull request dependencies
+        working-directory: source
+        run: npm ci --ignore-scripts
+      - name: Verify pull request tests
+        working-directory: source
+        run: npm test
+      - name: Verify pull request types
+        working-directory: source
+        run: npm run typecheck
+
+  deploy:
+    needs: verify
+    if: >-
+      needs.verify.result == 'success' &&
       github.event.action != 'closed' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -44,28 +73,42 @@ jobs:
           cache-dependency-path: deploy/package-lock.json
       - name: Install trusted Wrangler
         working-directory: deploy
-        run: npm ci --ignore-scripts
+        run: npm ci
       - name: Verify target account
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: test "$CLOUDFLARE_ACCOUNT_ID" = "a30acccb05b2f4058c1b13c249056b4c"
+      - name: Bundle verified Worker source
+        working-directory: deploy
+        run: ./node_modules/.bin/esbuild ../source/src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=worker.js
+      - name: Replace preview Worker service
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          response_file="$(mktemp)"
+          status="$(curl --silent --show-error \
+            --output "$response_file" \
+            --write-out "%{http_code}" \
+            --request DELETE \
+            --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/services/${PREVIEW_WORKER_NAME}?force=true" \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header "Content-Type: application/json")"
+          if [[ "$status" == 2?? || "$status" == "404" ]]; then
+            rm -f "$response_file"
+            exit 0
+          fi
+          cat "$response_file"
+          rm -f "$response_file"
+          printf 'Cloudflare preview replacement failed with HTTP %s\n' "$status" >&2
+          exit 1
       - name: Deploy preview Worker
         working-directory: deploy
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: ./node_modules/.bin/wrangler deploy ../source/src/index.ts --config wrangler.ppe.jsonc --name "$PREVIEW_WORKER_NAME"
-      - name: Configure preview Worker secrets
-        working-directory: deploy
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}
-          GITHUB_WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$GITHUB_CLIENT_SECRET" | ./node_modules/.bin/wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.ppe.jsonc --name "$PREVIEW_WORKER_NAME"
-          printf '%s' "$GITHUB_WEBHOOK_SECRET" | ./node_modules/.bin/wrangler secret put GITHUB_WEBHOOK_SECRET --config wrangler.ppe.jsonc --name "$PREVIEW_WORKER_NAME"
+        run: ./node_modules/.bin/wrangler deploy worker.js --config wrangler.ppe.jsonc --no-bundle --name "$PREVIEW_WORKER_NAME" --var "PUBLIC_BASE_URL:${PREVIEW_BASE_URL}"
 
   cleanup:
     if: >-
