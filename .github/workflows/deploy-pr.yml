@@ -78,6 +78,12 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: test "$CLOUDFLARE_ACCOUNT_ID" = "a30acccb05b2f4058c1b13c249056b4c"
+      - name: Link trusted bundling dependencies
+        working-directory: source
+        run: |
+          set -euo pipefail
+          rm -rf node_modules
+          ln -s ../deploy/node_modules node_modules
       - name: Bundle verified Worker source
         working-directory: deploy
         run: ./node_modules/.bin/esbuild ../source/src/index.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=worker.js
@@ -103,6 +109,7 @@ jobs:
           rm -f "$response_file"
           printf 'Cloudflare preview replacement failed with HTTP %s\n' "$status" >&2
           exit 1
+
       - name: Deploy preview Worker
         working-directory: deploy
         env:
