@@ -5,7 +5,7 @@ import { createWatchEvent, eventPullRequestNumbers, isSupportedGithubEvent, pars
 import { exchangeGithubCode, GithubApiError, githubUser, pullRequestSnapshot, refreshGithubToken } from "./github";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "./mcp";
 import type { GithubUser, OAuthClientRecord, OAuthCodeRecord, OAuthRequestRecord, SessionRecord, StoredWatchState, WatchEvent } from "./types";
-import { sessionStorageKey, watchStorageKey } from "./types";
+import { legacyWatchStorageKey, sessionStorageKey, watchStorageKey } from "./types";
 
 export interface Env {
   HUB: DurableObjectNamespace;
@@ -30,6 +30,7 @@ const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const OAUTH_TTL_SECONDS = 10 * 60;
 const MAX_EVENTS = 100;
 
+const MAX_STORAGE_BATCH_KEYS = 128;
 const MAX_WATCH_STATE_BYTES = 64 * 1024;
 const MAX_WATCH_CHUNK_CHARACTERS = 16_000;
 
@@ -37,7 +38,7 @@ interface WatchStateIndex {
   chunkCount: number;
 }
 
-type WatchStorage = Pick<DurableObjectStorage, "get" | "put" | "delete">;
+export type WatchStorage = Pick<DurableObjectStorage, "get" | "put" | "delete">;
 
 function emptyWatchState(): StoredWatchState {
   return { snapshot: null, events: [] };
@@ -65,13 +66,41 @@ function watchChunkKey(storageKey: string, index: number): string {
   return `${storageKey}:chunk:${index}`;
 }
 
-async function readStoredWatchState(storage: WatchStorage, storageKey: string): Promise<StoredWatchState> {
+function storageBatches<T>(values: readonly T[]): T[][] {
+  const batches: T[][] = [];
+  for (let index = 0; index < values.length; index += MAX_STORAGE_BATCH_KEYS) {
+    batches.push(values.slice(index, index + MAX_STORAGE_BATCH_KEYS));
+  }
+  return batches;
+}
+
+async function getStorageEntries<T>(storage: WatchStorage, keys: readonly string[]): Promise<Map<string, T>> {
+  const entries = new Map<string, T>();
+  for (const batch of storageBatches(keys)) {
+    const values = await storage.get<T>(batch);
+    for (const [key, value] of values) entries.set(key, value);
+  }
+  return entries;
+}
+
+async function putStorageEntries(storage: WatchStorage, entries: Record<string, unknown>): Promise<void> {
+  const values = Object.entries(entries);
+  for (const batch of storageBatches(values)) {
+    await storage.put(Object.fromEntries(batch));
+  }
+}
+
+async function deleteStorageKeys(storage: WatchStorage, keys: readonly string[]): Promise<void> {
+  for (const batch of storageBatches(keys)) await storage.delete(batch);
+}
+
+export async function readStoredWatchState(storage: WatchStorage, storageKey: string): Promise<StoredWatchState> {
   const stored = await storage.get<unknown>(storageKey);
   if (isStoredWatchState(stored)) return stored;
   if (!isWatchStateIndex(stored)) return emptyWatchState();
 
   const keys = Array.from({ length: stored.chunkCount }, (_, index) => watchChunkKey(storageKey, index));
-  const chunks = await storage.get<string>(keys);
+  const chunks = await getStorageEntries<string>(storage, keys);
   let encoded = "";
   for (const key of keys) {
     const chunk = chunks.get(key);
@@ -86,7 +115,7 @@ async function readStoredWatchState(storage: WatchStorage, storageKey: string): 
   }
 }
 
-async function writeStoredWatchState(storage: WatchStorage, storageKey: string, state: StoredWatchState): Promise<void> {
+export async function writeStoredWatchState(storage: WatchStorage, storageKey: string, state: StoredWatchState): Promise<void> {
   const encoded = JSON.stringify(state);
   const previous = await storage.get<unknown>(storageKey);
   const previousChunkCount = isWatchStateIndex(previous) ? previous.chunkCount : 0;
@@ -94,7 +123,10 @@ async function writeStoredWatchState(storage: WatchStorage, storageKey: string, 
   if (encodedBytes <= MAX_WATCH_STATE_BYTES) {
     await storage.put(storageKey, state);
     if (previousChunkCount > 0) {
-      await storage.delete(Array.from({ length: previousChunkCount }, (_, index) => watchChunkKey(storageKey, index)));
+      await deleteStorageKeys(
+        storage,
+        Array.from({ length: previousChunkCount }, (_, index) => watchChunkKey(storageKey, index)),
+      );
     }
     return;
   }
@@ -107,14 +139,17 @@ async function writeStoredWatchState(storage: WatchStorage, storageKey: string, 
       (index + 1) * MAX_WATCH_CHUNK_CHARACTERS,
     );
   }
-  await storage.put(chunks);
+  await putStorageEntries(storage, chunks);
   await storage.put(storageKey, { chunkCount } satisfies WatchStateIndex);
   if (previousChunkCount > chunkCount) {
-    await storage.delete(
+    await deleteStorageKeys(
+      storage,
       Array.from({ length: previousChunkCount - chunkCount }, (_, index) => watchChunkKey(storageKey, chunkCount + index)),
     );
   }
 }
+
+
 
 export class WatchPrHub {
   private readonly activeSessions = new Map<string, ActiveSession>();
@@ -268,7 +303,7 @@ export class WatchPrHub {
     active.watches.add(key);
     await this.persistSession(active);
     const state = await this.watchState(active.record.user.id, key);
-    this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, "watch");
+    this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "watch");
     if (!wasWatched) await this.notifyResourceListChanged(active);
     return {
       key,
@@ -312,7 +347,7 @@ export class WatchPrHub {
     const key = watchKey(repository, number);
     if (!active.watches.has(key)) throw new Error("pull request is not watched by this session");
     const state = await this.watchState(active.record.user.id, key);
-    if (!state.snapshot) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, "read");
+    if (!state.snapshot) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "read");
     return state;
   }
 
@@ -342,6 +377,11 @@ export class WatchPrHub {
     if (record.expiresAt <= now) {
       await this.state.storage.delete(key);
       return null;
+    }
+    await this.migrateLegacyWatchStates(record);
+    if (record.watchStorageVersion !== 1) {
+      record.watchStorageVersion = 1;
+      await this.state.storage.put(key, record);
     }
 
     const needsRefresh = Boolean(record.githubTokenExpiresAt && record.githubTokenExpiresAt <= now + 60_000);
@@ -373,6 +413,26 @@ export class WatchPrHub {
       return null;
     }
     return { token, record };
+  }
+  private async migrateLegacyWatchStates(record: SessionRecord): Promise<void> {
+    if (record.watchStorageVersion === 1) return;
+    for (const key of record.watches) {
+      let parsed;
+      try {
+        parsed = parseWatchKey(key);
+      } catch {
+        continue;
+      }
+      const legacyKey = legacyWatchStorageKey(parsed.repository, parsed.number);
+      const legacyStored = await this.state.storage.get<unknown>(legacyKey);
+      if (legacyStored === undefined) continue;
+      const scopedKey = watchStorageKey(record.user.id, parsed.repository, parsed.number);
+      const legacyState = await readStoredWatchState(this.state.storage, legacyKey);
+      await this.state.storage.transaction(async (storage) => {
+        if ((await storage.get<unknown>(scopedKey)) !== undefined) return;
+        await writeStoredWatchState(storage, scopedKey, legacyState);
+      });
+    }
   }
 
   private async handleGithubWebhook(request: Request): Promise<Response> {
@@ -419,20 +479,25 @@ export class WatchPrHub {
   private async processWebhook(eventName: string, deliveryId: string, payload: Record<string, unknown>): Promise<void> {
     await this.reconcileActiveSessions();
     const sessions = await this.sessionRecords();
-    const watchers = new Map<string, { userId: number; key: string; token: string }>();
-    const invalidTokens = new Set<string>();
-    const addWatchers = (token: string, record: SessionRecord): void => {
+    const watchers = new Map<string, { userId: number; key: string; githubToken: string; sessionToken: string }>();
+    const invalidSessionTokens = new Set<string>();
+    const addWatchers = (sessionToken: string, record: SessionRecord): void => {
       for (const key of record.watches) {
-        watchers.set(`${record.user.id}:${key}`, { userId: record.user.id, key, token });
+        watchers.set(`${record.user.id}:${key}`, {
+          userId: record.user.id,
+          key,
+          githubToken: record.githubAccessToken,
+          sessionToken,
+        });
       }
     };
-    for (const [token, record] of sessions) addWatchers(token, record);
+    for (const [sessionToken, record] of sessions) addWatchers(sessionToken, record);
     for (const active of this.activeSessions.values()) addWatchers(active.token, active.record);
 
     const repository = repositoryFromPayload(payload);
     if (!repository) return;
     for (const watcher of watchers.values()) {
-      if (invalidTokens.has(watcher.token)) continue;
+      if (invalidSessionTokens.has(watcher.sessionToken)) continue;
       let parsed;
       try {
         parsed = parseWatchKey(watcher.key);
@@ -446,11 +511,11 @@ export class WatchPrHub {
       const previous = await this.watchState(watcher.userId, watcher.key);
       let snapshot = previous.snapshot;
       try {
-        snapshot = await pullRequestSnapshot(watcher.token, parsed.repository, parsed.number);
+        snapshot = await pullRequestSnapshot(watcher.githubToken, parsed.repository, parsed.number);
       } catch (error) {
         if (isGithubAuthorizationError(error)) {
-          invalidTokens.add(watcher.token);
-          await this.invalidateSession(watcher.token);
+          invalidSessionTokens.add(watcher.sessionToken);
+          await this.invalidateSession(watcher.sessionToken);
           continue;
         }
         snapshot = previous.snapshot;
@@ -470,24 +535,30 @@ export class WatchPrHub {
     }
   }
 
-  private scheduleRefresh(userId: number, key: string, token: string, reason: string): void {
+  private scheduleRefresh(userId: number, key: string, githubToken: string, sessionToken: string, reason: string): void {
     const refreshKey = `${userId}:${key}`;
     if (this.refreshes.has(refreshKey)) return;
     this.refreshes.add(refreshKey);
     this.state.waitUntil(
-      this.refreshAndPublish(userId, key, token, reason).finally(() => {
+      this.refreshAndPublish(userId, key, githubToken, sessionToken, reason).finally(() => {
         this.refreshes.delete(refreshKey);
       }),
     );
   }
 
-  private async refreshAndPublish(userId: number, key: string, token: string, reason: string): Promise<void> {
+  private async refreshAndPublish(
+    userId: number,
+    key: string,
+    githubToken: string,
+    sessionToken: string,
+    reason: string,
+  ): Promise<void> {
     const parsed = parseWatchKey(key);
     let snapshot;
     try {
-      snapshot = await pullRequestSnapshot(token, parsed.repository, parsed.number);
+      snapshot = await pullRequestSnapshot(githubToken, parsed.repository, parsed.number);
     } catch (error) {
-      if (isGithubAuthorizationError(error)) await this.invalidateSession(token);
+      if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken);
       return;
     }
     const previous = await this.watchState(userId, key);
@@ -510,8 +581,8 @@ export class WatchPrHub {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     await this.reconcileActiveSessions();
     const sessions = await this.sessionRecords();
-    for (const record of sessions.values()) {
-      for (const key of record.watches) this.scheduleRefresh(record.user.id, key, record.githubAccessToken, "poll");
+    for (const [sessionToken, record] of sessions) {
+      for (const key of record.watches) this.scheduleRefresh(record.user.id, key, record.githubAccessToken, sessionToken, "poll");
     }
     return this.accepted({ accepted: true, scheduled: true });
   }
@@ -726,6 +797,7 @@ export class WatchPrHub {
       createdAt: Date.now(),
       expiresAt: Date.now() + sessionTtl * 1000,
       watches: [],
+      watchStorageVersion: 1,
     };
     await this.state.storage.put(sessionStorageKey(sessionToken), session);
     return this.json({ access_token: sessionToken, token_type: "Bearer", expires_in: sessionTtl, scope: "watch-pr" }, 200, { "access-control-allow-origin": "*" });

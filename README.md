@@ -40,6 +40,7 @@ The environment files intentionally pin both the account ID and Worker name:
 | PPE | `a30acccb05b2f4058c1b13c249056b4c` (`pedro@vezza.com.br`) | `watch-pr-ppe-vza-net` | `wrangler.ppe.jsonc` |
 
 Both Workers use the `WatchPrHub` SQLite Durable Object and a one-minute cron trigger. Production receives the GitHub webhook; PPE intentionally has no webhook secret and uses the scheduled refresh path.
+When an existing session first resumes, its predecessor `watch:<repository>:<number>` records are copied to `watch:<user-id>:<repository>:<number>` using that session's GitHub user ID; legacy records remain intact during the migration.
 
 Set the runtime secrets before the first authenticated request:
 
