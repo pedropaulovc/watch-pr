@@ -27,18 +27,40 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: test "$CLOUDFLARE_ACCOUNT_ID" = "a30acccb05b2f4058c1b13c249056b4c"
+      - name: Remove any PPE webhook secret
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          api_token="${CLOUDFLARE_API_TOKEN//$'\r'/}"
+          api_token="${api_token//$'\n'/}"
+          response_file="$(mktemp)"
+          status="$(curl --silent --show-error \
+            --output "$response_file" \
+            --write-out "%{http_code}" \
+            --request DELETE \
+            --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/watch-pr-ppe-vza-net/secrets/GITHUB_WEBHOOK_SECRET" \
+            --header "Authorization: Bearer ${api_token}" \
+            --header "Content-Type: application/json")"
+          if jq -e '(.success == true) or (([.errors[]?.code] | index(10056)) != null)' "$response_file" >/dev/null; then
+            rm -f "$response_file"
+            exit 0
+          fi
+          cat "$response_file"
+          rm -f "$response_file"
+          printf 'PPE webhook-secret cleanup failed with HTTP %s\n' "$status" >&2
+          exit 1
       - name: Deploy PPE Worker
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: npm run deploy:ppe
-      - name: Configure PPE Worker secrets
+      - name: Configure PPE Worker client secret
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          GITHUB_CLIENT_SECRET: ${{ secrets.GITHUB_CLIENT_SECRET }}
-          GITHUB_WEBHOOK_SECRET: ${{ secrets.GITHUB_WEBHOOK_SECRET }}
+          WATCH_PR_GITHUB_CLIENT_SECRET: ${{ secrets.WATCH_PR_GITHUB_CLIENT_SECRET }}
         run: |
           set -euo pipefail
-          printf '%s' "$GITHUB_CLIENT_SECRET" | npx wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.ppe.jsonc
-          printf '%s' "$GITHUB_WEBHOOK_SECRET" | npx wrangler secret put GITHUB_WEBHOOK_SECRET --config wrangler.ppe.jsonc
+          printf '%s' "$WATCH_PR_GITHUB_CLIENT_SECRET" | npx wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.ppe.jsonc

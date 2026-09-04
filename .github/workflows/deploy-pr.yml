@@ -93,13 +93,15 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           set -euo pipefail
+          api_token="${CLOUDFLARE_API_TOKEN//$'\r'/}"
+          api_token="${api_token//$'\n'/}"
           response_file="$(mktemp)"
           status="$(curl --silent --show-error \
             --output "$response_file" \
             --write-out "%{http_code}" \
             --request DELETE \
             --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/services/${PREVIEW_WORKER_NAME}?force=true" \
-            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header "Authorization: Bearer ${api_token}" \
             --header "Content-Type: application/json")"
           if [[ "$status" == 2?? || "$status" == "404" ]]; then
             rm -f "$response_file"
@@ -134,13 +136,15 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           set -euo pipefail
+          api_token="${CLOUDFLARE_API_TOKEN//$'\r'/}"
+          api_token="${api_token//$'\n'/}"
           response_file="$(mktemp)"
           status="$(curl --silent --show-error \
             --output "$response_file" \
             --write-out "%{http_code}" \
             --request DELETE \
             --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/services/${PREVIEW_WORKER_NAME}?force=true" \
-            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            --header "Authorization: Bearer ${api_token}" \
             --header "Content-Type: application/json")"
           if [[ "$status" == 2?? || "$status" == "404" ]]; then
             rm -f "$response_file"
