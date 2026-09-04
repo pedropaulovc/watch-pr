@@ -2,6 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "watch-pr-ppe-vza-net",
   "main": "src/index.ts",
+  "find_additional_modules": false,
   "compatibility_date": "2026-09-03",
   "account_id": "a30acccb05b2f4058c1b13c249056b4c",
   "workers_dev": true,
