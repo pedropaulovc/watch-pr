@@ -283,7 +283,7 @@ export async function refreshGithubToken(
     }),
   });
   const text = await response.text();
-  if (!response.ok) throw new Error(`GitHub OAuth refresh failed with HTTP ${response.status}`);
+  if (!response.ok) throw new GithubApiError(response.status, text, "https://github.com/login/oauth/access_token");
   const payload = JSON.parse(text) as GithubRecord;
   const accessToken = stringValue(payload, "access_token");
   if (!accessToken) throw new Error("GitHub OAuth refresh did not return an access token");

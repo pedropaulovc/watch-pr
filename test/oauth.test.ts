@@ -226,7 +226,7 @@ describe("OAuth broker", () => {
     await expect(storage.get(legacyKey)).resolves.toEqual(legacyState);
   });
 
-  it("invalidates the bearer session when GitHub refresh is unauthorized", async () => {
+  it("invalidates the bearer session when GitHub API access is unauthorized", async () => {
     const { hub, storage, pending } = hubFixture();
     const sessionToken = "session-token";
     const key = "owner/repo#7";
@@ -250,6 +250,39 @@ describe("OAuth broker", () => {
     } finally {
       vi.stubGlobal("fetch", originalFetch);
     }
+    await expect(storage.get(sessionStorageKey(sessionToken))).resolves.toBeUndefined();
+  });
+
+  it("invalidates the bearer session when GitHub refresh is unauthorized", async () => {
+    const { hub, storage } = hubFixture();
+    const sessionToken = "session-token";
+    await storage.put(sessionStorageKey(sessionToken), {
+      githubAccessToken: "expired-access-token",
+      githubRefreshToken: "revoked-refresh-token",
+      githubTokenExpiresAt: Date.now() - 1_000,
+      user: { login: "pedropaulovc", id: 42, name: "Pedro", avatarUrl: null, htmlUrl: "https://github.com/pedropaulovc" },
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+      watches: [],
+      watchStorageVersion: 1,
+    } satisfies SessionRecord);
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async () => new Response("revoked refresh", { status: 401 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      type HubSessionApi = {
+        sessionForToken(token: string): Promise<{ token: string; record: SessionRecord } | null>;
+      };
+      const internals = hub as unknown as HubSessionApi;
+      await expect(internals.sessionForToken(sessionToken)).resolves.toBeNull();
+    } finally {
+      vi.stubGlobal("fetch", originalFetch);
+    }
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://github.com/login/oauth/access_token",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     await expect(storage.get(sessionStorageKey(sessionToken))).resolves.toBeUndefined();
   });
 });
