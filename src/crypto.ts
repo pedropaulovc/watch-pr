@@ -44,9 +44,9 @@ export async function constantTimeEqual(left: string, right: string): Promise<bo
 export async function verifyGithubSignature(
   body: string,
   signatureHeader: string | null,
-  secret: string,
+  secret: string | undefined,
 ): Promise<boolean> {
-  if (!signatureHeader?.startsWith("sha256=")) return false;
+  if (!secret || !signatureHeader?.startsWith("sha256=")) return false;
   const expected = `sha256=${await hmacSha256Hex(secret, body)}`;
   return constantTimeEqual(expected, signatureHeader);
 }
