@@ -22,13 +22,11 @@ Snapshots include PR lifecycle and mergeability, base/head refs, checks and comm
 
 ## GitHub integration
 
-Configure the `watch-pr` GitHub App at <https://github.com/settings/apps/watch-pr>:
-
-- OAuth callback URL: `https://watch-pr.vza.net/oauth/callback`.
+- OAuth callback URLs: `https://watch-pr.vza.net/oauth/callback` and `https://watch-pr-ppe.vza.net/oauth/callback`.
 - Webhook URL: `https://watch-pr.vza.net/webhooks/github`.
-- Webhook secret: store the same value as the Cloudflare `GITHUB_WEBHOOK_SECRET` secret.
-- User permissions: read-only access to repository metadata, pull requests, issues, checks, and commit statuses.
-- Subscribe to `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `status`, `push`, `deployment_status`, `merge_group`, and `commit_comment`.
+- Webhook secret: store it as the production Cloudflare `GITHUB_WEBHOOK_SECRET` secret. The GitHub App has one webhook endpoint; PPE intentionally relies on its one-minute refresh instead of receiving the production webhook secret.
+- User permissions: read-only access to repository metadata, pull requests, issues, checks, commit statuses, deployments, and merge queues.
+- Subscribe to `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `status`, `push`, `deployment`, `deployment_status`, `merge_group`, and `commit_comment`.
 
 The webhook handler verifies `X-Hub-Signature-256` and deduplicates `X-GitHub-Delivery` IDs. GitHub has no reaction-specific webhook, so the scheduled refresh is required for reaction parity.
 
@@ -41,22 +39,26 @@ The environment files intentionally pin both the account ID and Worker name:
 | Production | `82fd9c2460271241c04b2401f16108db` (`pedro@vza.net`) | `watch-pr-vza-net-prod` | `wrangler.production.jsonc` |
 | PPE | `a30acccb05b2f4058c1b13c249056b4c` (`pedro@vezza.com.br`) | `watch-pr-ppe-vza-net` | `wrangler.ppe.jsonc` |
 
-Both Workers use the `WatchPrHub` SQLite Durable Object and a one-minute cron trigger. Set the runtime secrets before the first authenticated request:
+Both Workers use the `WatchPrHub` SQLite Durable Object and a one-minute cron trigger. Production receives the GitHub webhook; PPE intentionally has no webhook secret and uses the scheduled refresh path.
+When an existing session first resumes, its predecessor `watch:<repository>:<number>` records are copied to `watch:<user-id>:<repository>:<number>` using that session's GitHub user ID; legacy records remain intact during the migration.
+
+Set the runtime secrets before the first authenticated request:
 
 ```sh
 npx wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.production.jsonc
 npx wrangler secret put GITHUB_WEBHOOK_SECRET --config wrangler.production.jsonc
 npx wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.ppe.jsonc
-npx wrangler secret put GITHUB_WEBHOOK_SECRET --config wrangler.ppe.jsonc
 ```
 
 The GitHub Actions workflows expect `cloudflare-production` and `cloudflare-ppe` environments with:
 
 - variable `CLOUDFLARE_ACCOUNT_ID` matching the pinned account;
 - secret `CLOUDFLARE_API_TOKEN` scoped to that account's Workers deployment;
-- secrets `GITHUB_CLIENT_SECRET` and `GITHUB_WEBHOOK_SECRET`.
+- production Actions secrets `WATCH_PR_GITHUB_CLIENT_SECRET` and `WATCH_PR_GITHUB_WEBHOOK_SECRET`;
+- PPE Actions secret `WATCH_PR_GITHUB_CLIENT_SECRET`. The workflows map these names to the Worker runtime secrets `GITHUB_CLIENT_SECRET` and `GITHUB_WEBHOOK_SECRET`; GitHub reserves the `GITHUB_` prefix for built-in variables.
 
-`deploy-production.yml` deploys on every push to `main`. `deploy-ppe.yml` is manual. `deploy-pr.yml` provisions `watch-pr-pr-N` in the PPE account for same-repository pull requests and deletes it when the PR closes. The PR workflow checks out the deployment files from `main` before invoking Wrangler and never deploys a fork with privileged credentials.
+`deploy-production.yml` deploys on every push to `main`. `deploy-ppe.yml` is manual. `deploy-pr.yml` verifies same-repository pull request tests and types without Cloudflare credentials, then replaces and provisions `watch-pr-pr-N` in the PPE account for the verified source using Wrangler and configuration checked out from `main`; replacing the service removes any legacy preview secrets. Preview Workers receive only the public configuration and no runtime secrets. Fork PRs are skipped and never receive privileged credentials.
+The preview bundle is built before the Cloudflare API token is exposed to the upload step; pull request source cannot read deployment credentials during bundling.
 
 ## Local checks
 

@@ -15,6 +15,8 @@ export interface SessionRecord {
   createdAt: number;
   expiresAt: number;
   watches: string[];
+  subscriptions?: string[];
+  watchStorageVersion?: 1;
 }
 export interface OAuthClientRecord {
   clientId: string;
@@ -141,6 +143,9 @@ export function sessionStorageKey(token: string): string {
   return `session:${token}`;
 }
 
-export function watchStorageKey(repository: string, number: number): string {
+export function watchStorageKey(userId: number, repository: string, number: number): string {
+  return `watch:${userId}:${repository}:${number}`;
+}
+export function legacyWatchStorageKey(repository: string, number: number): string {
   return `watch:${repository}:${number}`;
 }

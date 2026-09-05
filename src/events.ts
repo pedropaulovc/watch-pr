@@ -4,6 +4,7 @@ export const SUPPORTED_GITHUB_EVENTS = [
   "check_run",
   "check_suite",
   "commit_comment",
+  "deployment",
   "deployment_status",
   "issue_comment",
   "merge_group",
@@ -81,9 +82,11 @@ function repositoryName(payload: Record<string, unknown>): string | null {
   }
 }
 
-function addNumber(numbers: Set<number>, value: unknown, key = "number"): void {
+function addNumber(numbers: Set<number>, value: unknown, key = "number"): boolean {
   const number = nestedNumber(value, key);
-  if (number !== null) numbers.add(number);
+  if (number === null) return false;
+  numbers.add(number);
+  return true;
 }
 
 export function eventPullRequestNumbers(
@@ -93,42 +96,42 @@ export function eventPullRequestNumbers(
 ): number[] {
   const repository = repositoryName(payload);
   if (!repository) return [];
+  const watched = [...watchedKeys];
   const numbers = new Set<number>();
-
-  addNumber(numbers, payload.pull_request);
+  let hasExplicitTargets = false;
+  hasExplicitTargets = addNumber(numbers, payload.pull_request) || hasExplicitTargets;
   if (eventName !== "issue_comment" || isPullRequestIssue(payload.issue)) {
-    addNumber(numbers, payload.issue);
+    hasExplicitTargets = addNumber(numbers, payload.issue) || hasExplicitTargets;
   }
-  addNumber(numbers, payload.merge_group);
-
-  for (const field of ["check_run", "check_suite", "deployment_status", "status"]) {
+  hasExplicitTargets = addNumber(numbers, payload.merge_group) || hasExplicitTargets;
+  for (const field of ["check_run", "check_suite", "deployment", "deployment_status", "merge_group", "status"]) {
     const value = payload[field];
     if (!value || typeof value !== "object") continue;
     const pullRequests = (value as Record<string, unknown>).pull_requests;
     if (!Array.isArray(pullRequests)) continue;
+    hasExplicitTargets = true;
     for (const pullRequest of pullRequests) addNumber(numbers, pullRequest);
   }
 
-  const matching = [...numbers].filter((number) => watchedKeysIterator(watchedKeys, repository, number));
-  if (matching.length > 0) return matching.sort((left, right) => left - right);
+  const matching = [...numbers].filter((number) => watchedKeysIterator(watched, repository, number));
+  if (matching.length > 0 || hasExplicitTargets) return matching.sort((left, right) => left - right);
 
-  // Status/check and push deliveries can omit pull_requests. Refresh every watched
-  // PR in the repository so mergeability and reaction changes are not lost.
-  if (["check_run", "check_suite", "commit_comment", "deployment_status", "merge_group", "push", "status"].includes(eventName)) {
-    return [...watchedKeys]
-      .map((key) => {
-        try {
-          return parseWatchKey(key);
-        } catch {
-          return null;
-        }
-      })
-      .filter((value): value is { repository: string; number: number } => value?.repository === repository)
-      .map((value) => value.number)
-      .sort((left, right) => left - right);
+  // Status/check/deployment/push deliveries can omit pull_requests. Refresh
+  // every watched PR in the repository so mergeability and reaction changes are not lost.
+  if (["check_run", "check_suite", "commit_comment", "deployment", "deployment_status", "merge_group", "push", "status"].includes(eventName)) {
+    const repositoryNumbers = new Set<number>();
+    for (const key of watched) {
+      try {
+        const parsed = parseWatchKey(key);
+        if (parsed.repository === repository) repositoryNumbers.add(parsed.number);
+      } catch {
+        // Ignore malformed watch keys from other callers.
+      }
+    }
+    return [...repositoryNumbers].sort((left, right) => left - right);
   }
 
-  return matching.sort((left, right) => left - right);
+  return matching;
 }
 
 function watchedKeysIterator(watchedKeys: Iterable<string>, repository: string, number: number): boolean {
@@ -147,11 +150,18 @@ export function snapshotChanges(
 ): string[] {
   if (!previous) return ["initial_snapshot"];
   const changes: string[] = [];
-  if (previous.state !== current.state || previous.draft !== current.draft || previous.merged !== current.merged) changes.push("lifecycle");
+  if (
+    previous.state !== current.state ||
+    previous.draft !== current.draft ||
+    previous.merged !== current.merged ||
+    previous.mergedAt !== current.mergedAt
+  ) changes.push("lifecycle");
+  if (previous.title !== current.title || previous.body !== current.body) changes.push("description");
   if (
     previous.mergeable !== current.mergeable ||
     previous.mergeableState !== current.mergeableState ||
     previous.baseRefName !== current.baseRefName ||
+    previous.headRefName !== current.headRefName ||
     previous.headSha !== current.headSha
   ) changes.push("mergeability");
   if (JSON.stringify(previous.comments) !== JSON.stringify(current.comments)) changes.push("comments");

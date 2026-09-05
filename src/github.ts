@@ -55,7 +55,7 @@ export async function githubJson<T>(
   return JSON.parse(text) as T;
 }
 
-async function githubPaginated<T>(token: string, path: string): Promise<T[]> {
+async function githubPaginated<T>(token: string, path: string, field?: string): Promise<T[]> {
   const values: T[] = [];
   let nextUrl: string | null = `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
 
@@ -63,8 +63,15 @@ async function githubPaginated<T>(token: string, path: string): Promise<T[]> {
     const response = await githubResponse(token, nextUrl);
     const text = await response.text();
     if (!response.ok) throw new GithubApiError(response.status, text, path);
-    const page = text ? (JSON.parse(text) as T[]) : [];
-    if (!Array.isArray(page)) throw new Error(`GitHub returned a non-array page for ${path}`);
+    const payload: unknown = text ? JSON.parse(text) : [];
+    const page = field
+      ? payload && typeof payload === "object" && Array.isArray((payload as GithubRecord)[field])
+        ? (payload as GithubRecord)[field] as T[]
+        : null
+      : Array.isArray(payload)
+        ? payload as T[]
+        : null;
+    if (!page) throw new Error(`GitHub returned a non-array page for ${path}`);
     values.push(...page);
     nextUrl = nextLink(response.headers.get("link"));
   }
@@ -276,7 +283,7 @@ export async function refreshGithubToken(
     }),
   });
   const text = await response.text();
-  if (!response.ok) throw new Error(`GitHub OAuth refresh failed with HTTP ${response.status}`);
+  if (!response.ok) throw new GithubApiError(response.status, text, "https://github.com/login/oauth/access_token");
   const payload = JSON.parse(text) as GithubRecord;
   const accessToken = stringValue(payload, "access_token");
   if (!accessToken) throw new Error("GitHub OAuth refresh did not return an access token");
@@ -300,15 +307,14 @@ export async function pullRequestSnapshot(
   const head = pull.head && typeof pull.head === "object" ? pull.head as GithubRecord : {};
   const base = pull.base && typeof pull.base === "object" ? pull.base as GithubRecord : {};
   const headSha = stringValue(head, "sha");
-  const [comments, reviews, reviewComments, checkRunPayload, statuses, threads] = await Promise.all([
+  const [comments, reviews, reviewComments, checkRuns, statuses, threads] = await Promise.all([
     githubPaginated<GithubRecord>(token, `/repos/${repository}/issues/${number}/comments`),
     githubPaginated<GithubRecord>(token, `/repos/${repository}/pulls/${number}/reviews`),
     githubPaginated<GithubRecord>(token, `/repos/${repository}/pulls/${number}/comments`),
-    headSha ? githubJson<GithubRecord>(token, `/repos/${repository}/commits/${headSha}/check-runs`) : Promise.resolve({ check_runs: [] }),
+    headSha ? githubPaginated<GithubRecord>(token, `/repos/${repository}/commits/${headSha}/check-runs`, "check_runs") : Promise.resolve([]),
     headSha ? githubPaginated<GithubRecord>(token, `/repos/${repository}/commits/${headSha}/statuses`) : Promise.resolve([]),
     reviewThreads(token, repository, number),
   ]);
-  const checkRuns = Array.isArray(checkRunPayload.check_runs) ? checkRunPayload.check_runs : [];
 
   return {
     repository,

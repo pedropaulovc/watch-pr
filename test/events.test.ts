@@ -61,11 +61,48 @@ describe("watch-pr event contracts", () => {
     expect(eventPullRequestNumbers("commit_comment", payload, watched)).toEqual([2, 7]);
     expect(eventPullRequestNumbers("merge_group", payload, watched)).toEqual([2, 7]);
   });
+  it("routes linked webhook deliveries and filters explicit PR associations", () => {
+    const watched = ["owner/repo#2", "owner/repo#7", "other/repo#9"];
+    const directPayload = { repository: { full_name: "owner/repo" }, pull_request: { number: 7 } };
+    for (const eventName of ["pull_request", "pull_request_review", "pull_request_review_comment", "pull_request_review_thread"]) {
+      expect(eventPullRequestNumbers(eventName, directPayload, watched)).toEqual([7]);
+    }
+    expect(eventPullRequestNumbers("check_run", {
+      repository: { full_name: "owner/repo" },
+      check_run: { pull_requests: [{ number: 7 }, { number: 99 }] },
+    }, watched)).toEqual([7]);
+    expect(eventPullRequestNumbers("check_suite", {
+      repository: { full_name: "owner/repo" },
+      check_suite: { pull_requests: [{ number: 2 }] },
+    }, watched)).toEqual([2]);
+    expect(eventPullRequestNumbers("status", {
+      repository: { full_name: "owner/repo" },
+      status: { pull_requests: [{ number: 7 }] },
+    }, watched)).toEqual([7]);
+    expect(eventPullRequestNumbers("deployment_status", {
+      repository: { full_name: "owner/repo" },
+      deployment_status: { pull_requests: [{ number: 2 }] },
+    }, watched)).toEqual([2]);
+    expect(eventPullRequestNumbers("deployment", {
+      repository: { full_name: "owner/repo" },
+      deployment: { pull_requests: [{ number: 7 }] },
+    }, watched)).toEqual([7]);
+    expect(eventPullRequestNumbers("check_run", {
+      repository: { full_name: "owner/repo" },
+      check_run: { pull_requests: [] },
+    }, watched)).toEqual([]);
+    expect(eventPullRequestNumbers("push", { repository: { full_name: "owner/repo" } }, watched)).toEqual([2, 7]);
+    expect(eventPullRequestNumbers("merge_group", { repository: { full_name: "owner/repo" } }, watched)).toEqual([2, 7]);
+  });
 
-  it("detects mergeability, review, check, and reaction changes", () => {
+  it("detects description, mergeability, review, check, and reaction changes", () => {
     const before = snapshot();
-    const after = snapshot({ mergeable: false, mergeableState: "dirty", bodyReactions: { eyes: 1 }, checks: [{ id: 1, name: "CI", status: "completed", conclusion: "failure", completedAt: "now", startedAt: "then", url: null, kind: "check_run" }] });
-    expect(snapshotChanges(before, after)).toEqual(["mergeability", "checks", "reactions"]);
+    const after = snapshot({ body: "updated", mergeable: false, mergeableState: "dirty", bodyReactions: { eyes: 1 }, checks: [{ id: 1, name: "CI", status: "completed", conclusion: "failure", completedAt: "now", startedAt: "then", url: null, kind: "check_run" }] });
+    expect(snapshotChanges(before, after)).toEqual(["description", "mergeability", "checks", "reactions"]);
+  });
+
+  it("detects merged timestamp changes as lifecycle changes", () => {
+    expect(snapshotChanges(snapshot(), snapshot({ merged: true, mergedAt: "2026-09-03T01:00:00.000Z" }))).toEqual(["lifecycle"]);
   });
 
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {
