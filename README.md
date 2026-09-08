@@ -15,7 +15,7 @@ Tools:
 - `list_watched_prs` — list the current account's subscriptions.
 - `get_pr` — read the latest durable pull request snapshot.
 - `list_pr_events` — read up to 100 recent webhook/snapshot events.
-- Tool outputs default to `mode: "brief"`, which returns newline-delimited watcher-style lifecycle lines (`check`, `review`, `comments`, `review-comments`, `reaction`, and feedback summaries). Pass `mode: "full"` to `get_pr` for the complete current snapshot or to `list_pr_events` for event payloads. Resource reads remain full stored records.
+- Tool outputs default to `mode: "brief"`, which returns newline-delimited watcher-style lifecycle lines for PR state, head revision, mergeability, checks, reviews, comments, reactions, and feedback. Pass `mode: "full"` to `get_pr` for the complete current snapshot or to `list_pr_events` for event payloads. Resource reads remain full stored records.
 
 Each watched PR is also available as a resource at `watch-pr://owner/repository/pull/NUMBER`. A webhook or changed snapshot sends the standard `notifications/resources/updated` notification; clients can then call `resources/read`. The server also sends a compact event summary through `notifications/message` for clients that support logging notifications.
 

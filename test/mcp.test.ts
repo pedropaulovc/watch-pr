@@ -96,7 +96,9 @@ const event: WatchEvent = {
 
 const state: StoredWatchState = { snapshot, events: [event] };
 
-function context(): McpSessionContext {
+function context(currentSnapshot: PullRequestSnapshot = snapshot): McpSessionContext {
+  const currentRegistration = { ...registration, snapshot: currentSnapshot };
+  const currentState = { ...state, snapshot: currentSnapshot };
   return {
     user: {
       login: "pedropaulovc",
@@ -106,21 +108,25 @@ function context(): McpSessionContext {
       htmlUrl: "https://github.com/pedropaulovc",
     },
     watches: new Set([registration.key]),
-    watch: async () => registration,
+    watch: async () => currentRegistration,
     unwatch: async () => true,
-    listWatches: async () => [registration],
-    readWatch: async () => state,
+    listWatches: async () => [currentRegistration],
+    readWatch: async () => currentState,
     subscribe: async () => undefined,
     unsubscribe: async () => undefined,
   };
 }
 
-async function callTool(name: string, arguments_: Record<string, unknown>): Promise<string> {
+async function callTool(
+  name: string,
+  arguments_: Record<string, unknown>,
+  currentSnapshot: PullRequestSnapshot = snapshot,
+): Promise<string> {
   const transport = new WebStandardStreamableHTTPServerTransport({
     enableJsonResponse: true,
     sessionIdGenerator: () => "test-session",
   });
-  const server = createMcpServer(context());
+  const server = createMcpServer(context(currentSnapshot));
   await server.connect(transport);
   const request = (body: unknown, sessionId?: string) => transport.handleRequest(new Request("https://watch-pr.test/mcp", {
     method: "POST",
@@ -162,6 +168,10 @@ async function callTool(name: string, arguments_: Record<string, unknown>): Prom
 describe("MCP output modes", () => {
   it("defaults to watcher-style brief output and preserves full snapshots", async () => {
     const brief = await callTool("get_pr", { repository: "owner/repo", number: 7 });
+    expect(brief).toContain("PR 7: OPEN");
+    expect(brief).toContain("head: feature@abc");
+    expect(brief).toContain("mergeable: no (DIRTY)");
+    expect(brief).toContain("reviews: 1");
     expect(brief).toContain("check CI: fail @2026-09-05T00:00:00.000Z");
     expect(brief).toContain("check Lint: pass @2026-09-05T00:00:00.000Z");
     expect(brief).toContain("rebase: DIRTY");
@@ -175,6 +185,13 @@ describe("MCP output modes", () => {
 
     const full = await callTool("get_pr", { repository: "owner/repo", number: 7, mode: "full" });
     expect(JSON.parse(full)).toEqual(snapshot);
+
+    const unknown = await callTool(
+      "get_pr",
+      { repository: "owner/repo", number: 7 },
+      { ...snapshot, mergeable: null, mergeableState: "unknown" },
+    );
+    expect(unknown).toContain("mergeable: unknown (UNKNOWN)");
   });
 
   it("formats registrations, unwatch results, and event history briefly", async () => {
