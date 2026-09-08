@@ -162,6 +162,10 @@ async function callTool(name: string, arguments_: Record<string, unknown>): Prom
 describe("MCP output modes", () => {
   it("defaults to watcher-style brief output and preserves full snapshots", async () => {
     const brief = await callTool("get_pr", { repository: "owner/repo", number: 7 });
+    expect(brief).toContain("PR 7: OPEN");
+    expect(brief).toContain("head: feature@abc");
+    expect(brief).toContain("mergeable: no (DIRTY)");
+    expect(brief).toContain("reviews: 1");
     expect(brief).toContain("check CI: fail @2026-09-05T00:00:00.000Z");
     expect(brief).toContain("check Lint: pass @2026-09-05T00:00:00.000Z");
     expect(brief).toContain("rebase: DIRTY");

@@ -128,17 +128,20 @@ function feedbackLines(threads: PullRequestThread[], comments: PullRequestCommen
 function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): string[] {
   const comments = snapshot.comments.filter((comment) => comment.author !== login);
   const reviewComments = snapshot.reviewComments.filter((comment) => comment.author !== login);
+  const reviews = snapshot.reviews.filter((review) => review.author !== login);
+  const mergeableState = snapshot.mergeableState?.toUpperCase();
   const lines = [
+    `PR ${snapshot.number}: ${snapshot.state.toUpperCase()}${snapshot.draft ? " DRAFT" : ""}`,
+    `head: ${snapshot.headRefName}@${snapshot.headSha}`,
+    `mergeable: ${snapshot.mergeable ? "yes" : "no"}${mergeableState ? ` (${mergeableState})` : ""}`,
     ...checkLines(snapshot.checks),
     ...reactionLines(snapshot.bodyReactions, "reaction"),
     ...commentReactionLines(comments),
-    ...snapshot.reviews
-      .filter((review) => review.author !== login)
-      .map((review) => `review ${review.author ?? "unknown"}: ${review.state}${review.submittedAt ? ` @${review.submittedAt}` : ""}`),
+    ...reviews.map((review) => `review ${review.author ?? "unknown"}: ${review.state}${review.submittedAt ? ` @${review.submittedAt}` : ""}`),
+    `reviews: ${reviews.length}`,
     `comments: ${comments.length}`,
     `review-comments: ${reviewComments.length}`,
   ];
-  const mergeableState = snapshot.mergeableState?.toUpperCase();
   if (mergeableState === "BEHIND" || mergeableState === "DIRTY") lines.push(`rebase: ${mergeableState}`);
   if (snapshot.merged) lines.push(`PR ${snapshot.number} finished: MERGED`);
   else if (snapshot.state.toUpperCase() === "CLOSED") lines.push(`PR ${snapshot.number} finished: CLOSED`);
