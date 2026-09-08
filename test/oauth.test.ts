@@ -49,7 +49,12 @@ class MemoryStorage {
   }
 }
 
-function hubFixture(): { hub: WatchPrHub; storage: MemoryStorage; pending: Promise<unknown>[] } {
+function hubFixture(): {
+  hub: WatchPrHub;
+  storage: MemoryStorage;
+  pending: Promise<unknown>[];
+  restart(): WatchPrHub;
+} {
   const storage = new MemoryStorage();
   const pending: Promise<unknown>[] = [];
   const state = {
@@ -65,7 +70,12 @@ function hubFixture(): { hub: WatchPrHub; storage: MemoryStorage; pending: Promi
     GITHUB_WEBHOOK_SECRET: "webhook-secret",
     PUBLIC_BASE_URL: "https://watch-pr.vza.net",
   };
-  return { hub: new WatchPrHub(state, env), storage, pending };
+  return {
+    hub: new WatchPrHub(state, env),
+    storage,
+    pending,
+    restart: () => new WatchPrHub(state, env),
+  };
 }
 
 function watchEvent(index: number, payload: unknown): WatchEvent {
@@ -81,6 +91,36 @@ function watchEvent(index: number, payload: unknown): WatchEvent {
     payload,
     snapshot: null,
     changes: [],
+  };
+}
+
+type TestActiveSession = {
+  token: string;
+  record: SessionRecord;
+  watches: Set<string>;
+  subscriptions: Set<string>;
+  kind: "stateful" | "recovered-stream";
+  server?: { close(): Promise<void> };
+  transport?: { close(): Promise<void> };
+};
+
+type HubSessionInternals = {
+  activeSessions: Map<string, TestActiveSession>;
+  newActiveSession(token: string, record: SessionRecord, kind: TestActiveSession["kind"]): TestActiveSession;
+  subscribe(active: TestActiveSession, repository: string, number: number): Promise<void>;
+  invalidateSession(token: string, expectedGithubToken?: string): Promise<void>;
+  sessionForToken(token: string): Promise<{ token: string; record: SessionRecord } | null>;
+};
+
+function sessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    githubAccessToken: "github-token",
+    user: { login: "pedropaulovc", id: 42, name: "Pedro", avatarUrl: null, htmlUrl: "https://github.com/pedropaulovc" },
+    createdAt: Date.now(),
+    expiresAt: Date.now() + 60_000,
+    watches: [],
+    watchStorageVersion: 1,
+    ...overrides,
   };
 }
 
@@ -284,5 +324,161 @@ describe("OAuth broker", () => {
     );
     expect(fetchMock).toHaveBeenCalledTimes(1);
     await expect(storage.get(sessionStorageKey(sessionToken))).resolves.toBeUndefined();
+  });
+
+  it("merges concurrent sibling subscriptions and synchronizes both active sessions", async () => {
+    const { hub, storage } = hubFixture();
+    const sessionToken = "shared-session-token";
+    const firstKey = "owner/repo#7";
+    const secondKey = "owner/repo#8";
+    const record = sessionRecord({ watches: [firstKey, secondKey], subscriptions: [] });
+    await storage.put(sessionStorageKey(sessionToken), record);
+    const internals = hub as unknown as HubSessionInternals;
+    const first = internals.newActiveSession(sessionToken, structuredClone(record), "stateful");
+    const second = internals.newActiveSession(sessionToken, structuredClone(record), "stateful");
+    internals.activeSessions.set("first-mcp-session", first);
+    internals.activeSessions.set("second-mcp-session", second);
+
+    await Promise.all([
+      internals.subscribe(first, "owner/repo", 7),
+      internals.subscribe(second, "owner/repo", 8),
+    ]);
+
+    await expect(storage.get<SessionRecord>(sessionStorageKey(sessionToken))).resolves.toMatchObject({
+      subscriptions: [firstKey, secondKey],
+    });
+    expect([...first.subscriptions].sort()).toEqual([firstKey, secondKey]);
+    expect([...second.subscriptions].sort()).toEqual([firstKey, secondKey]);
+  });
+
+  it("does not invalidate credentials rotated after an unauthorized request started", async () => {
+    const { hub, storage } = hubFixture();
+    const sessionToken = "rotated-session-token";
+    const rotated = sessionRecord({ githubAccessToken: "rotated-github-token" });
+    await storage.put(sessionStorageKey(sessionToken), rotated);
+    const internals = hub as unknown as HubSessionInternals;
+
+    await internals.invalidateSession(sessionToken, "stale-github-token");
+
+    await expect(storage.get<SessionRecord>(sessionStorageKey(sessionToken))).resolves.toEqual(rotated);
+  });
+
+  it.each(["missing", "expired"] as const)("closes server and transport before removing a %s active bearer", async (state) => {
+    const { hub, storage } = hubFixture();
+    const sessionToken = `${state}-session-token`;
+    if (state === "expired") {
+      await storage.put(sessionStorageKey(sessionToken), sessionRecord({ expiresAt: Date.now() - 1 }));
+    }
+    const internals = hub as unknown as HubSessionInternals;
+    const serverClose = vi.fn(async () => {
+      expect(internals.activeSessions.has("active-mcp-session")).toBe(true);
+    });
+    const transportClose = vi.fn(async () => {
+      expect(internals.activeSessions.has("active-mcp-session")).toBe(true);
+    });
+    const active: TestActiveSession = {
+      token: sessionToken,
+      record: sessionRecord(),
+      kind: "stateful",
+      watches: new Set(),
+      subscriptions: new Set(),
+      server: { close: serverClose },
+      transport: { close: transportClose },
+    };
+    internals.activeSessions.set("active-mcp-session", active);
+
+    await expect(internals.sessionForToken(sessionToken)).resolves.toBeNull();
+
+    expect(serverClose).toHaveBeenCalledOnce();
+    expect(transportClose).toHaveBeenCalledOnce();
+    expect(internals.activeSessions.has("active-mcp-session")).toBe(false);
+  });
+
+  it("replaces a recovered GET stream and catches up persisted subscriptions", async () => {
+    const { hub, storage } = hubFixture();
+    const sessionToken = "catch-up-session-token";
+    const mcpSessionId = "catch-up-mcp-session";
+    const key = "owner/repo#7";
+    await storage.put(sessionStorageKey(sessionToken), sessionRecord({ watches: [key], subscriptions: [key] }));
+    const headers = {
+      authorization: `Bearer ${sessionToken}`,
+      accept: "text/event-stream",
+      "mcp-session-id": mcpSessionId,
+      "mcp-protocol-version": "2025-06-18",
+    };
+
+    const original = await hub.fetch(new Request("https://watch-pr.vza.net/mcp", { headers }));
+    const originalReader = original.body!.getReader();
+    const originalCatchUp = await originalReader.read();
+    expect(new TextDecoder().decode(originalCatchUp.value)).toContain(
+      `"method":"notifications/resources/updated","params":{"uri":"watch-pr://owner/repo/pull/7"}`,
+    );
+
+    const replacement = await hub.fetch(new Request("https://watch-pr.vza.net/mcp", { headers }));
+    expect(replacement.status).toBe(200);
+    await expect(originalReader.read()).resolves.toMatchObject({ done: true });
+    const replacementCatchUp = await replacement.body!.getReader().read();
+    expect(new TextDecoder().decode(replacementCatchUp.value)).toContain("watch-pr://owner/repo/pull/7");
+    await hub.fetch(new Request("https://watch-pr.vza.net/mcp", { method: "DELETE", headers }));
+  });
+
+  it("handles a recovered POST with the live stream's ActiveSession context", async () => {
+    const { hub, storage } = hubFixture();
+    const sessionToken = "recovered-post-token";
+    const mcpSessionId = "recovered-post-session";
+    const key = "owner/repo#7";
+    await storage.put(sessionStorageKey(sessionToken), sessionRecord({ watches: [key], subscriptions: [] }));
+    const streamHeaders = {
+      authorization: `Bearer ${sessionToken}`,
+      accept: "text/event-stream",
+      "mcp-session-id": mcpSessionId,
+      "mcp-protocol-version": "2025-06-18",
+    };
+    const stream = await hub.fetch(new Request("https://watch-pr.vza.net/mcp", { headers: streamHeaders }));
+    expect(stream.status).toBe(200);
+
+    const post = await hub.fetch(new Request("https://watch-pr.vza.net/mcp", {
+      method: "POST",
+      headers: {
+        ...streamHeaders,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "resources/subscribe",
+        params: { uri: "watch-pr://owner/repo/pull/7" },
+      }),
+    }));
+
+    expect(post.status).toBe(200);
+    await expect(storage.get<SessionRecord>(sessionStorageKey(sessionToken))).resolves.toMatchObject({
+      subscriptions: [key],
+    });
+    const active = (hub as unknown as HubSessionInternals).activeSessions.get(mcpSessionId);
+    expect(active?.subscriptions.has(key)).toBe(true);
+    await hub.fetch(new Request("https://watch-pr.vza.net/mcp", { method: "DELETE", headers: streamHeaders }));
+  });
+
+  it("does not recover an MCP session after DELETE closes its recovered stream", async () => {
+    const { hub, storage, restart } = hubFixture();
+    const sessionToken = "delete-session-token";
+    const mcpSessionId = "recovered-mcp-session";
+    await storage.put(sessionStorageKey(sessionToken), sessionRecord());
+    const headers = {
+      authorization: `Bearer ${sessionToken}`,
+      accept: "text/event-stream",
+      "mcp-session-id": mcpSessionId,
+      "mcp-protocol-version": "2025-06-18",
+    };
+    const recovered = await hub.fetch(new Request("https://watch-pr.vza.net/mcp", { headers }));
+    expect(recovered.status).toBe(200);
+
+    const deleted = await hub.fetch(new Request("https://watch-pr.vza.net/mcp", { method: "DELETE", headers }));
+    expect(deleted.status).toBe(200);
+
+    const replay = await restart().fetch(new Request("https://watch-pr.vza.net/mcp", { headers }));
+    expect(replay.status).toBe(404);
   });
 });

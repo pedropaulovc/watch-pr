@@ -174,7 +174,7 @@ describe("MCP output modes", () => {
     expect(brief).not.toContain('"snapshot"');
 
     const full = await callTool("get_pr", { repository: "owner/repo", number: 7, mode: "full" });
-    expect(JSON.parse(full)).toEqual(state);
+    expect(JSON.parse(full)).toEqual(snapshot);
   });
 
   it("formats registrations, unwatch results, and event history briefly", async () => {

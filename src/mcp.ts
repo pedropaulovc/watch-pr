@@ -231,7 +231,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       const lines = state.snapshot
         ? briefSnapshotLines(state.snapshot, context.user.login)
         : ["snapshot: unavailable"];
-      return textResult(state, mode, lines);
+      return textResult(state.snapshot, mode, lines);
     },
   );
 
