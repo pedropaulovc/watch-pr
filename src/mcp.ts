@@ -130,10 +130,11 @@ function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): strin
   const reviewComments = snapshot.reviewComments.filter((comment) => comment.author !== login);
   const reviews = snapshot.reviews.filter((review) => review.author !== login);
   const mergeableState = snapshot.mergeableState?.toUpperCase();
+  const mergeable = snapshot.mergeable === null ? "unknown" : snapshot.mergeable ? "yes" : "no";
   const lines = [
     `PR ${snapshot.number}: ${snapshot.state.toUpperCase()}${snapshot.draft ? " DRAFT" : ""}`,
     `head: ${snapshot.headRefName}@${snapshot.headSha}`,
-    `mergeable: ${snapshot.mergeable ? "yes" : "no"}${mergeableState ? ` (${mergeableState})` : ""}`,
+    `mergeable: ${mergeable}${mergeableState ? ` (${mergeableState})` : ""}`,
     ...checkLines(snapshot.checks),
     ...reactionLines(snapshot.bodyReactions, "reaction"),
     ...commentReactionLines(comments),
