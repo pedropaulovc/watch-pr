@@ -13,10 +13,11 @@ Tools:
 - `watch_pr` — subscribe to `repository` (`owner/name`) and `number`.
 - `unwatch_pr` — remove a subscription for the current GitHub account.
 - `list_watched_prs` — list the current account's subscriptions.
-- `get_pr` — read the durable snapshot and recent events for a watched PR.
+- `get_pr` — read the latest durable pull request snapshot.
 - `list_pr_events` — read up to 100 recent webhook/snapshot events.
+- Tool outputs default to `mode: "brief"`, which returns newline-delimited watcher-style lifecycle lines (`check`, `review`, `comments`, `review-comments`, `reaction`, and feedback summaries). Pass `mode: "full"` to `get_pr` for the complete current snapshot or to `list_pr_events` for event payloads. Resource reads remain full stored records.
 
-Each watched PR is also available as a resource at `watch-pr://owner/repository/pull/NUMBER`. A webhook or changed snapshot sends the standard `notifications/resources/updated` notification; clients can then call `resources/read`. The server also sends the event through `notifications/message` for clients that support logging notifications.
+Each watched PR is also available as a resource at `watch-pr://owner/repository/pull/NUMBER`. A webhook or changed snapshot sends the standard `notifications/resources/updated` notification; clients can then call `resources/read`. The server also sends a compact event summary through `notifications/message` for clients that support logging notifications.
 
 Snapshots include PR lifecycle and mergeability, base/head refs, checks and commit statuses, reviews, top-level comments and reactions, inline review comments and reactions, and GraphQL review-thread resolution state.
 

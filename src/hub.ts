@@ -21,7 +21,7 @@ interface ActiveSession {
   record: SessionRecord;
   watches: Set<string>;
   subscriptions: Set<string>;
-  stateless?: boolean;
+  kind: "stateful" | "recovered-stream";
   transport?: WebStandardStreamableHTTPServerTransport;
   server?: McpServer;
   sessionId?: string;
@@ -29,6 +29,7 @@ interface ActiveSession {
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const OAUTH_TTL_SECONDS = 10 * 60;
 const MAX_EVENTS = 100;
+const MAX_CLOSED_MCP_SESSIONS = 64;
 
 const MAX_STORAGE_BATCH_KEYS = 128;
 const MAX_WATCH_STATE_BYTES = 64 * 1024;
@@ -154,6 +155,7 @@ export async function writeStoredWatchState(storage: WatchStorage, storageKey: s
 export class WatchPrHub {
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly refreshes = new Set<string>();
+  private readonly sessionOperations = new Map<string, Promise<void>>();
 
   constructor(
     private readonly state: DurableObjectState,
@@ -180,21 +182,29 @@ export class WatchPrHub {
 
     const sessionId = request.headers.get("mcp-session-id");
     if (sessionId) {
+      if (await this.isClosedMcpSession(bearer, sessionId)) return this.mcpSessionNotFound();
       const existing = this.activeSessions.get(sessionId);
       if (existing && existing.token !== bearer) return this.mcpSessionNotFound();
-      if (existing?.stateless) {
-        const response = await this.handleRecoveredMcp(request, bearer, session.record, sessionId);
-        if (request.method === "DELETE") this.activeSessions.delete(sessionId);
-        return response;
+      if (request.method === "DELETE") {
+        await this.rememberClosedMcpSession(bearer, sessionId);
+        if (existing) await this.closeActiveSession(sessionId, existing);
+        return this.withMcpSessionId(new Response(null, { status: 200 }), sessionId);
       }
-      if (existing?.transport) {
+      if (existing) {
         existing.record = session.record;
         this.syncActiveSession(existing, session.record);
-        return existing.transport.handleRequest(request);
+        if (existing.kind === "stateful") {
+          return existing.transport ? existing.transport.handleRequest(request) : this.mcpSessionNotFound();
+        }
+        if (request.method === "GET") {
+          await this.closeActiveSession(sessionId, existing);
+          return this.openRecoveredMcpStream(request, existing, sessionId);
+        }
+        return this.handleRecoveredMcpRequest(request, existing, sessionId);
       }
-      // Durable Object instances can be re-created between requests. Rebuild
-      // a stateless transport from the durable bearer session when that happens.
-      return this.handleRecoveredMcp(request, bearer, session.record, sessionId);
+      const recovered = this.newActiveSession(bearer, session.record, "recovered-stream");
+      if (request.method === "GET") return this.openRecoveredMcpStream(request, recovered, sessionId);
+      return this.handleRecoveredMcpRequest(request, recovered, sessionId);
     }
 
     let body: unknown;
@@ -210,7 +220,7 @@ export class WatchPrHub {
       });
     }
 
-    const active = this.newActiveSession(bearer, session.record);
+    const active = this.newActiveSession(bearer, session.record, "stateful");
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomToken(24),
       onsessioninitialized: (id) => {
@@ -231,34 +241,58 @@ export class WatchPrHub {
     return transport.handleRequest(request);
   }
 
-  private newActiveSession(token: string, record: SessionRecord): ActiveSession {
+  private newActiveSession(
+    token: string,
+    record: SessionRecord,
+    kind: ActiveSession["kind"],
+  ): ActiveSession {
     return {
       token,
       record,
+      kind,
       watches: new Set(record.watches),
       subscriptions: new Set(record.subscriptions ?? []),
     };
   }
 
-  private async handleRecoveredMcp(
+  private async openRecoveredMcpStream(
     request: Request,
-    token: string,
-    record: SessionRecord,
+    active: ActiveSession,
     sessionId: string,
   ): Promise<Response> {
-    const active = this.newActiveSession(token, record);
     const transport = new WebStandardStreamableHTTPServerTransport({ keepAliveMs: 15_000 });
     const server = createMcpServer(this.mcpContext(active));
     await server.connect(transport);
     const response = await transport.handleRequest(request);
-    if (request.method === "GET") {
-      active.stateless = true;
-      active.sessionId = sessionId;
-      active.transport = transport;
-      active.server = server;
-      this.activeSessions.set(sessionId, active);
+    if (!response.ok) {
+      await server.close();
+      return this.withMcpSessionId(response, sessionId);
     }
+    active.sessionId = sessionId;
+    active.transport = transport;
+    active.server = server;
+    this.activeSessions.set(sessionId, active);
+    await this.notifySubscribedResources(active);
     return this.withMcpSessionId(response, sessionId);
+  }
+
+  private async handleRecoveredMcpRequest(
+    request: Request,
+    active: ActiveSession,
+    sessionId: string,
+  ): Promise<Response> {
+    const transport = new WebStandardStreamableHTTPServerTransport({
+      enableJsonResponse: true,
+      keepAliveMs: 15_000,
+    });
+    const server = createMcpServer(this.mcpContext(active));
+    await server.connect(transport);
+    try {
+      const response = await transport.handleRequest(request);
+      return this.withMcpSessionId(response, sessionId);
+    } finally {
+      await Promise.allSettled([server.close(), transport.close()]);
+    }
   }
 
   private withMcpSessionId(response: Response, sessionId: string): Response {
@@ -271,6 +305,24 @@ export class WatchPrHub {
     return new Response(JSON.stringify({ error: "MCP session not found" }), {
       status: 404,
       headers: { "content-type": "application/json" },
+    });
+  }
+
+  private async isClosedMcpSession(token: string, sessionId: string): Promise<boolean> {
+    return this.withSessionLock(token, async () => {
+      const closed = await this.state.storage.get<string[]>(`closed-mcp-sessions:${token}`);
+      return closed?.includes(sessionId) ?? false;
+    });
+  }
+
+  private async rememberClosedMcpSession(token: string, sessionId: string): Promise<void> {
+    await this.withSessionLock(token, async () => {
+      const key = `closed-mcp-sessions:${token}`;
+      await this.state.storage.transaction(async (storage) => {
+        const closed = await storage.get<string[]>(key) ?? [];
+        if (closed.includes(sessionId)) return;
+        await storage.put(key, [...closed, sessionId].slice(-MAX_CLOSED_MCP_SESSIONS));
+      });
     });
   }
 
@@ -298,10 +350,12 @@ export class WatchPrHub {
 
   private async watch(active: ActiveSession, repository: string, number: number): Promise<WatchRegistration> {
     const key = watchKey(repository, number);
-    const wasWatched = active.watches.has(key);
-    active.subscriptions.add(key);
-    active.watches.add(key);
-    await this.persistSession(active);
+    const wasWatched = await this.updateSession(active, (watches, subscriptions) => {
+      const existed = watches.has(key);
+      watches.add(key);
+      subscriptions.add(key);
+      return existed;
+    });
     const state = await this.watchState(active.record.user.id, key);
     this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "watch");
     if (!wasWatched) await this.notifyResourceListChanged(active);
@@ -317,12 +371,11 @@ export class WatchPrHub {
 
   private async unwatch(active: ActiveSession, repository: string, number: number): Promise<boolean> {
     const key = watchKey(repository, number);
-    const removed = active.watches.delete(key);
-    active.subscriptions.delete(key);
-    if (removed) {
-      await this.persistSession(active);
-      await this.notifyResourceListChanged(active);
-    }
+    const removed = await this.updateSession(active, (watches, subscriptions) => {
+      subscriptions.delete(key);
+      return watches.delete(key);
+    });
+    if (removed) await this.notifyResourceListChanged(active);
     return removed;
   }
 
@@ -353,29 +406,84 @@ export class WatchPrHub {
 
   private async subscribe(active: ActiveSession, repository: string, number: number): Promise<void> {
     const key = watchKey(repository, number);
-    if (!active.watches.has(key)) throw new Error("watch the pull request before subscribing to its resource");
-    active.subscriptions.add(key);
-    await this.persistSession(active);
+    await this.updateSession(active, (watches, subscriptions) => {
+      if (!watches.has(key)) throw new Error("watch the pull request before subscribing to its resource");
+      subscriptions.add(key);
+    });
   }
 
   private async unsubscribe(active: ActiveSession, repository: string, number: number): Promise<void> {
-    active.subscriptions.delete(watchKey(repository, number));
-    await this.persistSession(active);
+    const key = watchKey(repository, number);
+    await this.updateSession(active, (_watches, subscriptions) => {
+      subscriptions.delete(key);
+    });
   }
 
-  private async persistSession(active: ActiveSession): Promise<void> {
-    active.record.watches = [...active.watches].sort();
-    active.record.subscriptions = [...active.subscriptions].filter((key) => active.watches.has(key)).sort();
-    await this.state.storage.put(sessionStorageKey(active.token), active.record);
+  private async updateSession<T>(
+    active: ActiveSession,
+    mutate: (watches: Set<string>, subscriptions: Set<string>) => T,
+  ): Promise<T> {
+    return this.withSessionLock(active.token, async () => {
+      const key = sessionStorageKey(active.token);
+      const updated = await this.state.storage.transaction(async (storage) => {
+        const current = await storage.get<SessionRecord>(key);
+        if (!current || current.expiresAt <= Date.now()) {
+          if (current) await storage.delete(key);
+          return null;
+        }
+        const watches = new Set(current.watches);
+        const subscriptions = new Set(current.subscriptions ?? []);
+        const result = mutate(watches, subscriptions);
+        const record: SessionRecord = {
+          ...current,
+          watches: [...watches].sort(),
+          subscriptions: [...subscriptions].filter((entry) => watches.has(entry)).sort(),
+        };
+        await storage.put(key, record);
+        return { record, result };
+      });
+      if (!updated) {
+        await this.closeActiveSessionsForToken(active.token);
+        throw new Error("session is no longer active");
+      }
+      this.syncActiveSessions(active.token, updated.record);
+      return updated.result;
+    });
+  }
+
+  private async withSessionLock<T>(token: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.sessionOperations.get(token) ?? Promise.resolve();
+    let release = (): void => { };
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.sessionOperations.set(token, current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.sessionOperations.get(token) === current) this.sessionOperations.delete(token);
+    }
   }
 
   private async sessionForToken(token: string): Promise<{ token: string; record: SessionRecord } | null> {
+    return this.withSessionLock(token, () => this.sessionForTokenUnlocked(token));
+  }
+
+  private async sessionForTokenUnlocked(token: string): Promise<{ token: string; record: SessionRecord } | null> {
+
     const key = sessionStorageKey(token);
     const record = await this.state.storage.get<SessionRecord>(key);
-    if (!record) return null;
+    if (!record) {
+      await this.state.storage.delete(`closed-mcp-sessions:${token}`);
+      await this.closeActiveSessionsForToken(token);
+      return null;
+    }
     const now = Date.now();
     if (record.expiresAt <= now) {
-      await this.state.storage.delete(key);
+      await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
+      await this.closeActiveSessionsForToken(token);
       return null;
     }
     await this.migrateLegacyWatchStates(record);
@@ -403,13 +511,15 @@ export class WatchPrHub {
         await this.state.storage.put(key, record);
       } catch (error) {
         if (isGithubAuthorizationError(error) || (record.githubTokenExpiresAt && record.githubTokenExpiresAt <= now)) {
-          await this.state.storage.delete(key);
+          await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
+          await this.closeActiveSessionsForToken(token);
           return null;
         }
       }
     }
     if (record.githubTokenExpiresAt && record.githubTokenExpiresAt <= now) {
-      await this.state.storage.delete(key);
+      await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
+      await this.closeActiveSessionsForToken(token);
       return null;
     }
     return { token, record };
@@ -459,23 +569,27 @@ export class WatchPrHub {
   }
 
   private async reconcileActiveSessions(): Promise<void> {
-    for (const [sessionId, active] of this.activeSessions) {
+    for (const active of [...this.activeSessions.values()]) {
       const session = await this.sessionForToken(active.token);
-      if (!session) {
-        this.activeSessions.delete(sessionId);
-        continue;
-      }
-      active.record = session.record;
-      this.syncActiveSession(active, session.record);
+      if (!session) continue;
+      this.syncActiveSessions(active.token, session.record);
     }
   }
 
-  private async invalidateSession(token: string): Promise<void> {
-    await this.state.storage.delete(sessionStorageKey(token));
-    for (const [sessionId, active] of this.activeSessions) {
-      if (active.token === token) this.activeSessions.delete(sessionId);
-    }
+  private async invalidateSession(token: string, expectedGithubToken?: string): Promise<void> {
+    await this.withSessionLock(token, async () => {
+      const key = sessionStorageKey(token);
+      const current = await this.state.storage.get<SessionRecord>(key);
+      if (!current) {
+        await this.closeActiveSessionsForToken(token);
+        return;
+      }
+      if (expectedGithubToken && current.githubAccessToken !== expectedGithubToken) return;
+      await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
+      await this.closeActiveSessionsForToken(token);
+    });
   }
+
   private async processWebhook(eventName: string, deliveryId: string, payload: Record<string, unknown>): Promise<void> {
     await this.reconcileActiveSessions();
     const sessions = await this.sessionRecords();
@@ -515,7 +629,7 @@ export class WatchPrHub {
       } catch (error) {
         if (isGithubAuthorizationError(error)) {
           invalidSessionTokens.add(watcher.sessionToken);
-          await this.invalidateSession(watcher.sessionToken);
+          await this.invalidateSession(watcher.sessionToken, watcher.githubToken);
           continue;
         }
         snapshot = previous.snapshot;
@@ -558,7 +672,7 @@ export class WatchPrHub {
     try {
       snapshot = await pullRequestSnapshot(githubToken, parsed.repository, parsed.number);
     } catch (error) {
-      if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken);
+      if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken, githubToken);
       return;
     }
     const previous = await this.watchState(userId, key);
@@ -636,12 +750,61 @@ export class WatchPrHub {
       try {
         await session.server.server.notification({
           method: "notifications/message",
-          params: { level: "info", logger: "watch-pr", data: deliveredEvent },
+          params: {
+            level: "info",
+            logger: "watch-pr",
+            data: {
+              resourceUri: deliveredEvent.resourceUri,
+              githubEvent: deliveredEvent.githubEvent,
+              action: deliveredEvent.action,
+              receivedAt: deliveredEvent.receivedAt,
+              changes: deliveredEvent.changes,
+            },
+          },
         } as never);
       } catch {
         // Resource updates remain the interoperable push channel.
       }
     }));
+  }
+
+  private syncActiveSessions(token: string, record: SessionRecord): void {
+    for (const active of this.activeSessions.values()) {
+      if (active.token !== token) continue;
+      active.record = record;
+      this.syncActiveSession(active, record);
+    }
+  }
+
+  private async closeActiveSession(sessionId: string, active: ActiveSession): Promise<void> {
+    try {
+      await active.server?.close();
+    } catch {
+      // Continue closing the underlying transport and forget the unusable session.
+    }
+    try {
+      await active.transport?.close();
+    } catch {
+      // Closing is best effort after the bearer session is no longer valid.
+    }
+    if (this.activeSessions.get(sessionId) === active) this.activeSessions.delete(sessionId);
+  }
+
+  private async closeActiveSessionsForToken(token: string): Promise<void> {
+    const sessions = [...this.activeSessions.entries()].filter(([, active]) => active.token === token);
+    await Promise.all(sessions.map(([sessionId, active]) => this.closeActiveSession(sessionId, active)));
+  }
+
+  private async notifySubscribedResources(active: ActiveSession): Promise<void> {
+    if (!active.server) return;
+    for (const key of active.subscriptions) {
+      try {
+        const parsed = parseWatchKey(key);
+        await active.server.server.sendResourceUpdated({ uri: resourceUri(parsed.repository, parsed.number) });
+      } catch {
+        // A recovered stream may close while catch-up notifications are queued.
+      }
+    }
   }
 
   private async notifyResourceListChanged(active: ActiveSession): Promise<void> {
