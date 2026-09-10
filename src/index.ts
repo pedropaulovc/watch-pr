@@ -72,7 +72,12 @@ const worker = {
     }
     if (url.pathname === "/.well-known/oauth-protected-resource") return addCors(oauthProtectedResource(request, env), request);
     if (url.pathname === "/.well-known/oauth-authorization-server") return addCors(oauthAuthorizationServer(request, env), request);
-    if (url.pathname === MCP_PATH || url.pathname === WEBHOOK_PATH || OAUTH_PATHS.has(url.pathname)) {
+    if (
+      url.pathname === MCP_PATH ||
+      url.pathname === WEBHOOK_PATH ||
+      url.pathname.startsWith("/monitor/") ||
+      OAUTH_PATHS.has(url.pathname)
+    ) {
       return addCors(await dispatch(request, env), request);
     }
     return new Response("Not found", { status: 404 });

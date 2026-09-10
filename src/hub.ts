@@ -4,8 +4,27 @@ import { constantTimeEqual, parseBearerToken, randomToken, sha256Base64Url, veri
 import { createWatchEvent, eventPullRequestNumbers, isSupportedGithubEvent, parseWatchKey, resourceUri, snapshotChanges, watchKey } from "./events";
 import { exchangeGithubCode, GithubApiError, githubUser, pullRequestSnapshot, refreshGithubToken } from "./github";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "./mcp";
-import type { GithubUser, OAuthClientRecord, OAuthCodeRecord, OAuthRequestRecord, SessionRecord, StoredWatchState, WatchEvent } from "./types";
-import { legacyWatchStorageKey, sessionStorageKey, watchStorageKey } from "./types";
+import type {
+  GithubUser,
+  MonitorCapabilityRecord,
+  MonitorTerminalState,
+  OAuthClientRecord,
+  OAuthCodeRecord,
+  OAuthRequestRecord,
+  PrMonitorEvent,
+  PrMonitorRegistration,
+  PullRequestSnapshot,
+  SessionRecord,
+  StoredWatchState,
+  WatchEvent,
+} from "./types";
+import {
+  legacyWatchStorageKey,
+  monitorCapabilityStorageKey,
+  monitorScopeStorageKey,
+  sessionStorageKey,
+  watchStorageKey,
+} from "./types";
 
 export interface Env {
   HUB: DurableObjectNamespace;
@@ -26,10 +45,22 @@ interface ActiveSession {
   server?: McpServer;
   sessionId?: string;
 }
+
+interface ActiveMonitorFeed {
+  capability: string;
+  sessionToken: string;
+  userId: number;
+  key: string;
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  heartbeat: number;
+  closed: boolean;
+}
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const OAUTH_TTL_SECONDS = 10 * 60;
 const MAX_EVENTS = 100;
 const MAX_CLOSED_MCP_SESSIONS = 64;
+const MONITOR_HEARTBEAT_MS = 15_000;
+const MAX_MONITOR_CURSOR_LENGTH = 256;
 
 const MAX_STORAGE_BATCH_KEYS = 128;
 const MAX_WATCH_STATE_BYTES = 64 * 1024;
@@ -150,10 +181,64 @@ export async function writeStoredWatchState(storage: WatchStorage, storageKey: s
   }
 }
 
+const monitorEncoder = new TextEncoder();
+
+function terminalState(snapshot: PullRequestSnapshot | null): MonitorTerminalState {
+  if (snapshot?.merged) return "merged";
+  return snapshot?.state.toLowerCase() === "closed" ? "closed" : "watching";
+}
+
+function resumesClosedWatch(event: WatchEvent, snapshot: PullRequestSnapshot | null): boolean {
+  if (terminalState(snapshot) !== "watching") return false;
+  return (
+    (event.githubEvent === "pull_request" && event.action === "reopened") ||
+    (event.githubEvent === "snapshot" && event.action === "watch")
+  );
+}
+
+function compactMonitorEvent(event: WatchEvent, state = terminalState(event.snapshot)): PrMonitorEvent {
+  return {
+    id: event.id,
+    repository: event.repository,
+    pullRequestNumber: event.pullRequestNumber,
+    githubEvent: event.githubEvent,
+    action: event.action,
+    receivedAt: event.receivedAt,
+    changes: event.changes,
+    terminalState: state,
+  };
+}
+
+function reconciliationMonitorEvent(
+  state: StoredWatchState,
+  action: "cursor_miss" | "terminal_snapshot",
+  repository: string,
+  pullRequestNumber: number,
+): PrMonitorEvent {
+  const latest = state.events.at(-1);
+  const snapshot = state.snapshot;
+  return {
+    id: latest?.id ?? `snapshot-${snapshot?.fetchedAt ?? "unavailable"}`,
+    repository,
+    pullRequestNumber,
+    githubEvent: "reconciliation",
+    action,
+    receivedAt: snapshot?.fetchedAt ?? latest?.receivedAt ?? new Date().toISOString(),
+    changes: action === "cursor_miss" ? ["reconciled"] : [],
+    terminalState: terminalState(snapshot),
+  };
+}
+
+function monitorFrame(event: PrMonitorEvent): Uint8Array {
+  const id = event.id.replace(/[\r\n]/gu, "");
+  return monitorEncoder.encode(`id: ${id}\nevent: pr\ndata: ${JSON.stringify(event)}\n\n`);
+}
+
 
 
 export class WatchPrHub {
   private readonly activeSessions = new Map<string, ActiveSession>();
+  private readonly activeMonitorFeeds = new Map<string, Set<ActiveMonitorFeed>>();
   private readonly refreshes = new Set<string>();
   private readonly sessionOperations = new Map<string, Promise<void>>();
 
@@ -165,6 +250,7 @@ export class WatchPrHub {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/mcp") return this.handleMcp(request);
+    if (url.pathname.startsWith("/monitor/")) return this.handleMonitorFeed(request);
     if (url.pathname === "/webhooks/github") return this.handleGithubWebhook(request);
     if (url.pathname === "/oauth/register") return this.handleOAuthRegister(request);
     if (url.pathname === "/oauth/authorize") return this.handleOAuthAuthorize(request);
@@ -172,6 +258,147 @@ export class WatchPrHub {
     if (url.pathname === "/oauth/token") return this.handleOAuthToken(request);
     if (url.pathname === "/internal/poll") return this.handlePoll(request);
     return new Response("Not found", { status: 404 });
+  }
+
+  private async handleMonitorFeed(request: Request): Promise<Response> {
+    if (request.method !== "GET") return this.monitorError(405, "method_not_allowed", "monitor feeds require GET");
+    const url = new URL(request.url);
+    const match = /^\/monitor\/([A-Za-z0-9_-]+)$/u.exec(url.pathname);
+    if (!match) return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+    const capability = match[1];
+    const capabilityKey = monitorCapabilityStorageKey(capability);
+    const record = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
+    if (!record) return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+
+    const session = await this.state.storage.get<SessionRecord>(sessionStorageKey(record.sessionToken));
+    const key = watchKey(record.repository, record.pullRequestNumber);
+    if (
+      record.expiresAt <= Date.now() ||
+      !session ||
+      session.expiresAt <= Date.now() ||
+      session.user.id !== record.userId ||
+      !session.watches.includes(key)
+    ) {
+      await this.revokeMonitorCapability(capability, record);
+      return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+    }
+
+    const headerCursor = request.headers.get("last-event-id")?.trim();
+    const queryCursor = url.searchParams.get("cursor")?.trim();
+    const cursor = headerCursor || queryCursor || null;
+    if (cursor && cursor.length > MAX_MONITOR_CURSOR_LENGTH) {
+      return this.monitorError(400, "invalid_cursor", `monitor cursor must not exceed ${MAX_MONITOR_CURSOR_LENGTH} characters`);
+    }
+
+    const watchState = await this.watchState(record.userId, key);
+    const currentTerminalState = terminalState(watchState.snapshot);
+    let events: PrMonitorEvent[];
+    if (!cursor) {
+      events = watchState.events.map((event) => compactMonitorEvent(event));
+    } else {
+      const cursorIndex = watchState.events.findIndex((event) => event.id === cursor);
+      events = cursorIndex >= 0
+        ? watchState.events.slice(cursorIndex + 1).map((event) => compactMonitorEvent(event))
+        : [reconciliationMonitorEvent(watchState, "cursor_miss", record.repository, record.pullRequestNumber)];
+    }
+    if (currentTerminalState !== "watching" && events.length === 0) {
+      const latest = watchState.events.at(-1);
+      events = [latest
+        ? compactMonitorEvent(latest, currentTerminalState)
+        : reconciliationMonitorEvent(watchState, "terminal_snapshot", record.repository, record.pullRequestNumber)];
+    }
+
+    let activeFeed: ActiveMonitorFeed | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        controller.enqueue(monitorEncoder.encode(": connected\n\n"));
+        for (const event of events) controller.enqueue(monitorFrame(event));
+        if (currentTerminalState !== "watching") {
+          controller.close();
+          return;
+        }
+        const heartbeat = setInterval(() => {
+          if (!activeFeed || activeFeed.closed) return;
+          try {
+            controller.enqueue(monitorEncoder.encode(": heartbeat\n\n"));
+          } catch {
+            this.closeMonitorFeed(activeFeed);
+          }
+        }, MONITOR_HEARTBEAT_MS);
+        for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) this.closeMonitorFeed(feed);
+        activeFeed = {
+          capability,
+          userId: record.userId,
+          sessionToken: record.sessionToken,
+          key,
+          controller,
+          heartbeat,
+          closed: false,
+        };
+        const feeds = this.activeMonitorFeeds.get(capability) ?? new Set<ActiveMonitorFeed>();
+        feeds.add(activeFeed);
+        this.activeMonitorFeeds.set(capability, feeds);
+      },
+      cancel: () => {
+        if (activeFeed) this.closeMonitorFeed(activeFeed, false);
+      },
+    });
+    const confirmed = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
+    if (
+      !confirmed ||
+      confirmed.sessionToken !== record.sessionToken ||
+      confirmed.userId !== record.userId ||
+      confirmed.repository !== record.repository ||
+      confirmed.pullRequestNumber !== record.pullRequestNumber ||
+      confirmed.expiresAt !== record.expiresAt
+    ) {
+      if (activeFeed) this.closeMonitorFeed(activeFeed);
+      return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+    }
+    return new Response(body, {
+      headers: {
+        "cache-control": "no-cache, no-transform",
+        "content-type": "text/event-stream; charset=utf-8",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+      },
+    });
+  }
+
+  private closeMonitorFeed(feed: ActiveMonitorFeed, closeController = true): void {
+    if (feed.closed) return;
+    feed.closed = true;
+    clearInterval(feed.heartbeat);
+    const feeds = this.activeMonitorFeeds.get(feed.capability);
+    feeds?.delete(feed);
+    if (feeds?.size === 0) this.activeMonitorFeeds.delete(feed.capability);
+    if (!closeController) return;
+    try {
+      feed.controller.close();
+    } catch {
+      // The response can be canceled while an event is being delivered.
+    }
+  }
+
+  private publishMonitorEvent(userId: number, key: string, event: PrMonitorEvent): void {
+    for (const feeds of this.activeMonitorFeeds.values()) {
+      for (const feed of [...feeds]) {
+        if (feed.userId !== userId || feed.key !== key || feed.closed) continue;
+        try {
+          feed.controller.enqueue(monitorFrame(event));
+        } catch {
+          this.closeMonitorFeed(feed);
+          continue;
+        }
+        if (event.terminalState !== "watching") this.closeMonitorFeed(feed);
+      }
+    }
+  }
+
+  private monitorError(status: number, error: string, description: string): Response {
+    return this.json({ error, error_description: description }, status, {
+      "cache-control": "no-store",
+    });
   }
 
   private async handleMcp(request: Request): Promise<Response> {
@@ -333,6 +560,7 @@ export class WatchPrHub {
       watch: async (repository, number) => this.watch(active, repository, number),
       unwatch: async (repository, number) => this.unwatch(active, repository, number),
       listWatches: async () => this.listWatches(active),
+      openMonitor: async (repository, number) => this.openMonitor(active, repository, number),
       readWatch: async (repository, number) => this.readWatch(active, repository, number),
       subscribe: async (repository, number) => this.subscribe(active, repository, number),
       unsubscribe: async (repository, number) => this.unsubscribe(active, repository, number),
@@ -357,7 +585,8 @@ export class WatchPrHub {
       return existed;
     });
     const state = await this.watchState(active.record.user.id, key);
-    this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "watch");
+    const refreshScheduled = terminalState(state.snapshot) !== "merged";
+    if (refreshScheduled) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "watch");
     if (!wasWatched) await this.notifyResourceListChanged(active);
     return {
       key,
@@ -365,7 +594,7 @@ export class WatchPrHub {
       number,
       resourceUri: resourceUri(repository, number),
       snapshot: state.snapshot,
-      refreshScheduled: true,
+      refreshScheduled,
     };
   }
 
@@ -375,8 +604,103 @@ export class WatchPrHub {
       subscriptions.delete(key);
       return watches.delete(key);
     });
+    await this.revokeMonitorScope(active.token, key);
     if (removed) await this.notifyResourceListChanged(active);
     return removed;
+  }
+
+  private async openMonitor(
+    active: ActiveSession,
+    repository: string,
+    number: number,
+  ): Promise<PrMonitorRegistration> {
+    const key = watchKey(repository, number);
+    if (!active.watches.has(key)) throw new Error("pull request is not watched by this session");
+    const parsed = parseWatchKey(key);
+    const scopeKey = monitorScopeStorageKey(active.token, parsed.repository, parsed.number);
+    let capability = await this.state.storage.get<string>(scopeKey);
+    let record = capability
+      ? await this.state.storage.get<MonitorCapabilityRecord>(monitorCapabilityStorageKey(capability))
+      : undefined;
+    if (
+      !capability ||
+      !record ||
+      record.sessionToken !== active.token ||
+      record.userId !== active.record.user.id ||
+      record.repository !== parsed.repository ||
+      record.pullRequestNumber !== parsed.number ||
+      record.expiresAt <= Date.now()
+    ) {
+      if (capability) await this.revokeMonitorCapability(capability, record);
+      capability = randomToken(32);
+      record = {
+        sessionToken: active.token,
+        userId: active.record.user.id,
+        repository: parsed.repository,
+        pullRequestNumber: parsed.number,
+        createdAt: Date.now(),
+        expiresAt: active.record.expiresAt,
+      };
+      await putStorageEntries(this.state.storage, {
+        [scopeKey]: capability,
+        [monitorCapabilityStorageKey(capability)]: record,
+      });
+    }
+
+    const state = await this.watchState(record.userId, key);
+    const cursor = state.events.at(-1)?.id ?? null;
+    const monitorUrl = new URL(`${this.baseUrl()}/monitor/${capability}`);
+    if (cursor) monitorUrl.searchParams.set("cursor", cursor);
+    return {
+      monitorUrl: monitorUrl.toString(),
+      cursor,
+      terminalState: terminalState(state.snapshot),
+    };
+  }
+
+  private async revokeMonitorScope(sessionToken: string, key: string): Promise<void> {
+    const parsed = parseWatchKey(key);
+    const scopeKey = monitorScopeStorageKey(sessionToken, parsed.repository, parsed.number);
+    const capability = await this.state.storage.get<string>(scopeKey);
+    if (!capability) {
+      await this.state.storage.delete(scopeKey);
+      return;
+    }
+    const record = await this.state.storage.get<MonitorCapabilityRecord>(monitorCapabilityStorageKey(capability));
+    await this.revokeMonitorCapability(capability, record);
+  }
+
+  private async revokeMonitorCapability(
+    capability: string,
+    record?: MonitorCapabilityRecord,
+  ): Promise<void> {
+    const keys = [monitorCapabilityStorageKey(capability)];
+    if (record) {
+      const scopeKey = monitorScopeStorageKey(record.sessionToken, record.repository, record.pullRequestNumber);
+      const current = await this.state.storage.get<string>(scopeKey);
+      if (current === capability) keys.push(scopeKey);
+    }
+    await this.state.storage.delete(keys);
+    for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) this.closeMonitorFeed(feed);
+  }
+
+  private async revokeSessionMonitors(sessionToken: string, watchKeys: Iterable<string>): Promise<void> {
+    for (const key of watchKeys) {
+      try {
+        await this.revokeMonitorScope(sessionToken, key);
+      } catch {
+        // Ignore malformed persisted watch keys while revoking the rest of the session.
+      }
+    }
+    this.closeMonitorFeedsForSession(sessionToken);
+  }
+
+  private closeMonitorFeedsForSession(sessionToken: string): void {
+    for (const feeds of this.activeMonitorFeeds.values()) {
+      for (const feed of [...feeds]) {
+        if (feed.sessionToken === sessionToken) this.closeMonitorFeed(feed);
+      }
+    }
   }
 
   private async listWatches(active: ActiveSession): Promise<WatchRegistration[]> {
@@ -443,6 +767,7 @@ export class WatchPrHub {
         return { record, result };
       });
       if (!updated) {
+        await this.revokeSessionMonitors(active.token, active.watches);
         await this.closeActiveSessionsForToken(active.token);
         throw new Error("session is no longer active");
       }
@@ -477,11 +802,13 @@ export class WatchPrHub {
     const record = await this.state.storage.get<SessionRecord>(key);
     if (!record) {
       await this.state.storage.delete(`closed-mcp-sessions:${token}`);
+      this.closeMonitorFeedsForSession(token);
       await this.closeActiveSessionsForToken(token);
       return null;
     }
     const now = Date.now();
     if (record.expiresAt <= now) {
+      await this.revokeSessionMonitors(token, record.watches);
       await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
       await this.closeActiveSessionsForToken(token);
       return null;
@@ -511,6 +838,7 @@ export class WatchPrHub {
         await this.state.storage.put(key, record);
       } catch (error) {
         if (isGithubAuthorizationError(error) || (record.githubTokenExpiresAt && record.githubTokenExpiresAt <= now)) {
+          await this.revokeSessionMonitors(token, record.watches);
           await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
           await this.closeActiveSessionsForToken(token);
           return null;
@@ -518,6 +846,7 @@ export class WatchPrHub {
       }
     }
     if (record.githubTokenExpiresAt && record.githubTokenExpiresAt <= now) {
+      await this.revokeSessionMonitors(token, record.watches);
       await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
       await this.closeActiveSessionsForToken(token);
       return null;
@@ -581,10 +910,12 @@ export class WatchPrHub {
       const key = sessionStorageKey(token);
       const current = await this.state.storage.get<SessionRecord>(key);
       if (!current) {
+        this.closeMonitorFeedsForSession(token);
         await this.closeActiveSessionsForToken(token);
         return;
       }
       if (expectedGithubToken && current.githubAccessToken !== expectedGithubToken) return;
+      await this.revokeSessionMonitors(token, current.watches);
       await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
       await this.closeActiveSessionsForToken(token);
     });
@@ -610,6 +941,7 @@ export class WatchPrHub {
 
     const repository = repositoryFromPayload(payload);
     if (!repository) return;
+    const webhookAction = actionFromPayload(payload);
     for (const watcher of watchers.values()) {
       if (invalidSessionTokens.has(watcher.sessionToken)) continue;
       let parsed;
@@ -623,6 +955,9 @@ export class WatchPrHub {
       if (!targetNumbers.includes(parsed.number)) continue;
 
       const previous = await this.watchState(watcher.userId, watcher.key);
+      const previousTerminalState = terminalState(previous.snapshot);
+      if (previousTerminalState === "merged") continue;
+      if (previousTerminalState === "closed" && (eventName !== "pull_request" || webhookAction !== "reopened")) continue;
       let snapshot = previous.snapshot;
       try {
         snapshot = await pullRequestSnapshot(watcher.githubToken, parsed.repository, parsed.number);
@@ -638,7 +973,7 @@ export class WatchPrHub {
       const event = createWatchEvent({
         deliveryId,
         githubEvent: eventName,
-        action: actionFromPayload(payload),
+        action: webhookAction,
         repository: parsed.repository,
         pullRequestNumber: parsed.number,
         payload,
@@ -667,6 +1002,9 @@ export class WatchPrHub {
     sessionToken: string,
     reason: string,
   ): Promise<void> {
+    const initialState = await this.watchState(userId, key);
+    const initialTerminalState = terminalState(initialState.snapshot);
+    if (initialTerminalState === "merged" || (initialTerminalState === "closed" && reason !== "watch")) return;
     const parsed = parseWatchKey(key);
     let snapshot;
     try {
@@ -675,9 +1013,11 @@ export class WatchPrHub {
       if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken, githubToken);
       return;
     }
-    const previous = await this.watchState(userId, key);
-    const changes = snapshotChanges(previous.snapshot, snapshot);
-    if (previous.snapshot && changes.length === 0) return;
+    const current = await this.watchState(userId, key);
+    const currentTerminalState = terminalState(current.snapshot);
+    if (currentTerminalState === "merged" || (currentTerminalState === "closed" && reason !== "watch")) return;
+    const changes = snapshotChanges(current.snapshot, snapshot);
+    if (current.snapshot && changes.length === 0) return;
     const event = createWatchEvent({
       deliveryId: `snapshot-${randomToken(12)}`,
       githubEvent: "snapshot",
@@ -695,11 +1035,18 @@ export class WatchPrHub {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     await this.reconcileActiveSessions();
     const sessions = await this.sessionRecords();
+    let scheduled = 0;
     for (const [sessionToken, record] of sessions) {
-      for (const key of record.watches) this.scheduleRefresh(record.user.id, key, record.githubAccessToken, sessionToken, "poll");
+      for (const key of record.watches) {
+        const state = await this.watchState(record.user.id, key);
+        if (terminalState(state.snapshot) !== "watching") continue;
+        this.scheduleRefresh(record.user.id, key, record.githubAccessToken, sessionToken, "poll");
+        scheduled += 1;
+      }
     }
-    return this.accepted({ accepted: true, scheduled: true });
+    return this.accepted({ accepted: true, scheduled });
   }
+
   private async publishEvent(
     userId: number,
     key: string,
@@ -708,8 +1055,11 @@ export class WatchPrHub {
   ): Promise<void> {
     const storageKey = watchStorageKey(userId, event.repository, event.pullRequestNumber);
     let deliveredEvent = event;
+    let published = false;
     await this.state.storage.transaction(async (storage) => {
       const current = await readStoredWatchState(storage, storageKey);
+      const currentTerminalState = terminalState(current.snapshot);
+      if (currentTerminalState === "merged") return;
       let snapshot = state.snapshot;
       let changes = event.changes;
       if (!snapshot) {
@@ -725,13 +1075,17 @@ export class WatchPrHub {
           changes = snapshotChanges(current.snapshot, snapshot);
         }
       }
+      if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
       deliveredEvent = { ...event, snapshot, changes };
       const events = [...current.events, deliveredEvent].slice(-MAX_EVENTS);
       const storedEvents = events.map((entry, index) => (
         index === events.length - 1 ? entry : { ...entry, snapshot: null }
       ));
       await writeStoredWatchState(storage, storageKey, { snapshot, events: storedEvents });
+      published = true;
     });
+    if (!published) return;
+    this.publishMonitorEvent(userId, key, compactMonitorEvent(deliveredEvent));
 
     const active = [...this.activeSessions.values()].filter(
       (session) =>

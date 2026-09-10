@@ -11,6 +11,7 @@ Authenticate with the OAuth 2.0 authorization-code + S256 PKCE flow advertised a
 Tools:
 
 - `watch_pr` — subscribe to `repository` (`owner/name`) and `number`.
+- `open_pr_monitor` — create a revocable read-only SSE capability for an already-watched PR; the JSON result includes `monitorUrl`, `cursor`, and `terminalState`.
 - `unwatch_pr` — remove a subscription for the current GitHub account.
 - `list_watched_prs` — list the current account's subscriptions.
 - `get_pr` — read the latest durable pull request snapshot.
@@ -18,6 +19,8 @@ Tools:
 - Tool outputs default to `mode: "brief"`, which returns newline-delimited watcher-style lifecycle lines for PR state, head revision, mergeability, checks, reviews, comments, reactions, and feedback. Pass `mode: "full"` to `get_pr` for the complete current snapshot or to `list_pr_events` for event payloads. Resource reads remain full stored records.
 
 Each watched PR is also available as a resource at `watch-pr://owner/repository/pull/NUMBER`. A webhook or changed snapshot sends the standard `notifications/resources/updated` notification; clients can then call `resources/read`. The server also sends a compact event summary through `notifications/message` for clients that support logging notifications.
+
+The monitor URL is scoped to the current OAuth session and PR and carries no GitHub credential. `GET /monitor/...` replays events after the URL's `cursor` (or the `Last-Event-ID` header), then remains open for live events and heartbeat comments. A cursor older than the bounded event history receives a reconciliation event from the current snapshot. `unwatch_pr` revokes the capability; merged or closed feeds emit their terminal event and close naturally.
 
 Snapshots include PR lifecycle and mergeability, base/head refs, checks and commit statuses, reviews, top-level comments and reactions, inline review comments and reactions, and GraphQL review-thread resolution state.
 
