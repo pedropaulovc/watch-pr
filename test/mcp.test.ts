@@ -112,6 +112,11 @@ function context(currentSnapshot: PullRequestSnapshot = snapshot): McpSessionCon
     unwatch: async () => true,
     listWatches: async () => [currentRegistration],
     readWatch: async () => currentState,
+    openMonitor: async () => ({
+      monitorUrl: "https://watch-pr.test/monitor/capability?cursor=event-1",
+      cursor: "event-1",
+      terminalState: "watching",
+    }),
     subscribe: async () => undefined,
     unsubscribe: async () => undefined,
   };
@@ -202,5 +207,17 @@ describe("MCP output modes", () => {
 
     const full = await callTool("list_pr_events", { repository: "owner/repo", number: 7, mode: "full" });
     expect(JSON.parse(full)).toEqual({ repository: "owner/repo", number: 7, events: [event] });
+  });
+
+  it("returns the read-only monitor capability as JSON text", async () => {
+    const result = JSON.parse(await callTool("open_pr_monitor", {
+      repository: "owner/repo",
+      number: 7,
+    })) as Record<string, unknown>;
+    expect(result).toEqual({
+      monitorUrl: "https://watch-pr.test/monitor/capability?cursor=event-1",
+      cursor: "event-1",
+      terminalState: "watching",
+    });
   });
 });

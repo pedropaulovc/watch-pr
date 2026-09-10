@@ -18,6 +18,34 @@ export interface SessionRecord {
   subscriptions?: string[];
   watchStorageVersion?: 1;
 }
+
+export type MonitorTerminalState = "watching" | "merged" | "closed";
+
+export interface MonitorCapabilityRecord {
+  sessionToken: string;
+  userId: number;
+  repository: string;
+  pullRequestNumber: number;
+  createdAt: number;
+  expiresAt: number;
+}
+
+export interface PrMonitorRegistration {
+  monitorUrl: string;
+  cursor: string | null;
+  terminalState: MonitorTerminalState;
+}
+
+export interface PrMonitorEvent {
+  id: string;
+  repository: string;
+  pullRequestNumber: number;
+  githubEvent: string;
+  action: string | null;
+  receivedAt: string;
+  changes: string[];
+  terminalState: MonitorTerminalState;
+}
 export interface OAuthClientRecord {
   clientId: string;
   redirectUris: string[];
@@ -148,4 +176,12 @@ export function watchStorageKey(userId: number, repository: string, number: numb
 }
 export function legacyWatchStorageKey(repository: string, number: number): string {
   return `watch:${repository}:${number}`;
+}
+
+export function monitorCapabilityStorageKey(capability: string): string {
+  return `monitor:${capability}`;
+}
+
+export function monitorScopeStorageKey(sessionToken: string, repository: string, number: number): string {
+  return `monitor-scope:${sessionToken}:${repository}:${number}`;
 }

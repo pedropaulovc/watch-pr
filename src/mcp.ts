@@ -3,7 +3,7 @@ import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validatio
 import { ReadResourceRequestSchema, SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import { parseResourceUri, resourceUri, watchKey } from "./events";
-import type { GithubUser, PullRequestCheck, PullRequestComment, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
+import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestComment, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
 
 export type McpOutputMode = "brief" | "full";
 
@@ -22,6 +22,7 @@ export interface McpSessionContext {
   watch(repository: string, number: number): Promise<WatchRegistration>;
   unwatch(repository: string, number: number): Promise<boolean>;
   listWatches(): Promise<WatchRegistration[]>;
+  openMonitor(repository: string, number: number): Promise<PrMonitorRegistration>;
   readWatch(repository: string, number: number): Promise<StoredWatchState>;
   subscribe(repository: string, number: number): Promise<void>;
   unsubscribe(repository: string, number: number): Promise<void>;
@@ -29,9 +30,13 @@ export interface McpSessionContext {
 
 const outputModeSchema = z.enum(["brief", "full"]).default("brief").describe("Output detail: watcher-style lines or the full JSON record");
 
-const watchInputSchema = {
+const pullRequestInputSchema = {
   repository: z.string().describe("GitHub repository in owner/name form"),
   number: z.number().int().positive().describe("Pull request number"),
+};
+
+const watchInputSchema = {
+  ...pullRequestInputSchema,
   mode: outputModeSchema,
 };
 
@@ -204,6 +209,21 @@ export function createMcpServer(context: McpSessionContext): McpServer {
         `${removed ? "unwatched" : "not watching"} ${repository}#${number}`,
       ]);
     },
+  );
+
+  server.registerTool(
+    "open_pr_monitor",
+    {
+      title: "Open pull request monitor",
+      description: "Create a revocable read-only SSE capability for an already-watched pull request.",
+      inputSchema: pullRequestInputSchema,
+    },
+    async ({ repository, number }) => ({
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify(await context.openMonitor(repository, number)),
+      }],
+    }),
   );
 
   server.registerTool(
