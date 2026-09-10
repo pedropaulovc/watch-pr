@@ -188,6 +188,14 @@ function terminalState(snapshot: PullRequestSnapshot | null): MonitorTerminalSta
   return snapshot?.state.toLowerCase() === "closed" ? "closed" : "watching";
 }
 
+function resumesClosedWatch(event: WatchEvent, snapshot: PullRequestSnapshot | null): boolean {
+  if (terminalState(snapshot) !== "watching") return false;
+  return (
+    (event.githubEvent === "pull_request" && event.action === "reopened") ||
+    (event.githubEvent === "snapshot" && event.action === "watch")
+  );
+}
+
 function compactMonitorEvent(event: WatchEvent, state = terminalState(event.snapshot)): PrMonitorEvent {
   return {
     id: event.id,
@@ -317,6 +325,7 @@ export class WatchPrHub {
             this.closeMonitorFeed(activeFeed);
           }
         }, MONITOR_HEARTBEAT_MS);
+        for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) this.closeMonitorFeed(feed);
         activeFeed = {
           capability,
           userId: record.userId,
@@ -334,6 +343,18 @@ export class WatchPrHub {
         if (activeFeed) this.closeMonitorFeed(activeFeed, false);
       },
     });
+    const confirmed = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
+    if (
+      !confirmed ||
+      confirmed.sessionToken !== record.sessionToken ||
+      confirmed.userId !== record.userId ||
+      confirmed.repository !== record.repository ||
+      confirmed.pullRequestNumber !== record.pullRequestNumber ||
+      confirmed.expiresAt !== record.expiresAt
+    ) {
+      if (activeFeed) this.closeMonitorFeed(activeFeed);
+      return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+    }
     return new Response(body, {
       headers: {
         "cache-control": "no-cache, no-transform",
@@ -564,7 +585,7 @@ export class WatchPrHub {
       return existed;
     });
     const state = await this.watchState(active.record.user.id, key);
-    const refreshScheduled = terminalState(state.snapshot) === "watching";
+    const refreshScheduled = terminalState(state.snapshot) !== "merged";
     if (refreshScheduled) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "watch");
     if (!wasWatched) await this.notifyResourceListChanged(active);
     return {
@@ -920,6 +941,7 @@ export class WatchPrHub {
 
     const repository = repositoryFromPayload(payload);
     if (!repository) return;
+    const webhookAction = actionFromPayload(payload);
     for (const watcher of watchers.values()) {
       if (invalidSessionTokens.has(watcher.sessionToken)) continue;
       let parsed;
@@ -933,7 +955,9 @@ export class WatchPrHub {
       if (!targetNumbers.includes(parsed.number)) continue;
 
       const previous = await this.watchState(watcher.userId, watcher.key);
-      if (terminalState(previous.snapshot) !== "watching") continue;
+      const previousTerminalState = terminalState(previous.snapshot);
+      if (previousTerminalState === "merged") continue;
+      if (previousTerminalState === "closed" && (eventName !== "pull_request" || webhookAction !== "reopened")) continue;
       let snapshot = previous.snapshot;
       try {
         snapshot = await pullRequestSnapshot(watcher.githubToken, parsed.repository, parsed.number);
@@ -949,7 +973,7 @@ export class WatchPrHub {
       const event = createWatchEvent({
         deliveryId,
         githubEvent: eventName,
-        action: actionFromPayload(payload),
+        action: webhookAction,
         repository: parsed.repository,
         pullRequestNumber: parsed.number,
         payload,
@@ -979,7 +1003,8 @@ export class WatchPrHub {
     reason: string,
   ): Promise<void> {
     const initialState = await this.watchState(userId, key);
-    if (terminalState(initialState.snapshot) !== "watching") return;
+    const initialTerminalState = terminalState(initialState.snapshot);
+    if (initialTerminalState === "merged" || (initialTerminalState === "closed" && reason !== "watch")) return;
     const parsed = parseWatchKey(key);
     let snapshot;
     try {
@@ -989,7 +1014,8 @@ export class WatchPrHub {
       return;
     }
     const current = await this.watchState(userId, key);
-    if (terminalState(current.snapshot) !== "watching") return;
+    const currentTerminalState = terminalState(current.snapshot);
+    if (currentTerminalState === "merged" || (currentTerminalState === "closed" && reason !== "watch")) return;
     const changes = snapshotChanges(current.snapshot, snapshot);
     if (current.snapshot && changes.length === 0) return;
     const event = createWatchEvent({
@@ -1032,7 +1058,8 @@ export class WatchPrHub {
     let published = false;
     await this.state.storage.transaction(async (storage) => {
       const current = await readStoredWatchState(storage, storageKey);
-      if (terminalState(current.snapshot) !== "watching") return;
+      const currentTerminalState = terminalState(current.snapshot);
+      if (currentTerminalState === "merged") return;
       let snapshot = state.snapshot;
       let changes = event.changes;
       if (!snapshot) {
@@ -1048,6 +1075,7 @@ export class WatchPrHub {
           changes = snapshotChanges(current.snapshot, snapshot);
         }
       }
+      if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
       deliveredEvent = { ...event, snapshot, changes };
       const events = [...current.events, deliveredEvent].slice(-MAX_EVENTS);
       const storedEvents = events.map((entry, index) => (

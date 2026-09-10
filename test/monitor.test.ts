@@ -17,6 +17,7 @@ import {
 
 class MemoryStorage {
   private readonly values = new Map<string, unknown>();
+  afterGet?: (key: string) => void | Promise<void>;
 
   async get<T>(key: string | string[]): Promise<T | undefined | Map<string, T>> {
     if (Array.isArray(key)) {
@@ -25,7 +26,9 @@ class MemoryStorage {
         return value === undefined ? [] : [[entry, value as T]];
       }));
     }
-    return this.values.get(key) as T | undefined;
+    const value = this.values.get(key) as T | undefined;
+    await this.afterGet?.(key);
+    return value;
   }
 
   async put<T>(key: string | Record<string, T>, value?: T): Promise<void> {
@@ -143,6 +146,52 @@ function hubFixture(): {
   return { hub: new WatchPrHub(state, env), storage, pending };
 }
 
+function openPullRequestFetch() {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.endsWith("/pulls/7")) {
+      return Response.json({
+        number,
+        html_url: "https://github.com/owner/repo/pull/7",
+        title: "Monitor feed",
+        body: "body",
+        state: "open",
+        draft: false,
+        merged: false,
+        merged_at: null,
+        mergeable: true,
+        mergeable_state: "clean",
+        user: { login: "author" },
+        head: { ref: "feature", sha: "reopened" },
+        base: { ref: "main" },
+      });
+    }
+    if (url.endsWith("/issues/7")) return Response.json({ reactions: {} });
+    if (
+      url.endsWith("/issues/7/comments?per_page=100") ||
+      url.endsWith("/pulls/7/reviews?per_page=100") ||
+      url.endsWith("/pulls/7/comments?per_page=100") ||
+      url.endsWith("/commits/reopened/statuses?per_page=100")
+    ) return Response.json([]);
+    if (url.endsWith("/commits/reopened/check-runs?per_page=100")) return Response.json({ check_runs: [] });
+    if (url.endsWith("/graphql")) {
+      return Response.json({
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                nodes: [],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        },
+      });
+    }
+    throw new Error(`unexpected GitHub URL ${url}`);
+  });
+}
+
 async function storeMonitor(
   storage: MemoryStorage,
   state: StoredWatchState,
@@ -191,11 +240,15 @@ function feedReader(response: Response): FeedReader {
 
 type HubInternals = {
   activeSessions: Map<string, TestActiveSession>;
+  activeMonitorFeeds: Map<string, Set<unknown>>;
   newActiveSession(token: string, record: SessionRecord, kind: "stateful"): TestActiveSession;
   openMonitor(active: TestActiveSession, repository: string, number: number): Promise<{
     monitorUrl: string;
     cursor: string | null;
     terminalState: string;
+  }>;
+  watch(active: TestActiveSession, repository: string, number: number): Promise<{
+    refreshScheduled: boolean;
   }>;
   unwatch(active: TestActiveSession, repository: string, number: number): Promise<boolean>;
   publishEvent(
@@ -204,6 +257,7 @@ type HubInternals = {
     event: WatchEvent,
     state: Pick<StoredWatchState, "snapshot">,
   ): Promise<void>;
+  processWebhook(eventName: string, deliveryId: string, payload: Record<string, unknown>): Promise<void>;
 };
 
 type TestActiveSession = {
@@ -239,6 +293,43 @@ describe("native monitor feed", () => {
       terminalState: "watching",
     });
     await feed.reader.cancel();
+  });
+
+  it("keeps only the newest active feed for one capability", async () => {
+    const { hub, storage } = hubFixture();
+    const current = event("event-1");
+    await storeMonitor(storage, { snapshot: current.snapshot, events: [current] });
+    const url = `https://watch-pr.test/monitor/${capability}?cursor=event-1`;
+
+    const first = await hub.fetch(new Request(url));
+    const firstReader = first.body!.getReader();
+    await firstReader.read();
+    const second = await hub.fetch(new Request(url));
+
+    await expect(firstReader.read()).resolves.toMatchObject({ done: true });
+    const activeFeeds = (hub as unknown as HubInternals).activeMonitorFeeds.get(capability);
+    expect(activeFeeds?.size).toBe(1);
+    await second.body!.cancel();
+  });
+
+  it("does not register a feed when its capability is revoked during validation", async () => {
+    const { hub, storage } = hubFixture();
+    const current = event("event-1");
+    await storeMonitor(storage, { snapshot: current.snapshot, events: [current] });
+    const stateKey = watchStorageKey(userId, repository, number);
+    storage.afterGet = async (key) => {
+      if (key !== stateKey) return;
+      storage.afterGet = undefined;
+      await storage.delete([
+        monitorCapabilityStorageKey(capability),
+        monitorScopeStorageKey(sessionToken, repository, number),
+      ]);
+    };
+
+    const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}?cursor=event-1`));
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toMatchObject({ error: "monitor_not_found" });
+    expect((hub as unknown as HubInternals).activeMonitorFeeds.size).toBe(0);
   });
 
   it("reconciles from the current snapshot when the cursor fell out of the bounded log", async () => {
@@ -310,6 +401,75 @@ describe("native monitor feed", () => {
       vi.unstubAllGlobals();
     }
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("resumes a closed watch only for a pull_request reopened webhook", async () => {
+    const { hub, storage } = hubFixture();
+    const closed = snapshot({ state: "closed", fetchedAt: "2026-09-10T12:03:00.000Z" });
+    await storeMonitor(storage, {
+      snapshot: closed,
+      events: [event("event-closed", closed, { action: "closed", changes: ["lifecycle"] })],
+    });
+    const fetchMock = openPullRequestFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await (hub as unknown as HubInternals).processWebhook("pull_request", "delivery-reopened", {
+        action: "reopened",
+        repository: { full_name: repository },
+        pull_request: { number },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
+    expect(stored.snapshot).toMatchObject({ state: "open", merged: false, headSha: "reopened" });
+    expect(stored.events.at(-1)).toMatchObject({
+      deliveryId: "delivery-reopened",
+      githubEvent: "pull_request",
+      action: "reopened",
+      changes: expect.arrayContaining(["lifecycle"]),
+    });
+  });
+
+  it("refreshes an explicitly watched closed PR but never refreshes a merged PR", async () => {
+    const { hub, storage, pending } = hubFixture();
+    const closed = snapshot({ state: "closed", fetchedAt: "2026-09-10T12:03:00.000Z" });
+    const record = sessionRecord();
+    await storeMonitor(storage, {
+      snapshot: closed,
+      events: [event("event-closed", closed, { action: "closed", changes: ["lifecycle"] })],
+    }, record);
+    const internals = hub as unknown as HubInternals;
+    const active = internals.newActiveSession(sessionToken, record, "stateful");
+    const fetchMock = openPullRequestFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const registration = await internals.watch(active, repository, number);
+      expect(registration.refreshScheduled).toBe(true);
+      await Promise.all(pending.splice(0));
+      const reopened = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
+      expect(reopened.snapshot).toMatchObject({ state: "open", headSha: "reopened" });
+
+      const merged = snapshot({
+        state: "closed",
+        merged: true,
+        mergedAt: "2026-09-10T12:04:00.000Z",
+        fetchedAt: "2026-09-10T12:04:00.000Z",
+      });
+      await writeStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, number),
+        { snapshot: merged, events: [event("event-merged", merged, { action: "closed" })] },
+      );
+      fetchMock.mockClear();
+      const mergedRegistration = await internals.watch(active, repository, number);
+      expect(mergedRegistration.refreshScheduled).toBe(false);
+      expect(pending).toHaveLength(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("revokes the capability and closes its feed when the session unwatches", async () => {
