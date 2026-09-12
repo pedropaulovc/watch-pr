@@ -7,6 +7,7 @@ import type {
   PullRequestThread,
   ReactionCounts,
 } from "./types";
+import { normalizeRepository } from "./events";
 
 const API_ROOT = "https://api.github.com";
 const API_VERSION = "2022-11-28";
@@ -91,6 +92,17 @@ function nextLink(linkHeader: string | null): string | null {
 function stringValue(record: GithubRecord, key: string): string | null {
   const value = record[key];
   return typeof value === "string" ? value : null;
+}
+
+function repositoryFullName(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const fullName = stringValue(value as GithubRecord, "full_name");
+  if (!fullName) return null;
+  try {
+    return normalizeRepository(fullName);
+  } catch {
+    return null;
+  }
 }
 
 function numberValue(record: GithubRecord, key: string): number {
@@ -330,6 +342,7 @@ export async function pullRequestSnapshot(
     mergeableState: stringValue(pull, "mergeable_state"),
     baseRefName: stringValue(base, "ref"),
     headRefName: stringValue(head, "ref"),
+    headRepository: repositoryFullName(head.repo),
     headSha,
     author: userLogin(pull, "user"),
     fetchedAt: new Date().toISOString(),

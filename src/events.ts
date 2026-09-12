@@ -101,16 +101,31 @@ function pushedBranch(payload: Record<string, unknown>): string | null | undefin
     : null;
 }
 
-function pushTargetsWatch(payload: Record<string, unknown>, snapshot: PullRequestSnapshot | null): boolean {
+function pushTargetsWatch(
+  payload: Record<string, unknown>,
+  pushedRepository: string,
+  watchedRepository: string,
+  snapshot: PullRequestSnapshot | null,
+): boolean {
   const branch = pushedBranch(payload);
   if (branch === null) return false;
-  if (branch === undefined || !snapshot) {
-    // Incomplete webhook data or an as-yet-unpopulated watch cannot be ruled out safely.
-    return true;
+  if (!snapshot) return pushedRepository === watchedRepository;
+
+  const headRepository = snapshot.headRepository;
+  if (branch === undefined) {
+    return pushedRepository === watchedRepository || headRepository === pushedRepository;
   }
-  if (snapshot.headRefName === branch || snapshot.baseRefName === branch) return true;
-  // A missing head/base ref leaves a real possibility that this branch targets the watch.
-  return !snapshot.headRefName || !snapshot.baseRefName;
+  if (pushedRepository === watchedRepository && snapshot.baseRefName === branch) return true;
+  if (snapshot.headRefName === branch) {
+    // Legacy snapshots retain repository-local routing until their next refresh
+    // populates headRepository and can distinguish a fork branch collision.
+    return headRepository ? headRepository === pushedRepository : pushedRepository === watchedRepository;
+  }
+  if (pushedRepository === watchedRepository && !snapshot.baseRefName) return true;
+  if (!snapshot.headRefName) {
+    return headRepository ? headRepository === pushedRepository : pushedRepository === watchedRepository;
+  }
+  return false;
 }
 
 export function eventPullRequestNumbers(
@@ -148,8 +163,11 @@ export function eventPullRequestNumbers(
     for (const watch of watched) {
       try {
         const parsed = parseWatchKey(watch.key);
-        if (parsed.repository !== repository) continue;
-        if (eventName === "push" && !pushTargetsWatch(payload, watch.snapshot)) continue;
+        if (eventName === "push") {
+          if (!pushTargetsWatch(payload, repository, parsed.repository, watch.snapshot)) continue;
+        } else if (parsed.repository !== repository) {
+          continue;
+        }
         repositoryNumbers.add(parsed.number);
       } catch {
         // Ignore malformed watch keys from other callers.

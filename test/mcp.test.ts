@@ -17,6 +17,7 @@ const snapshot: PullRequestSnapshot = {
   mergeableState: "dirty",
   baseRefName: "main",
   headRefName: "feature",
+  headRepository: "owner/repo",
   headSha: "abc",
   author: "author",
   fetchedAt: "2026-09-05T00:00:00.000Z",

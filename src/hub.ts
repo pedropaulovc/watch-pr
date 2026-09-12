@@ -950,7 +950,7 @@ export class WatchPrHub {
       } catch {
         continue;
       }
-      if (parsed.repository !== repository) continue;
+      if (eventName !== "push" && parsed.repository !== repository) continue;
       let previous: StoredWatchState | undefined;
       if (eventName === "push") previous = await this.watchState(watcher.userId, watcher.key);
       const targetNumbers = eventPullRequestNumbers(eventName, payload, [{

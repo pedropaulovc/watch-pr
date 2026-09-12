@@ -17,6 +17,7 @@ const snapshot = (overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnap
   mergeableState: "clean",
   baseRefName: "main",
   headRefName: "feature",
+  headRepository: "owner/repo",
   headSha: "abc",
   author: "author",
   fetchedAt: "2026-09-03T00:00:00.000Z",
@@ -151,6 +152,48 @@ describe("watch-pr event contracts", () => {
       repository: { full_name: "owner/repo" },
       ref: "refs/heads/review-hobby-shop-tolerances",
     }, stack)).toEqual([733, 734]);
+  });
+
+  it("does not confuse a fork head with a same-named branch in the base repository", () => {
+    const forkWatch = [{
+      key: "owner/repo#735",
+      snapshot: snapshot({
+        number: 735,
+        headRefName: "feature",
+        headRepository: "contributor/repo",
+        baseRefName: "main",
+      }),
+    }];
+
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "owner/repo" },
+      ref: "refs/heads/feature",
+    }, forkWatch)).toEqual([]);
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "contributor/repo" },
+      ref: "refs/heads/feature",
+    }, forkWatch)).toEqual([735]);
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "owner/repo" },
+      ref: "refs/heads/main",
+    }, forkWatch)).toEqual([735]);
+  });
+
+  it("conservatively routes legacy fork snapshots without a stored head repository", () => {
+    const legacyWatch = [{
+      key: "owner/repo#735",
+      snapshot: snapshot({
+        number: 735,
+        headRefName: "feature",
+        headRepository: null,
+        baseRefName: "main",
+      }),
+    }];
+
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "owner/repo" },
+      ref: "refs/heads/feature",
+    }, legacyWatch)).toEqual([735]);
   });
 
   it("detects description, mergeability, review, check, and reaction changes", () => {

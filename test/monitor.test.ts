@@ -81,6 +81,7 @@ function snapshot(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnap
     mergeableState: "clean",
     baseRefName: "main",
     headRefName: "feature",
+    headRepository: repository,
     headSha: "abc",
     author: "author",
     fetchedAt: "2026-09-10T12:00:00.000Z",
@@ -162,7 +163,7 @@ function openPullRequestFetch() {
         mergeable: true,
         mergeable_state: "clean",
         user: { login: "author" },
-        head: { ref: "feature", sha: "reopened" },
+        head: { ref: "feature", sha: "reopened", repo: { full_name: repository } },
         base: { ref: "main" },
       });
     }
@@ -192,7 +193,9 @@ function openPullRequestFetch() {
   });
 }
 
-function stackedPullRequestFetch(branches: Record<number, { head: string; base: string; sha: string }>) {
+function stackedPullRequestFetch(
+  branches: Record<number, { head: string; headRepository: string; base: string; sha: string }>,
+) {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = new URL(String(input));
     if (url.pathname.endsWith("/graphql")) {
@@ -227,7 +230,7 @@ function stackedPullRequestFetch(branches: Record<number, { head: string; base: 
         mergeable: true,
         mergeable_state: "clean",
         user: { login: "author" },
-        head: { ref: branch.head, sha: branch.sha },
+        head: { ref: branch.head, sha: branch.sha, repo: { full_name: branch.headRepository } },
         base: { ref: branch.base },
       });
     }
@@ -460,18 +463,21 @@ describe("native monitor feed", () => {
       {
         number: 730,
         head: "recreate-pinion-handle",
+        headRepository: repository,
         base: "main",
         sha: "sha-730",
       },
       {
         number: 733,
         head: "review-hobby-shop-tolerances",
+        headRepository: repository,
         base: "recreate-pinion-handle",
         sha: "sha-733",
       },
       {
         number: 734,
         head: "review-machinist-prompt-eval",
+        headRepository: "contributor/repo",
         base: "review-hobby-shop-tolerances",
         sha: "sha-734",
       },
@@ -485,6 +491,7 @@ describe("native monitor feed", () => {
         number: pullRequest.number,
         url: `https://github.com/${repository}/pull/${pullRequest.number}`,
         headRefName: pullRequest.head,
+        headRepository: pullRequest.headRepository,
         baseRefName: pullRequest.base,
         headSha: pullRequest.sha,
       });
@@ -533,6 +540,31 @@ describe("native monitor feed", () => {
         githubEvent: "push",
         changes: [],
       });
+
+      fetchMock.mockClear();
+      await (hub as unknown as HubInternals).processWebhook("push", "delivery-base-collision", {
+        repository: { full_name: repository },
+        ref: "refs/heads/review-machinist-prompt-eval",
+      });
+      const afterBaseCollision = await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, 734),
+      );
+      expect(afterBaseCollision.events).toHaveLength(1);
+      expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/pulls/734"))).toBe(false);
+
+      await (hub as unknown as HubInternals).processWebhook("push", "delivery-fork-head", {
+        repository: { full_name: "contributor/repo" },
+        ref: "refs/heads/review-machinist-prompt-eval",
+      });
+      const afterForkHead = await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, 734),
+      );
+      expect(afterForkHead.events.map((storedEvent) => storedEvent.deliveryId)).toEqual([
+        "delivery-733",
+        "delivery-fork-head",
+      ]);
     } finally {
       vi.unstubAllGlobals();
     }

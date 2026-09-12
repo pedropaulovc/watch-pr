@@ -137,6 +137,7 @@ export interface PullRequestSnapshot {
   mergeableState: string | null;
   baseRefName: string | null;
   headRefName: string | null;
+  headRepository: string | null;
   headSha: string | null;
   author: string | null;
   fetchedAt: string;
