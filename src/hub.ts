@@ -65,10 +65,73 @@ const MAX_MONITOR_CURSOR_LENGTH = 256;
 const MAX_STORAGE_BATCH_KEYS = 128;
 const MAX_WATCH_STATE_BYTES = 64 * 1024;
 const MAX_WATCH_CHUNK_CHARACTERS = 16_000;
+const DELIVERY_DEDUPLICATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const WEBHOOK_TELEMETRY_SAMPLE_RATE = 0.01;
+const HIGH_WRITE_TELEMETRY_THRESHOLD = 4;
+
 
 interface WatchStateIndex {
   chunkCount: number;
 }
+
+interface WatchStateWriteStats {
+  puts: number;
+  deletes: number;
+  encodedBytes: number;
+  chunkCount: number;
+  format: "compact" | "chunked";
+}
+
+interface PublishResult {
+  published: boolean;
+  write: WatchStateWriteStats | null;
+}
+
+interface WebhookProcessStats {
+  candidateWatches: number;
+  routedWatches: number;
+  duplicateWatches: number;
+  publishedWatches: number;
+  deliveryDedupePuts: number;
+
+  storageKeyPuts: number;
+  storageKeyDeletes: number;
+  compactWrites: number;
+  chunkedWrites: number;
+  largestStateBytes: number;
+  largestStateChunkCount: number;
+}
+
+function createWebhookProcessStats(): WebhookProcessStats {
+  return {
+    candidateWatches: 0,
+    routedWatches: 0,
+    duplicateWatches: 0,
+    publishedWatches: 0,
+    deliveryDedupePuts: 0,
+    storageKeyPuts: 0,
+    storageKeyDeletes: 0,
+    compactWrites: 0,
+    chunkedWrites: 0,
+    largestStateBytes: 0,
+    largestStateChunkCount: 0,
+  };
+}
+
+interface WebhookWatcher {
+  userId: number;
+  key: string;
+  githubToken: string;
+  sessionToken: string;
+}
+
+interface WebhookTarget extends WebhookWatcher {
+  repository: string;
+  number: number;
+  previous: StoredWatchState;
+}
+
+
 
 export type WatchStorage = Pick<DurableObjectStorage, "get" | "put" | "delete">;
 
@@ -147,20 +210,23 @@ export async function readStoredWatchState(storage: WatchStorage, storageKey: st
   }
 }
 
-export async function writeStoredWatchState(storage: WatchStorage, storageKey: string, state: StoredWatchState): Promise<void> {
+export async function writeStoredWatchState(
+  storage: WatchStorage,
+  storageKey: string,
+  state: StoredWatchState,
+): Promise<WatchStateWriteStats> {
   const encoded = JSON.stringify(state);
   const previous = await storage.get<unknown>(storageKey);
   const previousChunkCount = isWatchStateIndex(previous) ? previous.chunkCount : 0;
   const encodedBytes = new TextEncoder().encode(encoded).byteLength;
   if (encodedBytes <= MAX_WATCH_STATE_BYTES) {
     await storage.put(storageKey, state);
-    if (previousChunkCount > 0) {
-      await deleteStorageKeys(
-        storage,
-        Array.from({ length: previousChunkCount }, (_, index) => watchChunkKey(storageKey, index)),
-      );
+    if (previousChunkCount === 0) {
+      return { puts: 1, deletes: 0, encodedBytes, chunkCount: 0, format: "compact" };
     }
-    return;
+    const staleChunks = Array.from({ length: previousChunkCount }, (_, index) => watchChunkKey(storageKey, index));
+    await deleteStorageKeys(storage, staleChunks);
+    return { puts: 1, deletes: staleChunks.length, encodedBytes, chunkCount: 0, format: "compact" };
   }
 
   const chunkCount = Math.ceil(encoded.length / MAX_WATCH_CHUNK_CHARACTERS);
@@ -172,13 +238,80 @@ export async function writeStoredWatchState(storage: WatchStorage, storageKey: s
     );
   }
   await putStorageEntries(storage, chunks);
-  await storage.put(storageKey, { chunkCount } satisfies WatchStateIndex);
-  if (previousChunkCount > chunkCount) {
+  let puts = chunkCount;
+  if (previousChunkCount !== chunkCount) {
+    await storage.put(storageKey, { chunkCount } satisfies WatchStateIndex);
+    puts += 1;
+  }
+  const staleChunkCount = Math.max(previousChunkCount - chunkCount, 0);
+  if (staleChunkCount > 0) {
     await deleteStorageKeys(
       storage,
-      Array.from({ length: previousChunkCount - chunkCount }, (_, index) => watchChunkKey(storageKey, chunkCount + index)),
+      Array.from({ length: staleChunkCount }, (_, index) => watchChunkKey(storageKey, chunkCount + index)),
     );
   }
+  return { puts, deletes: staleChunkCount, encodedBytes, chunkCount, format: "chunked" };
+}
+
+
+function sampleStorageTelemetry(): boolean {
+  const value = crypto.getRandomValues(new Uint32Array(1))[0]!;
+  return value / 0x1_0000_0000 < WEBHOOK_TELEMETRY_SAMPLE_RATE;
+}
+
+function logWatchStateWrite(event: WatchEvent, write: WatchStateWriteStats): void {
+  const storageKeyWrites = write.puts + write.deletes;
+  const sampled = sampleStorageTelemetry();
+  const sampleReason = storageKeyWrites >= HIGH_WRITE_TELEMETRY_THRESHOLD
+    ? "high_write"
+    : sampled
+      ? "random"
+      : null;
+  if (!sampleReason) return;
+  console.log(JSON.stringify({
+    event: "watch_pr.do_storage",
+    schema_version: 1,
+    sample_rate: sampleReason === "high_write" ? 1 : WEBHOOK_TELEMETRY_SAMPLE_RATE,
+    sample_reason: sampleReason,
+    source: event.githubEvent === "snapshot" ? "refresh" : "webhook",
+    github_event: event.githubEvent,
+    github_action: event.action,
+    storage_key_puts: write.puts,
+    storage_key_deletes: write.deletes,
+    storage_key_writes: storageKeyWrites,
+    encoded_state_bytes: write.encodedBytes,
+    state_chunk_count: write.chunkCount,
+    state_format: write.format,
+  }));
+}
+
+function logWebhookFanout(eventName: string, sampled: boolean, stats: WebhookProcessStats): void {
+  const storageKeyWrites = stats.storageKeyPuts + stats.storageKeyDeletes;
+  const sampleReason = storageKeyWrites >= HIGH_WRITE_TELEMETRY_THRESHOLD
+    ? "high_write"
+    : sampled
+      ? "random"
+      : null;
+  if (!sampleReason) return;
+  console.log(JSON.stringify({
+    event: "watch_pr.webhook_fanout",
+    schema_version: 1,
+    sample_rate: sampleReason === "high_write" ? 1 : WEBHOOK_TELEMETRY_SAMPLE_RATE,
+    sample_reason: sampleReason,
+    github_event: eventName,
+    candidate_watches: stats.candidateWatches,
+    routed_watches: stats.routedWatches,
+    duplicate_watches: stats.duplicateWatches,
+    published_watches: stats.publishedWatches,
+    storage_key_puts: stats.storageKeyPuts,
+    delivery_dedupe_puts: stats.deliveryDedupePuts,
+    storage_key_deletes: stats.storageKeyDeletes,
+    storage_key_writes: storageKeyWrites,
+    compact_writes: stats.compactWrites,
+    chunked_writes: stats.chunkedWrites,
+    largest_state_bytes: stats.largestStateBytes,
+    largest_state_chunk_count: stats.largestStateChunkCount,
+  }));
 }
 
 const monitorEncoder = new TextEncoder();
@@ -241,11 +374,24 @@ export class WatchPrHub {
   private readonly activeMonitorFeeds = new Map<string, Set<ActiveMonitorFeed>>();
   private readonly refreshes = new Set<string>();
   private readonly sessionOperations = new Map<string, Promise<void>>();
+  private readonly recentDeliveries = new Set<string>();
 
   constructor(
     private readonly state: DurableObjectState,
     private readonly env: Env,
   ) { }
+
+  private rememberDelivery(deliveryId: string): boolean {
+    if (this.recentDeliveries.has(deliveryId)) return false;
+    this.recentDeliveries.add(deliveryId);
+    return true;
+  }
+
+
+  private releaseDelivery(deliveryId: string): void {
+    this.recentDeliveries.delete(deliveryId);
+  }
+
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -658,22 +804,23 @@ export class WatchPrHub {
     };
   }
 
-  private async revokeMonitorScope(sessionToken: string, key: string): Promise<void> {
+  private async revokeMonitorScope(sessionToken: string, key: string): Promise<number> {
     const parsed = parseWatchKey(key);
     const scopeKey = monitorScopeStorageKey(sessionToken, parsed.repository, parsed.number);
     const capability = await this.state.storage.get<string>(scopeKey);
-    if (!capability) {
-      await this.state.storage.delete(scopeKey);
-      return;
-    }
+    if (!capability) return 0;
     const record = await this.state.storage.get<MonitorCapabilityRecord>(monitorCapabilityStorageKey(capability));
-    await this.revokeMonitorCapability(capability, record);
+    if (!record) {
+      await this.state.storage.delete(scopeKey);
+      return 1;
+    }
+    return this.revokeMonitorCapability(capability, record);
   }
 
   private async revokeMonitorCapability(
     capability: string,
     record?: MonitorCapabilityRecord,
-  ): Promise<void> {
+  ): Promise<number> {
     const keys = [monitorCapabilityStorageKey(capability)];
     if (record) {
       const scopeKey = monitorScopeStorageKey(record.sessionToken, record.repository, record.pullRequestNumber);
@@ -682,17 +829,20 @@ export class WatchPrHub {
     }
     await this.state.storage.delete(keys);
     for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) this.closeMonitorFeed(feed);
+    return keys.length;
   }
 
-  private async revokeSessionMonitors(sessionToken: string, watchKeys: Iterable<string>): Promise<void> {
+  private async revokeSessionMonitors(sessionToken: string, watchKeys: Iterable<string>): Promise<number> {
+    let deletes = 0;
     for (const key of watchKeys) {
       try {
-        await this.revokeMonitorScope(sessionToken, key);
+        deletes += await this.revokeMonitorScope(sessionToken, key);
       } catch {
         // Ignore malformed persisted watch keys while revoking the rest of the session.
       }
     }
     this.closeMonitorFeedsForSession(sessionToken);
+    return deletes;
   }
 
   private closeMonitorFeedsForSession(sessionToken: string): void {
@@ -758,10 +908,20 @@ export class WatchPrHub {
         const watches = new Set(current.watches);
         const subscriptions = new Set(current.subscriptions ?? []);
         const result = mutate(watches, subscriptions);
+        const nextWatches = [...watches].sort();
+        const nextSubscriptions = [...subscriptions].filter((entry) => watches.has(entry)).sort();
+        const watchesChanged =
+          current.watches.length !== nextWatches.length ||
+          current.watches.some((entry, index) => entry !== nextWatches[index]);
+        const currentSubscriptions = current.subscriptions ?? [];
+        const subscriptionsChanged =
+          currentSubscriptions.length !== nextSubscriptions.length ||
+          currentSubscriptions.some((entry, index) => entry !== nextSubscriptions[index]);
+        if (!watchesChanged && !subscriptionsChanged) return { record: current, result };
         const record: SessionRecord = {
           ...current,
-          watches: [...watches].sort(),
-          subscriptions: [...subscriptions].filter((entry) => watches.has(entry)).sort(),
+          watches: nextWatches,
+          subscriptions: nextSubscriptions,
         };
         await storage.put(key, record);
         return { record, result };
@@ -891,9 +1051,38 @@ export class WatchPrHub {
     }
     const deliveryKey = `delivery:${deliveryId}`;
     const previousDelivery = await this.state.storage.get<number>(deliveryKey);
-    if (previousDelivery && Date.now() - previousDelivery < 7 * 24 * 60 * 60 * 1000) return this.accepted({ accepted: true, duplicate: true });
-    await this.state.storage.put(deliveryKey, Date.now());
-    this.state.waitUntil(this.processWebhook(eventName, deliveryId, payload));
+    if (previousDelivery && Date.now() - previousDelivery < DELIVERY_DEDUPLICATION_WINDOW_MS) {
+      return this.accepted({ accepted: true, duplicate: true });
+    }
+    if (!this.rememberDelivery(deliveryId)) return this.accepted({ accepted: true, duplicate: true });
+    const sampled = sampleStorageTelemetry();
+    const stats = createWebhookProcessStats();
+    this.state.waitUntil(
+      this.processWebhook(eventName, deliveryId, payload, stats)
+        .then(() => {
+          logWebhookFanout(eventName, sampled, stats);
+        })
+        .catch(async (error) => {
+          logWebhookFanout(eventName, sampled, stats);
+          const errorKind = error instanceof GithubApiError
+            ? "github_api"
+            : error instanceof TypeError
+              ? "network_or_runtime"
+              : "unexpected";
+          const githubStatus = error instanceof GithubApiError ? error.status : undefined;
+          console.log(JSON.stringify({
+            event: "watch_pr.webhook_failure",
+            github_event: eventName,
+            delivery_fingerprint: await sha256Base64Url(deliveryId),
+            error_kind: errorKind,
+            error_name: error instanceof Error ? error.name : typeof error,
+            ...(githubStatus === undefined ? {} : { github_status: githubStatus }),
+          }));
+        })
+        .finally(() => {
+          this.releaseDelivery(deliveryId);
+        }),
+    );
     return this.accepted({ accepted: true, deliveryId, event: eventName });
   }
 
@@ -905,26 +1094,35 @@ export class WatchPrHub {
     }
   }
 
-  private async invalidateSession(token: string, expectedGithubToken?: string): Promise<void> {
-    await this.withSessionLock(token, async () => {
+  private async invalidateSession(token: string, expectedGithubToken?: string): Promise<number> {
+    return this.withSessionLock(token, async () => {
       const key = sessionStorageKey(token);
       const current = await this.state.storage.get<SessionRecord>(key);
       if (!current) {
         this.closeMonitorFeedsForSession(token);
         await this.closeActiveSessionsForToken(token);
-        return;
+        return 0;
       }
-      if (expectedGithubToken && current.githubAccessToken !== expectedGithubToken) return;
-      await this.revokeSessionMonitors(token, current.watches);
-      await this.state.storage.delete([key, `closed-mcp-sessions:${token}`]);
+      if (expectedGithubToken && current.githubAccessToken !== expectedGithubToken) return 0;
+      const monitorDeletes = await this.revokeSessionMonitors(token, current.watches);
+      const closedSessionKey = `closed-mcp-sessions:${token}`;
+      const closedSession = await this.state.storage.get<unknown>(closedSessionKey);
+      const keys = closedSession === undefined ? [key] : [key, closedSessionKey];
+      await this.state.storage.delete(keys);
       await this.closeActiveSessionsForToken(token);
+      return monitorDeletes + keys.length;
     });
   }
 
-  private async processWebhook(eventName: string, deliveryId: string, payload: Record<string, unknown>): Promise<void> {
+  private async processWebhook(
+    eventName: string,
+    deliveryId: string,
+    payload: Record<string, unknown>,
+    stats = createWebhookProcessStats(),
+  ): Promise<WebhookProcessStats> {
     await this.reconcileActiveSessions();
     const sessions = await this.sessionRecords();
-    const watchers = new Map<string, { userId: number; key: string; githubToken: string; sessionToken: string }>();
+    const watchers = new Map<string, WebhookWatcher>();
     const invalidSessionTokens = new Set<string>();
     const addWatchers = (sessionToken: string, record: SessionRecord): void => {
       for (const key of record.watches) {
@@ -938,12 +1136,15 @@ export class WatchPrHub {
     };
     for (const [sessionToken, record] of sessions) addWatchers(sessionToken, record);
     for (const active of this.activeSessions.values()) addWatchers(active.token, active.record);
+    stats.candidateWatches = watchers.size;
 
     const repository = repositoryFromPayload(payload);
-    if (!repository) return;
+    if (!repository) {
+      return stats;
+    }
     const webhookAction = actionFromPayload(payload);
+    const targets: WebhookTarget[] = [];
     for (const watcher of watchers.values()) {
-      if (invalidSessionTokens.has(watcher.sessionToken)) continue;
       let parsed;
       try {
         parsed = parseWatchKey(watcher.key);
@@ -958,18 +1159,33 @@ export class WatchPrHub {
         snapshot: previous?.snapshot ?? null,
       }]);
       if (!targetNumbers.includes(parsed.number)) continue;
-
       previous ??= await this.watchState(watcher.userId, watcher.key);
       const previousTerminalState = terminalState(previous.snapshot);
       if (previousTerminalState === "merged") continue;
       if (previousTerminalState === "closed" && (eventName !== "pull_request" || webhookAction !== "reopened")) continue;
+      targets.push({ ...watcher, repository: parsed.repository, number: parsed.number, previous });
+    }
+    stats.routedWatches = targets.length;
+    if (targets.length === 0) {
+      return stats;
+    }
+
+
+
+    for (const target of targets) {
+      const { githubToken, key, number, previous, repository: targetRepository, sessionToken, userId } = target;
+      if (invalidSessionTokens.has(sessionToken)) continue;
+      if (previous.events.some((event) => event.deliveryId === deliveryId)) {
+        stats.duplicateWatches += 1;
+        continue;
+      }
       let snapshot = previous.snapshot;
       try {
-        snapshot = await pullRequestSnapshot(watcher.githubToken, parsed.repository, parsed.number);
+        snapshot = await pullRequestSnapshot(githubToken, targetRepository, number);
       } catch (error) {
         if (isGithubAuthorizationError(error)) {
-          invalidSessionTokens.add(watcher.sessionToken);
-          await this.invalidateSession(watcher.sessionToken, watcher.githubToken);
+          invalidSessionTokens.add(sessionToken);
+          stats.storageKeyDeletes += await this.invalidateSession(sessionToken, githubToken);
           continue;
         }
         snapshot = previous.snapshot;
@@ -979,25 +1195,39 @@ export class WatchPrHub {
         deliveryId,
         githubEvent: eventName,
         action: webhookAction,
-        repository: parsed.repository,
-        pullRequestNumber: parsed.number,
+        repository: targetRepository,
+        pullRequestNumber: number,
         payload,
         snapshot,
         changes,
       });
-      await this.publishEvent(watcher.userId, watcher.key, event, { snapshot });
+      const result = await this.publishEvent(userId, key, event, { snapshot });
+      if (!result.published || !result.write) continue;
+      stats.publishedWatches += 1;
+      stats.storageKeyPuts += result.write.puts;
+      stats.storageKeyDeletes += result.write.deletes;
+      stats.largestStateBytes = Math.max(stats.largestStateBytes, result.write.encodedBytes);
+      stats.largestStateChunkCount = Math.max(stats.largestStateChunkCount, result.write.chunkCount);
+      if (result.write.format === "compact") stats.compactWrites += 1;
+      if (result.write.format === "chunked") stats.chunkedWrites += 1;
     }
+    const deliveryKey = `delivery:${deliveryId}`;
+    await this.state.storage.put(deliveryKey, Date.now());
+    stats.deliveryDedupePuts = 1;
+    stats.storageKeyPuts += 1;
+    return stats;
   }
 
-  private scheduleRefresh(userId: number, key: string, githubToken: string, sessionToken: string, reason: string): void {
+  private scheduleRefresh(userId: number, key: string, githubToken: string, sessionToken: string, reason: string): boolean {
     const refreshKey = `${userId}:${key}`;
-    if (this.refreshes.has(refreshKey)) return;
+    if (this.refreshes.has(refreshKey)) return false;
     this.refreshes.add(refreshKey);
     this.state.waitUntil(
       this.refreshAndPublish(userId, key, githubToken, sessionToken, reason).finally(() => {
         this.refreshes.delete(refreshKey);
       }),
     );
+    return true;
   }
 
   private async refreshAndPublish(
@@ -1040,15 +1270,22 @@ export class WatchPrHub {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     await this.reconcileActiveSessions();
     const sessions = await this.sessionRecords();
+    let refreshesStarted = 0;
     let scheduled = 0;
     for (const [sessionToken, record] of sessions) {
       for (const key of record.watches) {
         const state = await this.watchState(record.user.id, key);
         if (terminalState(state.snapshot) !== "watching") continue;
-        this.scheduleRefresh(record.user.id, key, record.githubAccessToken, sessionToken, "poll");
         scheduled += 1;
+        if (this.scheduleRefresh(record.user.id, key, record.githubAccessToken, sessionToken, "poll")) refreshesStarted += 1;
       }
     }
+    console.log(JSON.stringify({
+      event: "watch_pr.poll",
+      active_sessions: sessions.size,
+      scheduled_watches: scheduled,
+      refreshes_started: refreshesStarted,
+    }));
     return this.accepted({ accepted: true, scheduled });
   }
 
@@ -1057,10 +1294,11 @@ export class WatchPrHub {
     key: string,
     event: WatchEvent,
     state: Pick<StoredWatchState, "snapshot">,
-  ): Promise<void> {
+  ): Promise<PublishResult> {
     const storageKey = watchStorageKey(userId, event.repository, event.pullRequestNumber);
     let deliveredEvent = event;
     let published = false;
+    let write: WatchStateWriteStats | null = null;
     await this.state.storage.transaction(async (storage) => {
       const current = await readStoredWatchState(storage, storageKey);
       const currentTerminalState = terminalState(current.snapshot);
@@ -1086,10 +1324,11 @@ export class WatchPrHub {
       const storedEvents = events.map((entry, index) => (
         index === events.length - 1 ? entry : { ...entry, snapshot: null }
       ));
-      await writeStoredWatchState(storage, storageKey, { snapshot, events: storedEvents });
+      write = await writeStoredWatchState(storage, storageKey, { snapshot, events: storedEvents });
       published = true;
     });
-    if (!published) return;
+    if (!published || !write) return { published: false, write: null };
+    logWatchStateWrite(deliveredEvent, write);
     this.publishMonitorEvent(userId, key, compactMonitorEvent(deliveredEvent));
 
     const active = [...this.activeSessions.values()].filter(
@@ -1125,6 +1364,7 @@ export class WatchPrHub {
         // Resource updates remain the interoperable push channel.
       }
     }));
+    return { published: true, write };
   }
 
   private syncActiveSessions(token: string, record: SessionRecord): void {

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { hmacSha256Hex, sha256Base64Url } from "../src/crypto";
 import { WatchPrHub, readStoredWatchState, writeStoredWatchState, type Env } from "../src/hub";
 import type {
   MonitorCapabilityRecord,
@@ -17,8 +18,9 @@ import {
 
 class MemoryStorage {
   private readonly values = new Map<string, unknown>();
+  readonly deleteKeys: string[] = [];
   afterGet?: (key: string) => void | Promise<void>;
-
+  putError?: (key: string) => unknown;
   async get<T>(key: string | string[]): Promise<T | undefined | Map<string, T>> {
     if (Array.isArray(key)) {
       return new Map(key.flatMap((entry) => {
@@ -33,18 +35,26 @@ class MemoryStorage {
 
   async put<T>(key: string | Record<string, T>, value?: T): Promise<void> {
     if (typeof key === "string") {
+      const error = this.putError?.(key);
+      if (error !== undefined) throw error;
       this.values.set(key, value);
       return;
     }
-    for (const [entry, entryValue] of Object.entries(key)) this.values.set(entry, entryValue);
+    for (const [entry, entryValue] of Object.entries(key)) {
+      const error = this.putError?.(entry);
+      if (error !== undefined) throw error;
+      this.values.set(entry, entryValue);
+    }
   }
 
   async delete(key: string | string[]): Promise<boolean> {
     if (Array.isArray(key)) {
+      this.deleteKeys.push(...key);
       let deleted = false;
       for (const entry of key) deleted = this.values.delete(entry) || deleted;
       return deleted;
     }
+    this.deleteKeys.push(key);
     return this.values.delete(key);
   }
 
@@ -53,7 +63,6 @@ class MemoryStorage {
       .filter(([key]) => !options.prefix || key.startsWith(options.prefix))
       .map(([key, value]) => [key, value as T]));
   }
-
   async transaction<T>(callback: (storage: MemoryStorage) => Promise<T>): Promise<T> {
     return callback(this);
   }
@@ -128,6 +137,7 @@ function hubFixture(): {
   hub: WatchPrHub;
   storage: MemoryStorage;
   pending: Promise<unknown>[];
+  restart(): WatchPrHub;
 } {
   const storage = new MemoryStorage();
   const pending: Promise<unknown>[] = [];
@@ -144,7 +154,7 @@ function hubFixture(): {
     GITHUB_WEBHOOK_SECRET: "webhook-secret",
     PUBLIC_BASE_URL: "https://watch-pr.test",
   };
-  return { hub: new WatchPrHub(state, env), storage, pending };
+  return { hub: new WatchPrHub(state, env), storage, pending, restart: () => new WatchPrHub(state, env) };
 }
 
 function openPullRequestFetch() {
@@ -312,6 +322,7 @@ type HubInternals = {
     state: Pick<StoredWatchState, "snapshot">,
   ): Promise<void>;
   processWebhook(eventName: string, deliveryId: string, payload: Record<string, unknown>): Promise<void>;
+  invalidateSession(token: string, expectedGithubToken?: string): Promise<number>;
 };
 
 type TestActiveSession = {
@@ -434,6 +445,342 @@ describe("native monitor feed", () => {
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-terminal"]);
   });
 
+  it("logs multi-chunk Durable Object state writes without sampling", async () => {
+    const { hub } = hubFixture();
+    const current = snapshot();
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await (hub as unknown as HubInternals).publishEvent(
+        userId,
+        watch,
+        event("event-large", current, { payload: "x".repeat(80_000) }),
+        { snapshot: current },
+      );
+      const record = log.mock.calls
+        .map(([value]) => JSON.parse(String(value)) as Record<string, unknown>)
+        .find((entry) => entry.event === "watch_pr.do_storage");
+      expect(record).toMatchObject({
+        event: "watch_pr.do_storage",
+        sample_rate: 1,
+        sample_reason: "high_write",
+        source: "webhook",
+        state_format: "chunked",
+      });
+      expect(record?.state_chunk_count).toBeGreaterThanOrEqual(4);
+      expect(record?.storage_key_writes).toBeGreaterThanOrEqual(4);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("deduplicates matched deliveries after a hub restart", async () => {
+    const { hub, pending, restart, storage } = hubFixture();
+    await storeMonitor(storage, { snapshot: snapshot(), events: [] });
+    const deliveryId = "persistent-delivery";
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { full_name: repository },
+      pull_request: { number },
+    });
+    const headers = {
+      "x-github-delivery": deliveryId,
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+    };
+    const fetchMock = openPullRequestFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const first = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      expect(first.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      await expect(storage.get<number>(`delivery:${deliveryId}`)).resolves.toEqual(expect.any(Number));
+      fetchMock.mockClear();
+
+      const duplicate = await restart().fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      await expect(duplicate.json()).resolves.toMatchObject({ accepted: true, duplicate: true });
+
+      const stored = await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, number),
+      );
+      expect(stored.events).toHaveLength(1);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+
+  it("retries a matched delivery after fanout storage fails", async () => {
+    const { hub, pending, storage } = hubFixture();
+    await storeMonitor(storage, { snapshot: snapshot(), events: [] });
+    const deliveryId = "fanout-failure-delivery";
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { full_name: repository },
+      pull_request: { number },
+    });
+    const headers = {
+      "x-github-delivery": deliveryId,
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+    };
+    storage.putError = (key) => key === watchStorageKey(userId, repository, number)
+      ? new Error("watch state write failed")
+      : undefined;
+    const fetchMock = openPullRequestFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const first = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      expect(first.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      await expect(storage.get<number>(`delivery:${deliveryId}`)).resolves.toBeUndefined();
+      fetchMock.mockClear();
+      storage.putError = undefined;
+
+      const retry = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      await expect(retry.json()).resolves.toMatchObject({ accepted: true, deliveryId });
+      await Promise.all(pending.splice(0));
+      expect(fetchMock).toHaveBeenCalled();
+      await expect(storage.get<number>(`delivery:${deliveryId}`)).resolves.toEqual(expect.any(Number));
+
+      const stored = await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, number),
+      );
+      expect(stored.events).toHaveLength(1);
+      expect(stored.events[0]?.deliveryId).toBe(deliveryId);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("logs and resumes partial high-write fanout after a later target fails", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const watcherIds = [41, 42, 43, 44, 45];
+    for (const watcherId of watcherIds) {
+      await storage.put(sessionStorageKey(`partial-failure-${watcherId}`), sessionRecord({
+        user: { ...sessionRecord().user, id: watcherId },
+        watches: [watch],
+      }));
+      await writeStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(watcherId, repository, number),
+        { snapshot: snapshot(), events: [] },
+      );
+    }
+    storage.putError = (key) => key === watchStorageKey(45, repository, number)
+      ? new Error("later watch state write failed")
+      : undefined;
+    const deliveryId = "partial-failure-delivery";
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { full_name: repository },
+      pull_request: { number },
+    });
+    const headers = {
+      "x-github-delivery": deliveryId,
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+    };
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", openPullRequestFetch());
+    try {
+      const response = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      await expect(storage.get<number>(`delivery:${deliveryId}`)).resolves.toBeUndefined();
+
+      const records = log.mock.calls.map(([value]) => JSON.parse(String(value)) as Record<string, unknown>);
+      expect(records.find((entry) => entry.event === "watch_pr.webhook_fanout")).toMatchObject({
+        sample_rate: 1,
+        sample_reason: "high_write",
+        routed_watches: 5,
+        published_watches: 4,
+        storage_key_puts: 4,
+        storage_key_writes: 4,
+      });
+      expect(records.find((entry) => entry.event === "watch_pr.webhook_failure")).toMatchObject({
+        delivery_fingerprint: await sha256Base64Url(deliveryId),
+        error_kind: "unexpected",
+        error_name: "Error",
+      });
+
+      storage.putError = undefined;
+      const retry = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      await expect(retry.json()).resolves.toMatchObject({ accepted: true, deliveryId });
+      await Promise.all(pending.splice(0));
+      await expect(storage.get<number>(`delivery:${deliveryId}`)).resolves.toEqual(expect.any(Number));
+
+      const states = await Promise.all(watcherIds.map((watcherId) => readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(watcherId, repository, number),
+      )));
+      expect(states.every((state) => state.events.length === 1 && state.events[0]?.deliveryId === deliveryId)).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      log.mockRestore();
+    }
+  });
+
+
+
+  it("counts invalidated session deletes in webhook fanout telemetry", async () => {
+    const { hub, pending, storage } = hubFixture();
+    await storeMonitor(storage, { snapshot: snapshot(), events: [] });
+    const deliveryId = "invalidated-session-delivery";
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { full_name: repository },
+      pull_request: { number },
+    });
+    const headers = {
+      "x-github-delivery": deliveryId,
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+    };
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ message: "Bad credentials" }, { status: 401 })));
+    try {
+      const response = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending.splice(0));
+
+      const telemetry = log.mock.calls
+        .map(([value]) => JSON.parse(String(value)) as Record<string, unknown>)
+        .find((entry) => entry.event === "watch_pr.webhook_fanout");
+      expect(telemetry).toMatchObject({
+        event: "watch_pr.webhook_fanout",
+        sample_rate: 1,
+        sample_reason: "high_write",
+        delivery_dedupe_puts: 1,
+        storage_key_puts: 1,
+        storage_key_deletes: 3,
+        storage_key_writes: 4,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+      log.mockRestore();
+    }
+  });
+
+  it("avoids no-op deletes while invalidating a session", async () => {
+    const { hub, storage } = hubFixture();
+    await storage.put(sessionStorageKey(sessionToken), sessionRecord({ watches: [watch] }));
+
+    const deleted = await (hub as unknown as HubInternals).invalidateSession(sessionToken, "github-token");
+
+    expect(deleted).toBe(1);
+    expect(storage.deleteKeys).toEqual([sessionStorageKey(sessionToken)]);
+  });
+  it("retries after delivery admission storage fails", async () => {
+    const { hub, pending, storage } = hubFixture();
+    await storeMonitor(storage, { snapshot: snapshot(), events: [] });
+    const deliveryId = "admission-retry-delivery";
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { full_name: repository },
+      pull_request: { number },
+    });
+    const headers = {
+      "x-github-delivery": deliveryId,
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+    };
+    storage.afterGet = (key) => {
+      if (key !== `delivery:${deliveryId}`) return;
+      storage.afterGet = undefined;
+      throw new Error("admission read failed");
+    };
+    const fetchMock = openPullRequestFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await expect(hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }))).rejects.toThrow("admission read failed");
+
+      const retry = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      expect(retry.status).toBe(202);
+      await Promise.all(pending.splice(0));
+
+      const stored = await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, number),
+      );
+      expect(stored.events).toHaveLength(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+
+  it("does not persist terminal webhook deliveries that publish nothing", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const closed = snapshot({ state: "closed", fetchedAt: "2026-09-10T12:03:00.000Z" });
+    await storeMonitor(storage, { snapshot: closed, events: [event("event-closed", closed, { action: "closed" })] });
+    const deliveryId = "closed-watch-delivery";
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { full_name: repository },
+      pull_request: { number },
+    });
+    const headers = {
+      "x-github-delivery": deliveryId,
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+    };
+
+    const first = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+      method: "POST",
+      headers,
+      body,
+    }));
+    expect(first.status).toBe(202);
+    await Promise.all(pending.splice(0));
+    await expect(storage.get<number>(`delivery:${deliveryId}`)).resolves.toBeUndefined();
+
+    const retry = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+      method: "POST",
+      headers,
+      body,
+    }));
+    await expect(retry.json()).resolves.toMatchObject({ accepted: true, deliveryId });
+    await Promise.all(pending.splice(0));
+  });
   it("suppresses polling and reports terminal state for an already-terminal watch", async () => {
     const { hub, storage, pending } = hubFixture();
     const terminalSnapshot = snapshot({ state: "closed", fetchedAt: "2026-09-10T12:03:00.000Z" });
@@ -524,6 +871,24 @@ describe("native monitor feed", () => {
         [],
       ]);
       expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/pulls/734"))).toBe(false);
+
+      fetchMock.mockClear();
+      await (hub as unknown as HubInternals).processWebhook("push", "delivery-730", {
+        repository: { full_name: repository },
+        ref: "refs/heads/recreate-pinion-handle",
+      });
+      const duplicate730 = await Promise.all(stack.map((pullRequest) =>
+        readStoredWatchState(
+          storage as unknown as DurableObjectStorage,
+          watchStorageKey(userId, repository, pullRequest.number),
+        )
+      ));
+      expect(duplicate730.map((state) => state.events.map((storedEvent) => storedEvent.deliveryId))).toEqual([
+        ["delivery-730"],
+        ["delivery-730"],
+        [],
+      ]);
+      expect(fetchMock).not.toHaveBeenCalled();
 
       fetchMock.mockClear();
       await (hub as unknown as HubInternals).processWebhook("push", "delivery-733", {

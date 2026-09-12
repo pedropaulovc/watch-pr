@@ -1,30 +1,41 @@
 import { describe, expect, it, vi } from "vitest";
-import { sha256Base64Url } from "../src/crypto";
+import { hmacSha256Hex, sha256Base64Url } from "../src/crypto";
 import { WatchPrHub, readStoredWatchState, type Env, type WatchStorage, writeStoredWatchState } from "../src/hub";
+import { GithubApiError } from "../src/github";
 import type { OAuthCodeRecord, SessionRecord, StoredWatchState, WatchEvent } from "../src/types";
 import { legacyWatchStorageKey, sessionStorageKey, watchStorageKey } from "../src/types";
 
 class MemoryStorage {
   private readonly values = new Map<string, unknown>();
   readonly batchSizes: number[] = [];
+  readonly putKeys: string[] = [];
+  readonly getKeys: string[] = [];
+
+  listError?: unknown;
+
+
 
   async get<T>(key: string | string[]): Promise<T | undefined | Map<string, T>> {
     if (Array.isArray(key)) {
+      this.getKeys.push(...key);
       this.batchSizes.push(key.length);
       return new Map(key.flatMap((entry) => {
         const value = this.values.get(entry);
         return value === undefined ? [] : [[entry, value as T]];
       }));
     }
+    this.getKeys.push(key);
     return this.values.get(key) as T | undefined;
   }
 
   async put<T>(key: string | Record<string, T>, value?: T): Promise<void> {
     if (typeof key === "string") {
+      this.putKeys.push(key);
       this.values.set(key, value);
       return;
     }
     this.batchSizes.push(Object.keys(key).length);
+    this.putKeys.push(...Object.keys(key));
     for (const [entry, entryValue] of Object.entries(key)) this.values.set(entry, entryValue);
   }
 
@@ -39,6 +50,7 @@ class MemoryStorage {
   }
 
   async list<T>(options: { prefix?: string } = {}): Promise<Map<string, T>> {
+    if (this.listError !== undefined) throw this.listError;
     return new Map([...this.values.entries()]
       .filter(([key]) => !options.prefix || key.startsWith(options.prefix))
       .map(([key, value]) => [key, value as T]));
@@ -108,7 +120,7 @@ type HubSessionInternals = {
   activeSessions: Map<string, TestActiveSession>;
   newActiveSession(token: string, record: SessionRecord, kind: TestActiveSession["kind"]): TestActiveSession;
   subscribe(active: TestActiveSession, repository: string, number: number): Promise<void>;
-  invalidateSession(token: string, expectedGithubToken?: string): Promise<void>;
+  invalidateSession(token: string, expectedGithubToken?: string): Promise<number>;
   sessionForToken(token: string): Promise<{ token: string; record: SessionRecord } | null>;
 };
 
@@ -208,6 +220,90 @@ describe("OAuth broker", () => {
     }));
     expect(unsigned.status).toBe(401);
   });
+  it("does not write a Durable Object row for unmatched webhook deliveries", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const deliveryId = "unmatched-delivery";
+    const body = JSON.stringify({
+      action: "opened",
+      repository: { full_name: "owner/unwatched" },
+      pull_request: { number: 7 },
+    });
+    const signature = `sha256=${await hmacSha256Hex("webhook-secret", body)}`;
+    const headers = {
+      "x-github-delivery": deliveryId,
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": signature,
+    };
+
+    await expect(hub.fetch(new Request("https://watch-pr.vza.net/webhooks/github", {
+      method: "POST",
+      headers,
+      body,
+    }))).resolves.toMatchObject({ status: 202 });
+    await Promise.all(pending.splice(0));
+    expect(storage.putKeys).not.toContain(`delivery:${deliveryId}`);
+    expect(storage.getKeys).toContain(`delivery:${deliveryId}`);
+
+
+    const redelivery = await hub.fetch(new Request("https://watch-pr.vza.net/webhooks/github", {
+      method: "POST",
+      headers,
+      body,
+    }));
+    await expect(redelivery.json()).resolves.toMatchObject({ accepted: true, deliveryId });
+    await Promise.all(pending.splice(0));
+    expect(storage.putKeys).not.toContain(`delivery:${deliveryId}`);
+  });
+
+  it("logs a safe failure classification for a rejected webhook fanout", async () => {
+    const { hub, pending, storage } = hubFixture();
+    storage.listError = new GithubApiError(503, "sensitive upstream response", "/repos/private/repo");
+    const body = JSON.stringify({
+      action: "opened",
+      repository: { full_name: "owner/repo" },
+      pull_request: { number: 7 },
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const response = await hub.fetch(new Request("https://watch-pr.vza.net/webhooks/github", {
+        method: "POST",
+        headers: {
+          "x-github-delivery": "failed-delivery",
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+        },
+        body,
+      }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      const failure = log.mock.calls
+        .map(([value]) => JSON.parse(String(value)) as Record<string, unknown>)
+        .find((entry) => entry.event === "watch_pr.webhook_failure");
+      expect(failure).toMatchObject({
+        event: "watch_pr.webhook_failure",
+        error_kind: "github_api",
+        error_name: "GithubApiError",
+        github_status: 503,
+      });
+      expect(JSON.stringify(failure)).not.toContain("private/repo");
+      expect(JSON.stringify(failure)).not.toContain("sensitive upstream response");
+      storage.listError = undefined;
+      const retry = await hub.fetch(new Request("https://watch-pr.vza.net/webhooks/github", {
+        method: "POST",
+        headers: {
+          "x-github-delivery": "failed-delivery",
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+        },
+        body,
+      }));
+      await expect(retry.json()).resolves.toMatchObject({ accepted: true, deliveryId: "failed-delivery" });
+      await Promise.all(pending.splice(0));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("batches oversized watch state and removes stale chunks", async () => {
     const storage = new MemoryStorage();
     const storageKey = watchStorageKey(42, "owner/repo", 7);
@@ -232,8 +328,22 @@ describe("OAuth broker", () => {
     expect(chunkCount).toBeGreaterThan(128);
     await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey)).resolves.toEqual(state);
 
+    const updated: StoredWatchState = {
+      ...state,
+      events: state.events.map((entry, index) => (
+        index === 0 ? { ...entry, payload: "y".repeat(23_000) } : entry
+      )),
+    };
+    storage.putKeys.length = 0;
+    const write = await writeStoredWatchState(storage as unknown as WatchStorage, storageKey, updated);
+    expect(write).toMatchObject({ puts: chunkCount, chunkCount, format: "chunked" });
+    expect(storage.putKeys).toHaveLength(chunkCount);
+    expect(storage.putKeys).not.toContain(storageKey);
+    await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey)).resolves.toEqual(updated);
+
     const compact = { snapshot: null, events: [watchEvent(101, { compact: true })] };
-    await writeStoredWatchState(storage as unknown as WatchStorage, storageKey, compact);
+    const compactWrite = await writeStoredWatchState(storage as unknown as WatchStorage, storageKey, compact);
+    expect(compactWrite).toMatchObject({ puts: 1, chunkCount: 0, format: "compact" });
     await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey)).resolves.toEqual(compact);
     await expect(storage.get(`${storageKey}:chunk:${chunkCount - 1}`)).resolves.toBeUndefined();
   });
@@ -349,6 +459,23 @@ describe("OAuth broker", () => {
     });
     expect([...first.subscriptions].sort()).toEqual([firstKey, secondKey]);
     expect([...second.subscriptions].sort()).toEqual([firstKey, secondKey]);
+  });
+
+  it("does not rewrite an unchanged subscription", async () => {
+    const { hub, storage } = hubFixture();
+    const sessionToken = "idempotent-subscription-token";
+    const key = "owner/repo#7";
+    const record = sessionRecord({ watches: [key], subscriptions: [key] });
+    await storage.put(sessionStorageKey(sessionToken), record);
+    storage.putKeys.length = 0;
+    const internals = hub as unknown as HubSessionInternals;
+    const active = internals.newActiveSession(sessionToken, structuredClone(record), "stateful");
+    internals.activeSessions.set("idempotent-mcp-session", active);
+
+    await internals.subscribe(active, "owner/repo", 7);
+
+    expect(storage.putKeys).toEqual([]);
+    expect([...active.subscriptions]).toEqual([key]);
   });
 
   it("does not invalidate credentials rotated after an unauthorized request started", async () => {
