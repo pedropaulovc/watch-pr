@@ -88,15 +88,40 @@ function addNumber(numbers: Set<number>, value: unknown, key = "number"): boolea
   numbers.add(number);
   return true;
 }
+export interface WatchedPullRequest {
+  key: string;
+  snapshot: PullRequestSnapshot | null;
+}
+
+function pushedBranch(payload: Record<string, unknown>): string | null | undefined {
+  if (typeof payload.ref !== "string") return undefined;
+  const prefix = "refs/heads/";
+  return payload.ref.startsWith(prefix) && payload.ref.length > prefix.length
+    ? payload.ref.slice(prefix.length)
+    : null;
+}
+
+function pushTargetsWatch(payload: Record<string, unknown>, snapshot: PullRequestSnapshot | null): boolean {
+  const branch = pushedBranch(payload);
+  if (branch === null) return false;
+  if (branch === undefined || !snapshot) {
+    // Incomplete webhook data or an as-yet-unpopulated watch cannot be ruled out safely.
+    return true;
+  }
+  if (snapshot.headRefName === branch || snapshot.baseRefName === branch) return true;
+  // A missing head/base ref leaves a real possibility that this branch targets the watch.
+  return !snapshot.headRefName || !snapshot.baseRefName;
+}
 
 export function eventPullRequestNumbers(
   eventName: string,
   payload: Record<string, unknown>,
-  watchedKeys: Iterable<string>,
+  watchedPullRequests: Iterable<WatchedPullRequest>,
 ): number[] {
   const repository = repositoryName(payload);
   if (!repository) return [];
-  const watched = [...watchedKeys];
+  const watched = [...watchedPullRequests];
+  const watchedKeys = new Set(watched.map((watch) => watch.key));
   const numbers = new Set<number>();
   let hasExplicitTargets = false;
   hasExplicitTargets = addNumber(numbers, payload.pull_request) || hasExplicitTargets;
@@ -113,17 +138,19 @@ export function eventPullRequestNumbers(
     for (const pullRequest of pullRequests) addNumber(numbers, pullRequest);
   }
 
-  const matching = [...numbers].filter((number) => watchedKeysIterator(watched, repository, number));
+  const matching = [...numbers].filter((number) => watchedKeys.has(`${repository}#${number}`));
   if (matching.length > 0 || hasExplicitTargets) return matching.sort((left, right) => left - right);
 
-  // Status/check/deployment/push deliveries can omit pull_requests. Refresh
-  // every watched PR in the repository so mergeability and reaction changes are not lost.
+  // These deliveries can omit pull_requests. Non-push events still refresh every
+  // repository watch; pushes are narrowed below to the affected head/base branches.
   if (["check_run", "check_suite", "commit_comment", "deployment", "deployment_status", "merge_group", "push", "status"].includes(eventName)) {
     const repositoryNumbers = new Set<number>();
-    for (const key of watched) {
+    for (const watch of watched) {
       try {
-        const parsed = parseWatchKey(key);
-        if (parsed.repository === repository) repositoryNumbers.add(parsed.number);
+        const parsed = parseWatchKey(watch.key);
+        if (parsed.repository !== repository) continue;
+        if (eventName === "push" && !pushTargetsWatch(payload, watch.snapshot)) continue;
+        repositoryNumbers.add(parsed.number);
       } catch {
         // Ignore malformed watch keys from other callers.
       }
@@ -132,12 +159,6 @@ export function eventPullRequestNumbers(
   }
 
   return matching;
-}
-
-function watchedKeysIterator(watchedKeys: Iterable<string>, repository: string, number: number): boolean {
-  const key = `${repository}#${number}`;
-  for (const watchedKey of watchedKeys) if (watchedKey === key) return true;
-  return false;
 }
 
 function isPullRequestIssue(value: unknown): boolean {
