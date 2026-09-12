@@ -950,11 +950,16 @@ export class WatchPrHub {
       } catch {
         continue;
       }
-      if (parsed.repository !== repository) continue;
-      const targetNumbers = eventPullRequestNumbers(eventName, payload, [watcher.key]);
+      if (eventName !== "push" && parsed.repository !== repository) continue;
+      let previous: StoredWatchState | undefined;
+      if (eventName === "push") previous = await this.watchState(watcher.userId, watcher.key);
+      const targetNumbers = eventPullRequestNumbers(eventName, payload, [{
+        key: watcher.key,
+        snapshot: previous?.snapshot ?? null,
+      }]);
       if (!targetNumbers.includes(parsed.number)) continue;
 
-      const previous = await this.watchState(watcher.userId, watcher.key);
+      previous ??= await this.watchState(watcher.userId, watcher.key);
       const previousTerminalState = terminalState(previous.snapshot);
       if (previousTerminalState === "merged") continue;
       if (previousTerminalState === "closed" && (eventName !== "pull_request" || webhookAction !== "reopened")) continue;

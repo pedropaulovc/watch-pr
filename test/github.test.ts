@@ -26,7 +26,7 @@ describe("GitHub API adapter", () => {
           mergeable: false,
           mergeable_state: "dirty",
           user: { login: "author" },
-          head: { ref: "feature", sha: "abc" },
+          head: { ref: "feature", sha: "abc", repo: { full_name: "Fork/Repo" } },
           base: { ref: "main" },
         });
       }
@@ -56,6 +56,7 @@ describe("GitHub API adapter", () => {
     expect(result.mergeable).toBe(false);
     expect(result.checks[1]).toMatchObject({ name: "Lint", conclusion: "success", kind: "check_run" });
     expect(result.mergeableState).toBe("dirty");
+    expect(result.headRepository).toBe("fork/repo");
     expect(result.bodyReactions).toEqual({ eyes: 2, total_count: 2 });
     expect(result.comments[0]).toMatchObject({ id: 1, author: "reviewer", reactions: { "+1": 1 } });
     expect(result.reviews[0]).toMatchObject({ state: "APPROVED", author: "reviewer" });

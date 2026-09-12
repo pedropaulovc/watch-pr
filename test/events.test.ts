@@ -17,6 +17,7 @@ const snapshot = (overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnap
   mergeableState: "clean",
   baseRefName: "main",
   headRefName: "feature",
+  headRepository: "owner/repo",
   headSha: "abc",
   author: "author",
   fetchedAt: "2026-09-03T00:00:00.000Z",
@@ -28,6 +29,8 @@ const snapshot = (overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnap
   threads: [],
   ...overrides,
 });
+const watched = (keys: string[]) => keys.map((key) => ({ key, snapshot: null }));
+
 
 describe("watch-pr event contracts", () => {
   it("round-trips a resource URI and normalizes repository keys", () => {
@@ -40,59 +43,157 @@ describe("watch-pr event contracts", () => {
 
   it("fans status deliveries out to every watched PR in the repository", () => {
     const payload = { repository: { full_name: "owner/repo" }, status: { state: "pending" } };
-    expect(eventPullRequestNumbers("status", payload, ["owner/repo#2", "owner/repo#7", "other/repo#9"])).toEqual([2, 7]);
+    expect(eventPullRequestNumbers("status", payload, watched(["owner/repo#2", "owner/repo#7", "other/repo#9"]))).toEqual([2, 7]);
   });
 
   it("routes issue comments only when the issue is a pull request", () => {
-    const watched = ["owner/repo#7", "owner/repo#9"];
+    const watchedPullRequests = watched(["owner/repo#7", "owner/repo#9"]);
     expect(eventPullRequestNumbers("issue_comment", {
       repository: { full_name: "owner/repo" },
       issue: { number: 7 },
-    }, watched)).toEqual([]);
+    }, watchedPullRequests)).toEqual([]);
     expect(eventPullRequestNumbers("issue_comment", {
       repository: { full_name: "owner/repo" },
       issue: { number: 9, pull_request: { url: "https://api.github.com/repos/owner/repo/pulls/9" } },
-    }, watched)).toEqual([9]);
+    }, watchedPullRequests)).toEqual([9]);
   });
 
   it("fans commit comments and merge-group deliveries out to watched repository PRs", () => {
-    const watched = ["owner/repo#2", "owner/repo#7", "other/repo#9"];
+    const watchedPullRequests = watched(["owner/repo#2", "owner/repo#7", "other/repo#9"]);
     const payload = { repository: { full_name: "owner/repo" }, comment: { body: "commit note" } };
-    expect(eventPullRequestNumbers("commit_comment", payload, watched)).toEqual([2, 7]);
-    expect(eventPullRequestNumbers("merge_group", payload, watched)).toEqual([2, 7]);
+    expect(eventPullRequestNumbers("commit_comment", payload, watchedPullRequests)).toEqual([2, 7]);
+    expect(eventPullRequestNumbers("merge_group", payload, watchedPullRequests)).toEqual([2, 7]);
   });
   it("routes linked webhook deliveries and filters explicit PR associations", () => {
-    const watched = ["owner/repo#2", "owner/repo#7", "other/repo#9"];
+    const watchedPullRequests = watched(["owner/repo#2", "owner/repo#7", "other/repo#9"]);
     const directPayload = { repository: { full_name: "owner/repo" }, pull_request: { number: 7 } };
     for (const eventName of ["pull_request", "pull_request_review", "pull_request_review_comment", "pull_request_review_thread"]) {
-      expect(eventPullRequestNumbers(eventName, directPayload, watched)).toEqual([7]);
+      expect(eventPullRequestNumbers(eventName, directPayload, watchedPullRequests)).toEqual([7]);
     }
     expect(eventPullRequestNumbers("check_run", {
       repository: { full_name: "owner/repo" },
       check_run: { pull_requests: [{ number: 7 }, { number: 99 }] },
-    }, watched)).toEqual([7]);
+    }, watchedPullRequests)).toEqual([7]);
     expect(eventPullRequestNumbers("check_suite", {
       repository: { full_name: "owner/repo" },
       check_suite: { pull_requests: [{ number: 2 }] },
-    }, watched)).toEqual([2]);
+    }, watchedPullRequests)).toEqual([2]);
     expect(eventPullRequestNumbers("status", {
       repository: { full_name: "owner/repo" },
       status: { pull_requests: [{ number: 7 }] },
-    }, watched)).toEqual([7]);
+    }, watchedPullRequests)).toEqual([7]);
     expect(eventPullRequestNumbers("deployment_status", {
       repository: { full_name: "owner/repo" },
       deployment_status: { pull_requests: [{ number: 2 }] },
-    }, watched)).toEqual([2]);
+    }, watchedPullRequests)).toEqual([2]);
     expect(eventPullRequestNumbers("deployment", {
       repository: { full_name: "owner/repo" },
       deployment: { pull_requests: [{ number: 7 }] },
-    }, watched)).toEqual([7]);
+    }, watchedPullRequests)).toEqual([7]);
     expect(eventPullRequestNumbers("check_run", {
       repository: { full_name: "owner/repo" },
       check_run: { pull_requests: [] },
-    }, watched)).toEqual([]);
-    expect(eventPullRequestNumbers("push", { repository: { full_name: "owner/repo" } }, watched)).toEqual([2, 7]);
-    expect(eventPullRequestNumbers("merge_group", { repository: { full_name: "owner/repo" } }, watched)).toEqual([2, 7]);
+    }, watchedPullRequests)).toEqual([]);
+    expect(eventPullRequestNumbers("push", { repository: { full_name: "owner/repo" } }, watchedPullRequests)).toEqual([2, 7]);
+    expect(eventPullRequestNumbers("merge_group", { repository: { full_name: "owner/repo" } }, watchedPullRequests)).toEqual([2, 7]);
+  });
+
+  it("routes a stacked-PR push only to watches whose head or direct base changed", () => {
+    const stack = [
+      {
+        key: "owner/repo#730",
+        snapshot: snapshot({ number: 730, headRefName: "recreate-pinion-handle", baseRefName: "main" }),
+      },
+      {
+        key: "owner/repo#733",
+        snapshot: snapshot({
+          number: 733,
+          headRefName: "review-hobby-shop-tolerances",
+          baseRefName: "recreate-pinion-handle",
+        }),
+      },
+      {
+        key: "owner/repo#734",
+        snapshot: snapshot({
+          number: 734,
+          headRefName: "review-machinist-prompt-eval",
+          baseRefName: "review-hobby-shop-tolerances",
+        }),
+      },
+    ];
+
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "owner/repo" },
+      ref: "refs/heads/recreate-pinion-handle",
+    }, stack)).toEqual([730, 733]);
+  });
+
+  it("routes a direct-base push even when the watched snapshot itself is unchanged", () => {
+    const stack = [
+      {
+        key: "owner/repo#733",
+        snapshot: snapshot({
+          number: 733,
+          headRefName: "review-hobby-shop-tolerances",
+          baseRefName: "recreate-pinion-handle",
+        }),
+      },
+      {
+        key: "owner/repo#734",
+        snapshot: snapshot({
+          number: 734,
+          headRefName: "review-machinist-prompt-eval",
+          baseRefName: "review-hobby-shop-tolerances",
+        }),
+      },
+    ];
+
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "owner/repo" },
+      ref: "refs/heads/review-hobby-shop-tolerances",
+    }, stack)).toEqual([733, 734]);
+  });
+
+  it("does not confuse a fork head with a same-named branch in the base repository", () => {
+    const forkWatch = [{
+      key: "owner/repo#735",
+      snapshot: snapshot({
+        number: 735,
+        headRefName: "feature",
+        headRepository: "contributor/repo",
+        baseRefName: "main",
+      }),
+    }];
+
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "owner/repo" },
+      ref: "refs/heads/feature",
+    }, forkWatch)).toEqual([]);
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "contributor/repo" },
+      ref: "refs/heads/feature",
+    }, forkWatch)).toEqual([735]);
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "owner/repo" },
+      ref: "refs/heads/main",
+    }, forkWatch)).toEqual([735]);
+  });
+
+  it("conservatively routes legacy fork snapshots without a stored head repository", () => {
+    const legacyWatch = [{
+      key: "owner/repo#735",
+      snapshot: snapshot({
+        number: 735,
+        headRefName: "feature",
+        headRepository: null,
+        baseRefName: "main",
+      }),
+    }];
+
+    expect(eventPullRequestNumbers("push", {
+      repository: { full_name: "owner/repo" },
+      ref: "refs/heads/feature",
+    }, legacyWatch)).toEqual([735]);
   });
 
   it("detects description, mergeability, review, check, and reaction changes", () => {

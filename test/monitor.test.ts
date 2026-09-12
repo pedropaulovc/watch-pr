@@ -81,6 +81,7 @@ function snapshot(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnap
     mergeableState: "clean",
     baseRefName: "main",
     headRefName: "feature",
+    headRepository: repository,
     headSha: "abc",
     author: "author",
     fetchedAt: "2026-09-10T12:00:00.000Z",
@@ -162,7 +163,7 @@ function openPullRequestFetch() {
         mergeable: true,
         mergeable_state: "clean",
         user: { login: "author" },
-        head: { ref: "feature", sha: "reopened" },
+        head: { ref: "feature", sha: "reopened", repo: { full_name: repository } },
         base: { ref: "main" },
       });
     }
@@ -188,6 +189,59 @@ function openPullRequestFetch() {
         },
       });
     }
+    throw new Error(`unexpected GitHub URL ${url}`);
+  });
+}
+
+function stackedPullRequestFetch(
+  branches: Record<number, { head: string; headRepository: string; base: string; sha: string }>,
+) {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith("/graphql")) {
+      return Response.json({
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                nodes: [],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        },
+      });
+    }
+
+    const pullMatch = /\/pulls\/([1-9][0-9]*)$/u.exec(url.pathname);
+    if (pullMatch) {
+      const pullNumber = Number(pullMatch[1]);
+      const branch = branches[pullNumber];
+      if (!branch) throw new Error(`unexpected pull request ${pullNumber}`);
+      return Response.json({
+        number: pullNumber,
+        html_url: `https://github.com/${repository}/pull/${pullNumber}`,
+        title: "Monitor feed",
+        body: "body",
+        state: "open",
+        draft: false,
+        merged: false,
+        merged_at: null,
+        mergeable: true,
+        mergeable_state: "clean",
+        user: { login: "author" },
+        head: { ref: branch.head, sha: branch.sha, repo: { full_name: branch.headRepository } },
+        base: { ref: branch.base },
+      });
+    }
+
+    if (/\/issues\/[1-9][0-9]*$/u.test(url.pathname)) return Response.json({ reactions: {} });
+    if (url.pathname.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+    if (
+      url.pathname.endsWith("/comments") ||
+      url.pathname.endsWith("/reviews") ||
+      url.pathname.endsWith("/statuses")
+    ) return Response.json([]);
     throw new Error(`unexpected GitHub URL ${url}`);
   });
 }
@@ -401,6 +455,119 @@ describe("native monitor feed", () => {
       vi.unstubAllGlobals();
     }
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("publishes stack pushes only to watches whose head or direct base matches", async () => {
+    const { hub, storage } = hubFixture();
+    const stack = [
+      {
+        number: 730,
+        head: "recreate-pinion-handle",
+        headRepository: repository,
+        base: "main",
+        sha: "sha-730",
+      },
+      {
+        number: 733,
+        head: "review-hobby-shop-tolerances",
+        headRepository: repository,
+        base: "recreate-pinion-handle",
+        sha: "sha-733",
+      },
+      {
+        number: 734,
+        head: "review-machinist-prompt-eval",
+        headRepository: "contributor/repo",
+        base: "review-hobby-shop-tolerances",
+        sha: "sha-734",
+      },
+    ];
+    const record = sessionRecord({
+      watches: stack.map((pullRequest) => `${repository}#${pullRequest.number}`),
+    });
+    await storage.put(sessionStorageKey(sessionToken), record);
+    for (const pullRequest of stack) {
+      const current = snapshot({
+        number: pullRequest.number,
+        url: `https://github.com/${repository}/pull/${pullRequest.number}`,
+        headRefName: pullRequest.head,
+        headRepository: pullRequest.headRepository,
+        baseRefName: pullRequest.base,
+        headSha: pullRequest.sha,
+      });
+      await writeStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, pullRequest.number),
+        { snapshot: current, events: [] },
+      );
+    }
+
+    const fetchMock = stackedPullRequestFetch(Object.fromEntries(
+      stack.map((pullRequest) => [pullRequest.number, pullRequest]),
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await (hub as unknown as HubInternals).processWebhook("push", "delivery-730", {
+        repository: { full_name: repository },
+        ref: "refs/heads/recreate-pinion-handle",
+      });
+
+      const after730Push = await Promise.all(stack.map((pullRequest) =>
+        readStoredWatchState(
+          storage as unknown as DurableObjectStorage,
+          watchStorageKey(userId, repository, pullRequest.number),
+        )
+      ));
+      expect(after730Push.map((state) => state.events.map((storedEvent) => storedEvent.deliveryId))).toEqual([
+        ["delivery-730"],
+        ["delivery-730"],
+        [],
+      ]);
+      expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/pulls/734"))).toBe(false);
+
+      fetchMock.mockClear();
+      await (hub as unknown as HubInternals).processWebhook("push", "delivery-733", {
+        repository: { full_name: repository },
+        ref: "refs/heads/review-hobby-shop-tolerances",
+      });
+      const downstream = await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, 734),
+      );
+      expect(downstream.events).toHaveLength(1);
+      expect(downstream.events[0]).toMatchObject({
+        deliveryId: "delivery-733",
+        githubEvent: "push",
+        changes: [],
+      });
+
+      fetchMock.mockClear();
+      await (hub as unknown as HubInternals).processWebhook("push", "delivery-base-collision", {
+        repository: { full_name: repository },
+        ref: "refs/heads/review-machinist-prompt-eval",
+      });
+      const afterBaseCollision = await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, 734),
+      );
+      expect(afterBaseCollision.events).toHaveLength(1);
+      expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/pulls/734"))).toBe(false);
+
+      await (hub as unknown as HubInternals).processWebhook("push", "delivery-fork-head", {
+        repository: { full_name: "contributor/repo" },
+        ref: "refs/heads/review-machinist-prompt-eval",
+      });
+      const afterForkHead = await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, 734),
+      );
+      expect(afterForkHead.events.map((storedEvent) => storedEvent.deliveryId)).toEqual([
+        "delivery-733",
+        "delivery-fork-head",
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("resumes a closed watch only for a pull_request reopened webhook", async () => {
