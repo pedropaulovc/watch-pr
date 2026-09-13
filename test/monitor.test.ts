@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { hmacSha256Hex, sha256Base64Url } from "../src/crypto";
-import { WatchPrHub, readStoredWatchState, writeStoredWatchState, type Env } from "../src/hub";
+import {
+  WatchPrHub,
+  openWatchStateMutation,
+  readStoredWatchState,
+  writeStoredWatchState,
+  type Env,
+} from "../src/hub";
 import type {
   MonitorCapabilityRecord,
   PrMonitorEvent,
@@ -498,6 +504,48 @@ describe("native monitor feed", () => {
     }
   });
 
+  it("keeps ten thousand single-watch deliveries with a 4,000-byte body below sixty percent of the free write limit", async () => {
+    const { storage } = hubFixture();
+    const storageKey = watchStorageKey(userId, repository, number);
+    const deliveries = 10_000;
+    const freeTierRowsWrittenPerDay = 100_000;
+    let totalRowsWritten = 0;
+    let largestDeliveryWrite = 0;
+
+    // Force a changing snapshot and event-window eviction on every steady-state append.
+    for (let index = 0; index < deliveries; index += 1) {
+      const current = snapshot({
+        body: "x".repeat(4_000),
+        headSha: `quota-stress-${index}`,
+        fetchedAt: new Date(1_700_000_000_000 + index).toISOString(),
+      });
+      const mutation = await openWatchStateMutation(
+        storage as unknown as DurableObjectStorage,
+        storageKey,
+      );
+      const putsBefore = storage.putKeys.length;
+      const deletesBefore = storage.deleteKeys.length;
+      const write = await mutation.append(
+        event(`quota-stress-${index}`, current, {
+          payload: { action: "synchronize", pull_request: { number, head: { sha: current.headSha } } },
+        }),
+        current,
+      );
+      // Every matched webhook persists its durable deduplication marker after fanout.
+      await storage.put(`delivery:quota-stress-${index}`, Date.now());
+      const rowsWritten = storage.putKeys.length - putsBefore + storage.deleteKeys.length - deletesBefore;
+      expect(rowsWritten).toBe(write.puts + write.deletes + 1);
+      totalRowsWritten += rowsWritten;
+      largestDeliveryWrite = Math.max(largestDeliveryWrite, rowsWritten);
+    }
+
+    expect(largestDeliveryWrite).toBeLessThanOrEqual(6);
+    expect(totalRowsWritten).toBeLessThan(freeTierRowsWrittenPerDay * 0.6);
+    const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+    expect(stored.events).toHaveLength(100);
+    expect(stored.events.at(-1)?.id).toBe("quota-stress-9999");
+  }, 30_000);
+
   it("deduplicates matched deliveries after a hub restart", async () => {
     const { hub, pending, restart, storage } = hubFixture();
     await storeMonitor(storage, { snapshot: snapshot(), events: [] });
@@ -644,10 +692,10 @@ describe("native monitor feed", () => {
         sample_reason: "high_write",
         routed_watches: 5,
         published_watches: 4,
-        // Each published watch writes an immutable event payload, snapshot, cleanup job, and
-        // index. Retiring its predecessor is deferred to a bounded later append.
-        storage_key_puts: 16,
-        storage_key_deletes: 0,
+        // Each published watch writes an immutable event payload, snapshot, and index.
+        // Its compact predecessor is retired in the same transaction; only chunked records defer.
+        storage_key_puts: 12,
+        storage_key_deletes: 4,
         storage_key_writes: 16,
       });
       expect(records.find((entry) => entry.event === "watch_pr.webhook_failure")).toMatchObject({
@@ -995,6 +1043,8 @@ describe("native monitor feed", () => {
   });
 
   it("refreshes an explicitly watched closed PR but never refreshes a merged PR", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-10T12:05:00.000Z"));
     const { hub, storage, pending } = hubFixture();
     const closed = snapshot({ state: "closed", fetchedAt: "2026-09-10T12:03:00.000Z" });
     const record = sessionRecord();
@@ -1034,6 +1084,7 @@ describe("native monitor feed", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       vi.unstubAllGlobals();
+      vi.useRealTimers();
     }
   });
 
