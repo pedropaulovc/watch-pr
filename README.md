@@ -48,7 +48,9 @@ When an existing session first resumes, its predecessor `watch:<repository>:<num
 
 ## Observability
 
-Both deployments emit Workers Logs and sample 1% of automatic traces. Trace samples include Durable Object KV `put` and `delete` spans.
+Both deployments export invocation logs and automatic traces to Azure Monitor Application Insights through account-scoped Cloudflare Observability destinations. Native logs and traces use a 100% head-sampling rate, redact query strings, and are not persisted in Cloudflare. The destinations send JSON OTLP to a dedicated gateway Worker; the gateway accepts logs and traces only, exchanges a signed OIDC assertion for an Entra workload token, and forwards protobuf OTLP to Azure. It does not persist telemetry payloads or log raw payloads, bearer values, or Azure tokens.
+
+The gateway has bounded request and forwarding timeouts, accepts at most two ingest bearers during rotation, and rejects oversized payloads. It returns `404` for metrics because this deployment exports logs and traces only. Cloudflare delivery to Azure may take several minutes, so production verification must query both `OTelLogs` and `OTelSpans` over a multi-minute interval after a request such as `/health`.
 
 The hub logs `watch_pr.poll` for each cron tick. Sampled `watch_pr.do_storage` records each persisted watch state. `watch_pr.webhook_fanout` aggregates the matched watches for a webhook delivery. Both include event type, logical storage-key puts and deletes, serialized state size, and chunk count. Records with four or more logical key writes are always logged with `sample_rate: 1`; randomly sampled records use `sample_rate: 0.01`. These records omit delivery IDs, repository names, tokens, snapshots, and webhook payloads. A `watch_pr.webhook_failure` record includes a SHA-256 delivery fingerprint, so an operator can match a GitHub delivery for manual recovery without logging its raw ID.
 
@@ -66,6 +68,10 @@ The GitHub Actions workflows expect `cloudflare-production` and `cloudflare-ppe`
 - secret `CLOUDFLARE_API_TOKEN` scoped to that account's Workers deployment;
 - production Actions secrets `WATCH_PR_GITHUB_CLIENT_SECRET` and `WATCH_PR_GITHUB_WEBHOOK_SECRET`;
 - PPE Actions secret `WATCH_PR_GITHUB_CLIENT_SECRET`. The workflows map these names to the Worker runtime secrets `GITHUB_CLIENT_SECRET` and `GITHUB_WEBHOOK_SECRET`; GitHub reserves the `GITHUB_` prefix for built-in variables.
+
+Telemetry deployment also requires `TELEMETRY_AZURE_TENANT_ID`, `TELEMETRY_AZURE_APP_CLIENT_ID`, `TELEMETRY_OTLP_TRACES_ENDPOINT`, `TELEMETRY_OTLP_LOGS_ENDPOINT`, `TELEMETRY_OIDC_ISSUER_URL`, `TELEMETRY_GATEWAY_ORIGIN`, `TELEMETRY_OIDC_SIGNING_KID`, and `TELEMETRY_OIDC_PUBLIC_JWK` as environment variables. `TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK` is optional during signing-key rotation. Store `TELEMETRY_OIDC_SIGNING_KEY` and `TELEMETRY_GATEWAY_INGEST_BEARER` as environment secrets; their `*_PREVIOUS_*` counterparts are optional during rotation.
+
+`CLOUDFLARE_OBSERVABILITY_API_TOKEN` is a separate environment secret used only to create and verify Cloudflare Observability destinations. Scope it to the target account with only `Workers Observability:Edit`; do not reuse the Worker deployment token. The workflow validates signing keys, Entra federation, bearer rotation, and generated telemetry configuration before configuring destinations and deploying the application Worker.
 
 `deploy-production.yml` deploys on every push to `main`. `deploy-ppe.yml` is manual. `deploy-pr.yml` verifies same-repository pull request tests and types without Cloudflare credentials, then replaces and provisions `watch-pr-pr-N` in the PPE account for the verified source using Wrangler and configuration checked out from `main`; replacing the service removes any legacy preview secrets. Preview Workers receive only the public configuration and no runtime secrets. Fork PRs are skipped and never receive privileged credentials.
 The preview bundle is built before the Cloudflare API token is exposed to the upload step; pull request source cannot read deployment credentials during bundling.
