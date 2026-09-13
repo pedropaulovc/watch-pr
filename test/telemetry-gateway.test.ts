@@ -211,4 +211,152 @@ describe("telemetry gateway", () => {
     expect(azureRequest?.headers.get("Content-Type")).toBe("application/x-protobuf");
     expect((await azureRequest?.arrayBuffer())?.byteLength).toBeGreaterThan(0);
   });
+
+  it("forwards only allowlisted telemetry and strips native Cloudflare request, client, and geo data", async () => {
+    let azureBody: Uint8Array | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.startsWith("https://login.microsoftonline.com/")) {
+        return Response.json({ access_token: "azure-access-token", expires_in: 3600 });
+      }
+      azureBody = new Uint8Array(await new Request(input, init).arrayBuffer());
+      return new Response(null, { status: 204 });
+    }));
+    const str = (value: string) => ({ stringValue: value });
+    const sensitive = {
+      resource: [{ key: "http.request.header.accept", value: str("text/html,RESOURCE-HEADER") }],
+      scope: [{ key: "user_agent.original", value: str("Mozilla/5.0 SCOPE-UA") }],
+      span: [
+        { key: "url.full", value: str("https://watch-pr.vza.net/monitor/CAPABILITY-IN-URL?code=QUERY") },
+        { key: "user_agent.original", value: str("Mozilla/5.0 SPAN-UA") },
+        { key: "geo.locality.name", value: str("GEO-CITY") },
+        { key: "geo.country.code", value: str("GEO-COUNTRY") },
+        { key: "geo.timezone", value: str("GEO-TIMEZONE") },
+        { key: "cloudflare.asn", value: { intValue: "13335" } },
+        { key: "http.request.header.cookie", value: str("sid=SPAN-COOKIE") },
+        { key: "cloudflare.durable_object.kv.query.keys", value: { arrayValue: { values: [str("watch:42:STORAGE-KEY")] } } },
+        { key: "watch_pr.user_name", value: str("RAW-WATCH-USER") },
+      ],
+      event: [{ key: "exception.stacktrace", value: str("EVENT-STACKTRACE") }],
+      link: [{ key: "http.request.header.authorization", value: str("Bearer LINK-TOKEN") }],
+    };
+
+    const response = await gateway.fetch(
+      new Request("https://gateway.example.test/v1/traces", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${currentBearer}` },
+        body: JSON.stringify({
+          resourceSpans: [{
+            schemaUrl: "https://opentelemetry.io/schemas/SCHEMA-URL",
+            resource: { attributes: [{ key: "service.name", value: str("watch-pr-vza-net-prod") }, ...sensitive.resource] },
+            scopeSpans: [{
+              scope: {
+                name: "SCOPE-NAME-LEAK",
+                version: "SCOPE-VERSION-LEAK",
+                attributes: sensitive.scope,
+              },
+              spans: [{
+                traceId: "0102030405060708090a0b0c0d0e0f10",
+                spanId: "1112131415161718",
+                traceState: "vendor=TRACE-STATE",
+                name: "SPAN-NAME-LEAK",
+                kind: 2,
+                startTimeUnixNano: "1782964800000000000",
+                endTimeUnixNano: "1782964800500000000",
+                attributes: [
+                  { key: "url.path", value: str("/monitor/CAPABILITY-IN-PATH") },
+                  { key: "cloudflare.ray_id", value: str("9a1b2c3d4e5f6a7b-GRU") },
+                  { key: "http.request.method", value: str("GET") },
+                  { key: "http.response.status_code", value: { intValue: 200 } },
+                  ...sensitive.span,
+                  { key: "http.request.method", value: str("METHOD-LEAK") },
+                ],
+                events: [{ timeUnixNano: "1782964800100000000", name: "exception", attributes: [
+                  { key: "exception.type", value: str("GithubApiError") },
+                  { key: "exception.message", value: str("PRIVATE-EXCEPTION-MESSAGE") },
+                  ...sensitive.event,
+                ] }],
+                links: [{ traceId: "2122232425262728292a2b2c2d2e2f30", spanId: "3132333435363738", attributes: [
+                  { key: "faas.trigger", value: str("http") },
+                  ...sensitive.link,
+                ] }],
+                status: { code: 2, message: "STATUS-MESSAGE-LEAK" },
+              }],
+            }],
+          }],
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    expect(azureBody).toBeDefined();
+    const wire = new TextDecoder().decode(azureBody);
+    for (const kept of [
+      "service.name", "watch-pr-vza-net-prod", "GET", "/monitor/{capability}", "GET /monitor/{capability}",
+      "9a1b2c3d4e5f6a7b-GRU", "http.request.method", "http.response.status_code",
+      "exception", "exception.type", "GithubApiError", "faas.trigger",
+    ]) {
+      expect(wire).toContain(kept);
+    }
+    const leaked = Object.values(sensitive).flat().map((attribute) => attribute.key).concat([
+      "RESOURCE-HEADER", "SCOPE-UA", "SPAN-UA", "CAPABILITY-IN-URL", "CAPABILITY-IN-PATH", "QUERY",
+      "GEO-CITY", "GEO-COUNTRY", "GEO-TIMEZONE", "13335", "SPAN-COOKIE", "STORAGE-KEY",
+      "EVENT-STACKTRACE", "LINK-TOKEN", "SCHEMA-URL", "TRACE-STATE", "SCOPE-NAME-LEAK",
+      "SCOPE-VERSION-LEAK", "SPAN-NAME-LEAK", "STATUS-MESSAGE-LEAK", "RAW-WATCH-USER",
+      "PRIVATE-EXCEPTION-MESSAGE", "METHOD-LEAK",
+    ]);
+    for (const secret of leaked) expect(wire).not.toContain(secret);
+  });
+
+  it("forwards hub diagnostics as a watch_pr marker with bounded fields and drops raw log bodies", async () => {
+    let azureBody: Uint8Array | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : input.toString();
+      if (url.startsWith("https://login.microsoftonline.com/")) {
+        return Response.json({ access_token: "azure-access-token", expires_in: 3600 });
+      }
+      azureBody = new Uint8Array(await new Request(input, init).arrayBuffer());
+      return new Response(null, { status: 204 });
+    }));
+
+    const response = await gateway.fetch(
+      new Request("https://gateway.example.test/v1/logs", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${currentBearer}` },
+        body: JSON.stringify({
+          resourceLogs: [{
+            scopeLogs: [{
+              logRecords: [
+                {
+                  timeUnixNano: "1782964800855000000",
+                  severityNumber: 9,
+                  severityText: "SEVERITY-TEXT-LEAK",
+                  body: { stringValue: JSON.stringify({
+                    event: "watch_pr.webhook_failure",
+                    github_event: "pull_request",
+                    github_status: 502,
+                    session_token: "FIELD-TOKEN",
+                  }) },
+                  attributes: [{ key: "user_agent.original", value: { stringValue: "Mozilla/5.0 LOG-UA" } }],
+                },
+                { body: { stringValue: "GET https://watch-pr.vza.net/monitor/RAW-BODY 200" } },
+              ],
+            }],
+          }],
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    const wire = new TextDecoder().decode(azureBody);
+    expect(wire).toContain("watch_pr.webhook_failure");
+    expect(wire).toContain("watch_pr.github_event");
+    expect(wire).toContain("pull_request");
+    expect(wire).toContain("watch_pr.github_status");
+    for (const secret of ["FIELD-TOKEN", "session_token", "LOG-UA", "user_agent", "RAW-BODY", "watch-pr.vza.net", "SEVERITY-TEXT-LEAK"]) {
+      expect(wire).not.toContain(secret);
+    }
+  });
 });
