@@ -1,5 +1,6 @@
 import { signAssertion } from "./oidc-sign";
 import { encodeLogsRequest, encodeTraceRequest } from "./otlp-protobuf";
+import { sanitizeLogsRequest, sanitizeTraceRequest } from "./otlp-sanitize";
 
 interface Env {
   TENANT_ID: string;
@@ -117,6 +118,7 @@ export function getEntraToken(env: Env, privateKeyPem: string): Promise<string> 
   return tokenRefresh;
 }
 
+type OtlpSanitizer = (json: unknown) => Record<string, unknown>;
 type OtlpEncoder = (json: Record<string, unknown>) => Uint8Array;
 type Signal = "logs" | "traces";
 
@@ -181,6 +183,7 @@ async function forwardOtlp(
   env: Env,
   signal: Signal,
   endpoint: string,
+  sanitize: OtlpSanitizer,
   encode: OtlpEncoder,
 ): Promise<Response> {
   if (!isAuthorized(request, env)) return new Response("OK", { status: 200 });
@@ -213,9 +216,11 @@ async function forwardOtlp(
   }
   if (jsonText.length === 0) return new Response("OK", { status: 200 });
 
+  // Cloudflare's export carries headers, user agents, geography, and full URLs; only the
+  // sanitized allowlist may reach Azure.
   let payload: Uint8Array;
   try {
-    payload = encode(JSON.parse(jsonText) as Record<string, unknown>);
+    payload = encode(sanitize(JSON.parse(jsonText)));
   } catch {
     return invalidPayloadResponse(signal);
   }
@@ -263,10 +268,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
     if (request.method === "POST" && path === "/v1/traces") {
-      return forwardOtlp(request, env, "traces", env.OTLP_TRACES_ENDPOINT, encodeTraceRequest);
+      return forwardOtlp(request, env, "traces", env.OTLP_TRACES_ENDPOINT, sanitizeTraceRequest, encodeTraceRequest);
     }
     if (request.method === "POST" && path === "/v1/logs") {
-      return forwardOtlp(request, env, "logs", env.OTLP_LOGS_ENDPOINT, encodeLogsRequest);
+      return forwardOtlp(request, env, "logs", env.OTLP_LOGS_ENDPOINT, sanitizeLogsRequest, encodeLogsRequest);
     }
     if (request.method === "POST" && path === "/v1/metrics") {
       return new Response("Metrics export is not supported", { status: 404 });
