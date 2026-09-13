@@ -78,8 +78,6 @@ const MAX_STORAGE_BATCH_KEYS = 128;
 const MAX_WATCH_STATE_BYTES = 64 * 1024;
 const MAX_WATCH_CHUNK_CHARACTERS = 16_000;
 const DELIVERY_DEDUPLICATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-const WEBHOOK_TELEMETRY_SAMPLE_RATE = 0.01;
-const HIGH_WRITE_TELEMETRY_THRESHOLD = 4;
 const MAX_DEFERRED_CLEANUP_DATA_ROWS_PER_JOB = 8;
 const MIN_DEFERRED_CLEANUP_ROWS = MAX_DEFERRED_CLEANUP_DATA_ROWS_PER_JOB;
 
@@ -210,6 +208,29 @@ interface WebhookTarget extends WebhookWatcher {
 }
 
 export type WatchStorage = Pick<DurableObjectStorage, "get" | "put" | "delete">;
+
+interface WatchStorageWrites {
+  puts: number;
+  deletes: number;
+}
+
+function countWatchStorageWrites(storage: WatchStorage, writes: WatchStorageWrites): WatchStorage {
+  const get = storage.get.bind(storage) as WatchStorage["get"];
+  const put = storage.put.bind(storage) as (key: string | Record<string, unknown>, value?: unknown) => Promise<void>;
+  const remove = storage.delete.bind(storage) as (key: string | string[]) => Promise<boolean>;
+  return {
+    get,
+    async put(key: string | Record<string, unknown>, value?: unknown): Promise<void> {
+      await put(key, value);
+      writes.puts += typeof key === "string" ? 1 : Object.keys(key).length;
+    },
+    async delete(key: string | string[]): Promise<boolean> {
+      const deleted = await remove(key);
+      writes.deletes += Array.isArray(key) ? key.length : 1;
+      return deleted;
+    },
+  } as WatchStorage;
+}
 
 /**
  * One read pass over a watch, reused by the append that follows it. Mutating paths need the
@@ -1114,25 +1135,13 @@ export async function writeStoredWatchState(
   return writeChunkedRecord(storage, storageKey, state, previousChunkCount);
 }
 
-function sampleStorageTelemetry(): boolean {
-  const value = crypto.getRandomValues(new Uint32Array(1))[0]!;
-  return value / 0x1_0000_0000 < WEBHOOK_TELEMETRY_SAMPLE_RATE;
-}
-
 function logWatchStateWrite(event: WatchEvent, write: WatchAppendStats): void {
   const storageKeyWrites = write.puts + write.deletes;
-  const sampled = sampleStorageTelemetry();
-  const sampleReason = storageKeyWrites >= HIGH_WRITE_TELEMETRY_THRESHOLD
-    ? "high_write"
-    : sampled
-      ? "random"
-      : null;
-  if (!sampleReason) return;
   console.log(JSON.stringify({
     event: "watch_pr.do_storage",
     schema_version: 1,
-    sample_rate: sampleReason === "high_write" ? 1 : WEBHOOK_TELEMETRY_SAMPLE_RATE,
-    sample_reason: sampleReason,
+    sample_rate: 1,
+    sample_reason: "all",
     source: event.githubEvent === "snapshot" ? "refresh" : "webhook",
     github_event: event.githubEvent,
     github_action: event.action,
@@ -1147,19 +1156,31 @@ function logWatchStateWrite(event: WatchEvent, write: WatchAppendStats): void {
   }));
 }
 
-function logWebhookFanout(eventName: string, sampled: boolean, stats: WebhookProcessStats): void {
+type WebhookAdmissionOutcome =
+  | "accepted"
+  | "admission_error"
+  | "duplicate_in_flight"
+  | "duplicate_persisted"
+  | "invalid_json"
+  | "unsupported_event";
+
+function logWebhookAdmission(outcome: WebhookAdmissionOutcome, eventName?: string): void {
+  console.log(JSON.stringify({
+    event: "watch_pr.webhook_admission",
+    schema_version: 1,
+    ...(eventName === undefined ? {} : { github_event: eventName }),
+    outcome,
+  }));
+}
+
+function logWebhookFanout(eventName: string, outcome: "completed" | "failed", stats: WebhookProcessStats): void {
   const storageKeyWrites = stats.storageKeyPuts + stats.storageKeyDeletes;
-  const sampleReason = storageKeyWrites >= HIGH_WRITE_TELEMETRY_THRESHOLD
-    ? "high_write"
-    : sampled
-      ? "random"
-      : null;
-  if (!sampleReason) return;
   console.log(JSON.stringify({
     event: "watch_pr.webhook_fanout",
     schema_version: 1,
-    sample_rate: sampleReason === "high_write" ? 1 : WEBHOOK_TELEMETRY_SAMPLE_RATE,
-    sample_reason: sampleReason,
+    sample_rate: 1,
+    sample_reason: "all",
+    outcome,
     github_event: eventName,
     candidate_watches: stats.candidateWatches,
     routed_watches: stats.routedWatches,
@@ -1905,29 +1926,43 @@ export class WatchPrHub {
     if (!valid) return new Response("Invalid webhook signature", { status: 401 });
     const eventName = request.headers.get("x-github-event")?.trim() ?? "";
     const deliveryId = request.headers.get("x-github-delivery")?.trim() || randomToken(12);
-    if (!isSupportedGithubEvent(eventName)) return this.accepted({ accepted: true, ignored: true, event: eventName });
+    if (!isSupportedGithubEvent(eventName)) {
+      logWebhookAdmission("unsupported_event");
+      return this.accepted({ accepted: true, ignored: true, event: eventName });
+    }
 
     let payload: Record<string, unknown>;
     try {
       payload = JSON.parse(body) as Record<string, unknown>;
     } catch {
+      logWebhookAdmission("invalid_json", eventName);
       return new Response("Invalid JSON", { status: 400 });
     }
     const deliveryKey = `delivery:${deliveryId}`;
-    const previousDelivery = await this.state.storage.get<number>(deliveryKey);
+    let previousDelivery: number | undefined;
+    try {
+      previousDelivery = await this.state.storage.get<number>(deliveryKey);
+    } catch (error) {
+      logWebhookAdmission("admission_error", eventName);
+      throw error;
+    }
     if (previousDelivery && Date.now() - previousDelivery < DELIVERY_DEDUPLICATION_WINDOW_MS) {
+      logWebhookAdmission("duplicate_persisted", eventName);
       return this.accepted({ accepted: true, duplicate: true });
     }
-    if (!this.rememberDelivery(deliveryId)) return this.accepted({ accepted: true, duplicate: true });
-    const sampled = sampleStorageTelemetry();
+    if (!this.rememberDelivery(deliveryId)) {
+      logWebhookAdmission("duplicate_in_flight", eventName);
+      return this.accepted({ accepted: true, duplicate: true });
+    }
+    logWebhookAdmission("accepted", eventName);
     const stats = createWebhookProcessStats();
     this.state.waitUntil(
       this.processWebhook(eventName, deliveryId, payload, stats)
         .then(() => {
-          logWebhookFanout(eventName, sampled, stats);
+          logWebhookFanout(eventName, "completed", stats);
         })
         .catch(async (error) => {
-          logWebhookFanout(eventName, sampled, stats);
+          logWebhookFanout(eventName, "failed", stats);
           const errorKind = error instanceof GithubApiError
             ? "github_api"
             : error instanceof TypeError
@@ -2065,11 +2100,12 @@ export class WatchPrHub {
         snapshot,
         changes,
       });
-      const result = await this.publishEvent(userId, key, event, { snapshot });
+      const result = await this.publishEvent(userId, key, event, { snapshot }, (writes) => {
+        stats.storageKeyPuts += writes.puts;
+        stats.storageKeyDeletes += writes.deletes;
+      });
       if (!result.published || !result.write) continue;
       stats.publishedWatches += 1;
-      stats.storageKeyPuts += result.write.puts;
-      stats.storageKeyDeletes += result.write.deletes;
       stats.largestStateBytes = Math.max(stats.largestStateBytes, result.write.encodedBytes);
       stats.largestStateChunkCount = Math.max(stats.largestStateChunkCount, result.write.chunkCount);
       if (result.write.format === "compact") stats.compactWrites += 1;
@@ -2158,37 +2194,46 @@ export class WatchPrHub {
     key: string,
     event: WatchEvent,
     state: Pick<StoredWatchState, "snapshot">,
+    onWatchStorageWrites?: (writes: WatchStorageWrites) => void,
   ): Promise<PublishResult> {
     const storageKey = watchStorageKey(userId, event.repository, event.pullRequestNumber);
+    const writes = onWatchStorageWrites ? { puts: 0, deletes: 0 } : null;
     let deliveredEvent = event;
     let published = false;
     let write: WatchAppendStats | null = null;
-    await this.state.storage.transaction(async (storage) => {
-      const mutation = await openWatchStateMutation(storage, storageKey);
-      const current = mutation.metadata;
-      if (current.events.some((storedEvent) => storedEvent.deliveryId === event.deliveryId)) return;
-      const currentTerminalState = terminalState(current.snapshot);
-      if (currentTerminalState === "merged") return;
-      let snapshot = state.snapshot;
-      let changes = event.changes;
-      if (!snapshot) {
-        snapshot = current.snapshot;
-        changes = [];
-      } else if (current.snapshot) {
-        const currentTime = Date.parse(current.snapshot.fetchedAt);
-        const incomingTime = Date.parse(snapshot.fetchedAt);
-        if (Number.isFinite(currentTime) && Number.isFinite(incomingTime) && currentTime > incomingTime) {
+    try {
+      await this.state.storage.transaction(async (storage) => {
+        const mutation = await openWatchStateMutation(
+          writes ? countWatchStorageWrites(storage, writes) : storage,
+          storageKey,
+        );
+        const current = mutation.metadata;
+        if (current.events.some((storedEvent) => storedEvent.deliveryId === event.deliveryId)) return;
+        const currentTerminalState = terminalState(current.snapshot);
+        if (currentTerminalState === "merged") return;
+        let snapshot = state.snapshot;
+        let changes = event.changes;
+        if (!snapshot) {
           snapshot = current.snapshot;
           changes = [];
-        } else {
-          changes = snapshotChanges(current.snapshot, snapshot);
+        } else if (current.snapshot) {
+          const currentTime = Date.parse(current.snapshot.fetchedAt);
+          const incomingTime = Date.parse(snapshot.fetchedAt);
+          if (Number.isFinite(currentTime) && Number.isFinite(incomingTime) && currentTime > incomingTime) {
+            snapshot = current.snapshot;
+            changes = [];
+          } else {
+            changes = snapshotChanges(current.snapshot, snapshot);
+          }
         }
-      }
-      if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
-      deliveredEvent = { ...event, snapshot, changes };
-      write = await mutation.append(deliveredEvent, snapshot);
-      published = true;
-    });
+        if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
+        deliveredEvent = { ...event, snapshot, changes };
+        write = await mutation.append(deliveredEvent, snapshot);
+        published = true;
+      });
+    } finally {
+      if (writes && onWatchStorageWrites) onWatchStorageWrites(writes);
+    }
     if (!published || !write) return { published: false, write: null };
     logWatchStateWrite(deliveredEvent, write);
     this.publishMonitorEvent(
