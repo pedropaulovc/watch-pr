@@ -133,6 +133,25 @@ describe("encodeLogsRequest", () => {
     expect(encodeLogsRequest({})).toHaveLength(0);
     expect(encodeLogsRequest({ resourceLogs: [] })).toHaveLength(0);
   });
+
+  it("omits empty optional log correlation identifiers", () => {
+    const encoded = encodeLogsRequest({
+      resourceLogs: [{
+        scopeLogs: [{
+          logRecords: [{
+            body: { stringValue: "uncorrelated log" },
+            traceId: "",
+            spanId: "",
+          }],
+        }],
+      }],
+    });
+    const resourceLogs = decode(bytes(only(decode(encoded), 1)));
+    const scopeLogs = decode(bytes(only(resourceLogs, 2)));
+    const record = decode(bytes(only(scopeLogs, 2)));
+
+    expect(record.some((field) => field.field === 9 || field.field === 10)).toBe(false);
+  });
   it("rejects malformed log correlation identifiers", () => {
     expect(() => encodeLogsRequest({
       resourceLogs: [{ scopeLogs: [{ logRecords: [{ traceId: "f".repeat(31) }] }] }],
@@ -183,6 +202,20 @@ describe("encodeTraceRequest", () => {
     const status = decode(bytes(only(span, 15)));
     expect(string(only(status, 2))).toBe("error");
     expect(number(only(status, 3))).toBe(2n);
+  });
+
+  it("omits an empty parent span ID for a root span", () => {
+    const encoded = encodeTraceRequest(traceRequest({
+      traceId: "0102030405060708090a0b0c0d0e0f10",
+      spanId: "1112131415161718",
+      parentSpanId: "",
+      name: "root",
+    }));
+    const resourceSpans = decode(bytes(only(decode(encoded), 1)));
+    const scopeSpans = decode(bytes(only(resourceSpans, 2)));
+    const span = decode(bytes(only(scopeSpans, 2)));
+
+    expect(span.some((field) => field.field === 4)).toBe(false);
   });
 
   it("accepts named OTLP enums", () => {

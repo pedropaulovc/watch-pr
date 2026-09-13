@@ -199,8 +199,8 @@ function encodeLogRecord(value: Json): number[] {
     pushTag(out, 8, WIRE_FIXED32);
     pushFixed32(out, Number(value.flags));
   }
-  if (value.traceId !== undefined) pushLenField(out, 9, hexToBytes(String(value.traceId), 16));
-  if (value.spanId !== undefined) pushLenField(out, 10, hexToBytes(String(value.spanId), 8));
+  if (value.traceId !== undefined && value.traceId !== "") pushLenField(out, 9, hexToBytes(String(value.traceId), 16));
+  if (value.spanId !== undefined && value.spanId !== "") pushLenField(out, 10, hexToBytes(String(value.spanId), 8));
   if (value.observedTimeUnixNano) pushFixed64Field(out, 11, BigInt(value.observedTimeUnixNano as string));
   return out;
 }
@@ -262,7 +262,9 @@ function encodeSpan(value: Json): number[] {
   if (value.traceId !== undefined) pushLenField(out, 1, hexToBytes(String(value.traceId), 16));
   if (value.spanId !== undefined) pushLenField(out, 2, hexToBytes(String(value.spanId), 8));
   if (value.traceState) pushStringField(out, 3, String(value.traceState));
-  if (value.parentSpanId !== undefined) pushLenField(out, 4, hexToBytes(String(value.parentSpanId), 8));
+  if (value.parentSpanId !== undefined && value.parentSpanId !== "") {
+    pushLenField(out, 4, hexToBytes(String(value.parentSpanId), 8));
+  }
   if (value.name) pushStringField(out, 5, String(value.name));
   if (value.kind !== undefined) pushVarintField(out, 6, enumInt(value.kind, SPAN_KIND));
   if (value.startTimeUnixNano) pushFixed64Field(out, 7, BigInt(value.startTimeUnixNano as string));
