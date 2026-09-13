@@ -476,7 +476,7 @@ describe("native monitor feed", () => {
     expect(stored.events.map((storedEvent) => storedEvent.deliveryId)).toEqual([incoming.deliveryId]);
   });
 
-  it("logs multi-chunk Durable Object state writes without sampling", async () => {
+  it("logs chunked Durable Object state writes", async () => {
     const { hub } = hubFixture();
     const current = snapshot();
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -493,12 +493,39 @@ describe("native monitor feed", () => {
       expect(record).toMatchObject({
         event: "watch_pr.do_storage",
         sample_rate: 1,
-        sample_reason: "high_write",
+        sample_reason: "all",
         source: "webhook",
         state_format: "chunked",
       });
       expect(record?.state_chunk_count).toBeGreaterThanOrEqual(4);
       expect(record?.storage_key_writes).toBeGreaterThanOrEqual(4);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("logs compact Durable Object state writes", async () => {
+    const { hub } = hubFixture();
+    const current = snapshot();
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await (hub as unknown as HubInternals).publishEvent(
+        userId,
+        watch,
+        event("event-compact", current),
+        { snapshot: current },
+      );
+      const record = log.mock.calls
+        .map(([value]) => JSON.parse(String(value)) as Record<string, unknown>)
+        .find((entry) => entry.event === "watch_pr.do_storage");
+      expect(record).toMatchObject({
+        event: "watch_pr.do_storage",
+        sample_rate: 1,
+        sample_reason: "all",
+        source: "webhook",
+        state_format: "compact",
+      });
+      expect(record?.storage_key_writes).toBeLessThan(4);
     } finally {
       log.mockRestore();
     }
@@ -561,6 +588,7 @@ describe("native monitor feed", () => {
       "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
     };
     const fetchMock = openPullRequestFetch();
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.stubGlobal("fetch", fetchMock);
     try {
       const first = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
@@ -579,6 +607,21 @@ describe("native monitor feed", () => {
         body,
       }));
       await expect(duplicate.json()).resolves.toMatchObject({ accepted: true, duplicate: true });
+      const records = log.mock.calls.map(([value]) => JSON.parse(String(value)) as Record<string, unknown>);
+      expect(records.filter((entry) => entry.event === "watch_pr.webhook_admission")).toEqual([
+        expect.objectContaining({ github_event: "pull_request", outcome: "accepted" }),
+        expect.objectContaining({ github_event: "pull_request", outcome: "duplicate_persisted" }),
+      ]);
+      expect(records.filter((entry) => entry.event === "watch_pr.webhook_fanout")).toEqual([
+        expect.objectContaining({
+          outcome: "completed",
+          routed_watches: 1,
+          published_watches: 1,
+          storage_key_puts: 4,
+          storage_key_deletes: 1,
+          storage_key_writes: 5,
+        }),
+      ]);
 
       const stored = await readStoredWatchState(
         storage as unknown as DurableObjectStorage,
@@ -588,6 +631,76 @@ describe("native monitor feed", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       vi.unstubAllGlobals();
+      log.mockRestore();
+    }
+  });
+
+  it("logs zero-write fanout for an authenticated unmatched webhook", async () => {
+    const { hub, pending } = hubFixture();
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { full_name: "other/repository" },
+      pull_request: { number: 8 },
+    });
+    const headers = {
+      "x-github-delivery": "unmatched-delivery",
+      "x-github-event": "pull_request",
+      "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+    };
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const response = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending.splice(0));
+
+      const records = log.mock.calls.map(([value]) => JSON.parse(String(value)) as Record<string, unknown>);
+      expect(records.filter((entry) => entry.event === "watch_pr.webhook_admission")).toEqual([
+        expect.objectContaining({ github_event: "pull_request", outcome: "accepted" }),
+      ]);
+      expect(records.filter((entry) => entry.event === "watch_pr.webhook_fanout")).toEqual([
+        expect.objectContaining({
+          sample_rate: 1,
+          sample_reason: "all",
+          outcome: "completed",
+          candidate_watches: 0,
+          routed_watches: 0,
+          published_watches: 0,
+          storage_key_writes: 0,
+        }),
+      ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("omits unrecognized event names from authenticated admissions", async () => {
+    const { hub } = hubFixture();
+    const body = "{}";
+    const headers = {
+      "x-github-delivery": "unsupported-delivery",
+      "x-github-event": "unsupported-event-name",
+      "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+    };
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const response = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers,
+        body,
+      }));
+      await expect(response.json()).resolves.toMatchObject({ accepted: true, ignored: true });
+
+      const admission = log.mock.calls
+        .map(([value]) => JSON.parse(String(value)) as Record<string, unknown>)
+        .find((entry) => entry.event === "watch_pr.webhook_admission");
+      expect(admission).toMatchObject({ outcome: "unsupported_event" });
+      expect(admission).not.toHaveProperty("github_event");
+    } finally {
+      log.mockRestore();
     }
   });
 
@@ -689,14 +802,15 @@ describe("native monitor feed", () => {
       const records = log.mock.calls.map(([value]) => JSON.parse(String(value)) as Record<string, unknown>);
       expect(records.find((entry) => entry.event === "watch_pr.webhook_fanout")).toMatchObject({
         sample_rate: 1,
-        sample_reason: "high_write",
+        sample_reason: "all",
+        outcome: "failed",
         routed_watches: 5,
         published_watches: 4,
-        // Each published watch writes an immutable event payload, snapshot, and index.
-        // Its compact predecessor is retired in the same transaction; only chunked records defer.
-        storage_key_puts: 12,
-        storage_key_deletes: 4,
-        storage_key_writes: 16,
+        // Four targets complete each event, snapshot, index, and root retirement. The fifth
+        // persists its event and snapshot and retires the root before its index write fails.
+        storage_key_puts: 14,
+        storage_key_deletes: 5,
+        storage_key_writes: 19,
       });
       expect(records.find((entry) => entry.event === "watch_pr.webhook_failure")).toMatchObject({
         delivery_fingerprint: await sha256Base64Url(deliveryId),
@@ -758,7 +872,8 @@ describe("native monitor feed", () => {
       expect(telemetry).toMatchObject({
         event: "watch_pr.webhook_fanout",
         sample_rate: 1,
-        sample_reason: "high_write",
+        sample_reason: "all",
+        outcome: "completed",
         delivery_dedupe_puts: 1,
         storage_key_puts: 1,
         storage_key_deletes: 3,
@@ -800,12 +915,21 @@ describe("native monitor feed", () => {
     };
     const fetchMock = openPullRequestFetch();
     vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
       await expect(hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
         method: "POST",
         headers,
         body,
       }))).rejects.toThrow("admission read failed");
+
+      const admission = log.mock.calls
+        .map(([value]) => JSON.parse(String(value)) as Record<string, unknown>)
+        .find((entry) => entry.event === "watch_pr.webhook_admission");
+      expect(admission).toMatchObject({
+        github_event: "pull_request",
+        outcome: "admission_error",
+      });
 
       const retry = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
         method: "POST",
@@ -822,6 +946,7 @@ describe("native monitor feed", () => {
       expect(stored.events).toHaveLength(1);
     } finally {
       vi.unstubAllGlobals();
+      log.mockRestore();
     }
   });
 

@@ -16,6 +16,7 @@ const MAX_DIAGNOSTIC_FIELDS = 32;
 
 const DIAGNOSTIC_EVENTS = new Set([
   "watch_pr.do_storage",
+  "watch_pr.webhook_admission",
   "watch_pr.webhook_fanout",
   "watch_pr.webhook_failure",
   "watch_pr.poll",
@@ -28,6 +29,7 @@ const DIAGNOSTIC_FIELDS = new Set([
   "schema_version",
   "sample_rate",
   "sample_reason",
+  "outcome",
   "source",
   "github_event",
   "github_action",

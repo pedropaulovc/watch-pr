@@ -152,6 +152,13 @@ describe("OTLP sanitizer", () => {
               repository: "private-repository",
               api_key: "secret-key",
             })) },
+            { body: str(JSON.stringify({
+              event: "watch_pr.webhook_admission",
+              github_event: "pull_request",
+              outcome: "accepted",
+              delivery_id: "private-delivery-id",
+              repository: "private-repository",
+            })) },
             { body: str("watch_pr.poll ") },
             { body: str(JSON.stringify({ event: "not_ours", request_headers: { cookie: "sid" } })) },
             { body: str("plain console output with https://watch-pr.vza.net/monitor/cap") },
@@ -174,9 +181,16 @@ describe("OTLP sanitizer", () => {
         { key: "watch_pr.predecessor_payload_references", value: { intValue: 99 } },
       ],
     });
-    expect(records[2]).toEqual({ body: str("watch_pr.poll") });
-    expect(records[3]).toEqual({});
+    expect(records[2]).toEqual({
+      body: str("watch_pr.webhook_admission"),
+      attributes: [
+        { key: "watch_pr.github_event", value: str("pull_request") },
+        { key: "watch_pr.outcome", value: str("accepted") },
+      ],
+    });
+    expect(records[3]).toEqual({ body: str("watch_pr.poll") });
     expect(records[4]).toEqual({});
+    expect(records[5]).toEqual({});
   });
 
   it("does not mutate the parsed payload", () => {
