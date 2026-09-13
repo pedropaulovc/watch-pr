@@ -37,6 +37,8 @@ const DIAGNOSTIC_FIELDS = new Set([
   "encoded_state_bytes",
   "state_chunk_count",
   "state_format",
+  "windowed_events",
+  "predecessor_payload_references",
   "candidate_watches",
   "routed_watches",
   "duplicate_watches",

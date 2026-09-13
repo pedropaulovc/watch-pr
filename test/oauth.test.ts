@@ -1,14 +1,31 @@
 import { describe, expect, it, vi } from "vitest";
 import { hmacSha256Hex, sha256Base64Url } from "../src/crypto";
-import { WatchPrHub, readStoredWatchState, type Env, type WatchStorage, writeStoredWatchState } from "../src/hub";
+import {
+  WatchPrHub,
+  openWatchStateMutation,
+  readStoredWatchState,
+  readWatchStateMetadata,
+  writeStoredWatchState,
+  type Env,
+  type WatchStorage,
+} from "../src/hub";
 import { GithubApiError } from "../src/github";
-import type { OAuthCodeRecord, SessionRecord, StoredWatchState, WatchEvent } from "../src/types";
-import { legacyWatchStorageKey, sessionStorageKey, watchStorageKey } from "../src/types";
+import type { OAuthCodeRecord, PullRequestSnapshot, SessionRecord, StoredWatchState, WatchEvent } from "../src/types";
+import {
+  legacyWatchStorageKey,
+  sessionStorageKey,
+  watchSidecarCleanupKey,
+  watchSidecarEventKey,
+  watchSidecarIndexKey,
+  watchSidecarSnapshotKey,
+  watchStorageKey,
+} from "../src/types";
 
 class MemoryStorage {
   private readonly values = new Map<string, unknown>();
   readonly batchSizes: number[] = [];
   readonly putKeys: string[] = [];
+  readonly deleteKeys: string[] = [];
   readonly getKeys: string[] = [];
 
   listError?: unknown;
@@ -42,10 +59,12 @@ class MemoryStorage {
   async delete(key: string | string[]): Promise<boolean> {
     if (Array.isArray(key)) {
       this.batchSizes.push(key.length);
+      this.deleteKeys.push(...key);
       let deleted = false;
       for (const entry of key) deleted = this.values.delete(entry) || deleted;
       return deleted;
     }
+    this.deleteKeys.push(key);
     return this.values.delete(key);
   }
 
@@ -103,6 +122,34 @@ function watchEvent(index: number, payload: unknown): WatchEvent {
     payload,
     snapshot: null,
     changes: [],
+  };
+}
+
+function pullRequestSnapshot(body: string, fetchedAt: string): PullRequestSnapshot {
+  return {
+    repository: "owner/repo",
+    number: 7,
+    url: "https://github.com/owner/repo/pull/7",
+    title: "Watch sidecar",
+    body,
+    state: "open",
+    draft: false,
+    merged: false,
+    mergedAt: null,
+    mergeable: true,
+    mergeableState: "clean",
+    baseRefName: "main",
+    headRefName: "sidecar",
+    headRepository: "owner/repo",
+    headSha: "abc123",
+    author: "owner",
+    fetchedAt,
+    bodyReactions: {},
+    comments: [],
+    reviews: [],
+    reviewComments: [],
+    checks: [],
+    threads: [],
   };
 }
 
@@ -607,5 +654,354 @@ describe("OAuth broker", () => {
 
     const replay = await restart().fetch(new Request("https://watch-pr.vza.net/mcp", { headers }));
     expect(replay.status).toBe(404);
+  });
+});
+
+describe("watch state sidecar storage", () => {
+  const storageKey = watchStorageKey(42, "owner/repo", 7);
+
+  function predecessorState(count: number, payloadSize: number): StoredWatchState {
+    return {
+      snapshot: null,
+      events: Array.from({ length: count }, (_, index) => watchEvent(index, "x".repeat(payloadSize))),
+    };
+  }
+
+  it("projects predecessor compact and chunked state while no sidecar exists", async () => {
+    const storage = new MemoryStorage();
+    const compact = predecessorState(2, 10);
+    await writeStoredWatchState(storage as unknown as WatchStorage, storageKey, compact);
+    await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey)).resolves.toEqual(compact);
+    const compactMetadata = await readWatchStateMetadata(storage as unknown as WatchStorage, storageKey);
+    expect(compactMetadata.events.map((entry) => entry.id)).toEqual(["event-0", "event-1"]);
+    expect(compactMetadata.events[0]).not.toHaveProperty("payload");
+
+    const chunked = predecessorState(100, 23_000);
+    await writeStoredWatchState(storage as unknown as WatchStorage, storageKey, chunked);
+    await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey)).resolves.toEqual(chunked);
+    const chunkedMetadata = await readWatchStateMetadata(storage as unknown as WatchStorage, storageKey);
+    expect(chunkedMetadata.snapshot).toBeNull();
+    expect(chunkedMetadata.events).toHaveLength(100);
+    expect(storage.putKeys.filter((key) => key.includes(":sidecar"))).toEqual([]);
+  });
+
+  it("indexes predecessor events on the first append instead of copying their payloads", async () => {
+    const storage = new MemoryStorage();
+    const predecessor = predecessorState(100, 23_000);
+    await writeStoredWatchState(storage as unknown as WatchStorage, storageKey, predecessor);
+    const rootRecord = await storage.get(storageKey);
+    storage.putKeys.length = 0;
+    storage.deleteKeys.length = 0;
+
+    const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    expect(mutation.metadata.events).toHaveLength(100);
+    const appended = watchEvent(100, { appended: true });
+    const write = await mutation.append(appended, null);
+
+    expect(write).toMatchObject({ puts: 3, deletes: 0, windowEvents: 100, rootReferences: 99 });
+    expect(storage.putKeys).toEqual([
+      watchSidecarEventKey(storageKey, 0),
+      watchSidecarSnapshotKey(storageKey, 0),
+      watchSidecarIndexKey(storageKey),
+    ]);
+    expect(storage.deleteKeys).toEqual([]);
+    // The predecessor record and every chunk it owns stay exactly as they were.
+    await expect(storage.get(storageKey)).resolves.toEqual(rootRecord);
+
+    const hydrated = await readStoredWatchState(storage as unknown as WatchStorage, storageKey);
+    expect(hydrated.events).toHaveLength(100);
+    expect(hydrated.events.slice(0, 99)).toEqual(predecessor.events.slice(1));
+    expect(hydrated.events.at(-1)).toEqual(appended);
+  });
+
+  it("keeps steady append writes bounded regardless of stored payload size", async () => {
+    const large = new MemoryStorage();
+    const small = new MemoryStorage();
+    await writeStoredWatchState(large as unknown as WatchStorage, storageKey, predecessorState(100, 23_000));
+    await writeStoredWatchState(small as unknown as WatchStorage, storageKey, predecessorState(100, 10));
+
+    const writes: number[][] = [];
+    for (const storage of [large, small]) {
+      const perAppend: number[] = [];
+      for (let index = 0; index < 4; index += 1) {
+        const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+        const write = await mutation.append(watchEvent(100 + index, { appended: index }), null);
+        perAppend.push(write.puts + write.deletes);
+      }
+      writes.push(perAppend);
+    }
+
+    expect(writes[0]).toEqual(writes[1]);
+    expect(Math.max(...writes[0]!)).toBeLessThanOrEqual(4);
+    await expect(readStoredWatchState(large as unknown as WatchStorage, storageKey)).resolves.toMatchObject({
+      events: expect.arrayContaining([expect.objectContaining({ id: "event-103" })]),
+    });
+  });
+
+  it("retires an evicted payload through bounded deferred cleanup", async () => {
+    const storage = new MemoryStorage();
+    for (let index = 0; index < 101; index += 1) {
+      const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+      await mutation.append(watchEvent(index, { sequence: index }), null);
+    }
+
+    await expect(storage.get(watchSidecarEventKey(storageKey, 0))).resolves.toMatchObject({ id: "event-0" });
+    await expect(storage.get(watchSidecarCleanupKey(storageKey, 0))).resolves.toMatchObject({
+      recordKey: watchSidecarEventKey(storageKey, 0),
+    });
+
+    const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await mutation.append(watchEvent(101, { sequence: 101 }), null);
+
+    expect(storage.deleteKeys).toEqual([
+      watchSidecarEventKey(storageKey, 0),
+      watchSidecarCleanupKey(storageKey, 0),
+    ]);
+    await expect(storage.get(watchSidecarEventKey(storageKey, 0))).resolves.toBeUndefined();
+    await expect(storage.get(watchSidecarEventKey(storageKey, 1))).resolves.toMatchObject({ id: "event-1" });
+
+    const hydrated = await readStoredWatchState(storage as unknown as WatchStorage, storageKey);
+    expect(hydrated.events).toHaveLength(100);
+    expect(hydrated.events[0]).toMatchObject({ id: "event-2", payload: { sequence: 2 } });
+    expect(hydrated.events.at(-1)).toMatchObject({ id: "event-101", payload: { sequence: 101 } });
+  });
+
+  it("drains compact snapshot and event retirements faster than they are enqueued", async () => {
+    const storage = new MemoryStorage();
+    for (let index = 0; index < 120; index += 1) {
+      const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+      await mutation.append(
+        watchEvent(index, { sequence: index }),
+        pullRequestSnapshot(`snapshot-${index}`, new Date(index).toISOString()),
+      );
+    }
+
+    const cleanupRows = await storage.list({ prefix: `${storageKey}:sidecar:cleanup:` });
+    expect(cleanupRows.size).toBe(2);
+    await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey)).resolves.toMatchObject({
+      snapshot: { body: "snapshot-119" },
+    });
+  });
+
+  it("drains repeated large event and snapshot retirements at the incoming write rate", async () => {
+    const storage = new MemoryStorage();
+    const eventPayload = "event".repeat(25_000);
+    const snapshotBody = "snapshot".repeat(20_000);
+    for (let index = 0; index < 102; index += 1) {
+      const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+      await mutation.append(
+        watchEvent(index, eventPayload),
+        pullRequestSnapshot(snapshotBody, new Date(index).toISOString()),
+      );
+    }
+
+    const cleanupRows = await storage.list({ prefix: `${storageKey}:sidecar:cleanup:` });
+    // Four partially retired records cover the two snapshot/event replacements in flight.
+    expect(cleanupRows.size).toBe(4);
+  });
+
+  it("limits predecessor retirement to a fixed cleanup batch", async () => {
+    const storage = new MemoryStorage();
+    await writeStoredWatchState(
+      storage as unknown as WatchStorage,
+      storageKey,
+      predecessorState(100, 23_000),
+    );
+    for (let index = 0; index < 100; index += 1) {
+      const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+      await mutation.append(watchEvent(100 + index, { replacement: index }), null);
+    }
+    await expect(storage.get(watchSidecarCleanupKey(storageKey, 0))).resolves.toMatchObject({
+      recordKey: storageKey,
+    });
+    storage.deleteKeys.length = 0;
+
+    const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    const write = await mutation.append(watchEvent(200, "replacement".repeat(16_000)), null);
+
+    const predecessorDeletes = storage.deleteKeys.filter(
+      (key) => key === storageKey || key.startsWith(`${storageKey}:chunk:`),
+    );
+    expect(predecessorDeletes).toHaveLength(8);
+    expect(write.deletes).toBe(9);
+    await expect(storage.get(watchSidecarCleanupKey(storageKey, 1))).resolves.toMatchObject({ nextRow: 8 });
+  });
+
+  it("retires replaced snapshots without deleting the current snapshot chunks", async () => {
+    const storage = new MemoryStorage();
+    const initial = pullRequestSnapshot("x".repeat(80_000), "2026-09-13T00:00:00.000Z");
+    const replacement = pullRequestSnapshot("replacement", "2026-09-13T00:01:00.000Z");
+
+    const first = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await first.append(watchEvent(0, { stored: true }), initial);
+    const second = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await second.append(watchEvent(1, { stored: true }), replacement);
+
+    await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey))
+      .resolves.toMatchObject({ snapshot: replacement });
+    await expect(storage.get(watchSidecarSnapshotKey(storageKey, 0))).resolves.toBeDefined();
+
+    const third = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await third.append(watchEvent(2, { stored: true }), replacement);
+
+    await expect(storage.get(watchSidecarSnapshotKey(storageKey, 0))).resolves.toBeUndefined();
+    await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey))
+      .resolves.toMatchObject({ snapshot: replacement });
+  });
+
+  it("fails closed for a present but unreadable sidecar index", async () => {
+    const storage = new MemoryStorage();
+    const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await mutation.append(watchEvent(0, { stored: true }), null);
+    await storage.put(watchSidecarIndexKey(storageKey), { version: 999 });
+
+    await expect(readWatchStateMetadata(storage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+    await expect(openWatchStateMutation(storage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+  });
+
+  it("fails closed for missing or malformed sidecar snapshots and payloads", async () => {
+    const snapshotStorage = new MemoryStorage();
+    const snapshotMutation = await openWatchStateMutation(snapshotStorage as unknown as WatchStorage, storageKey);
+    await snapshotMutation.append(watchEvent(0, { stored: true }), null);
+    await snapshotStorage.delete(watchSidecarSnapshotKey(storageKey, 0));
+
+    await expect(readWatchStateMetadata(snapshotStorage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+    await expect(openWatchStateMutation(snapshotStorage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+
+    const malformedSnapshotStorage = new MemoryStorage();
+    const malformedSnapshotMutation = await openWatchStateMutation(
+      malformedSnapshotStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await malformedSnapshotMutation.append(watchEvent(0, { stored: true }), null);
+    await malformedSnapshotStorage.put(watchSidecarSnapshotKey(storageKey, 0), { snapshot: [] });
+
+    await expect(readWatchStateMetadata(malformedSnapshotStorage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+
+    const nestedSnapshotStorage = new MemoryStorage();
+    const nestedSnapshot = pullRequestSnapshot("valid", "2026-09-13T00:00:00.000Z");
+    const nestedSnapshotMutation = await openWatchStateMutation(
+      nestedSnapshotStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await nestedSnapshotMutation.append(watchEvent(0, { stored: true }), nestedSnapshot);
+    await nestedSnapshotStorage.put(watchSidecarSnapshotKey(storageKey, 0), {
+      snapshot: { ...nestedSnapshot, comments: [null] },
+    });
+
+    await expect(readWatchStateMetadata(nestedSnapshotStorage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+
+    const protectedTargetStorage = new MemoryStorage();
+    const firstProtectedSnapshot = pullRequestSnapshot("first", "2026-09-13T00:00:00.000Z");
+    const currentProtectedSnapshot = pullRequestSnapshot("current", "2026-09-13T00:01:00.000Z");
+    const firstProtectedMutation = await openWatchStateMutation(
+      protectedTargetStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await firstProtectedMutation.append(watchEvent(0, { stored: true }), firstProtectedSnapshot);
+    const secondProtectedMutation = await openWatchStateMutation(
+      protectedTargetStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await secondProtectedMutation.append(watchEvent(1, { stored: true }), currentProtectedSnapshot);
+    await protectedTargetStorage.put(watchSidecarCleanupKey(storageKey, 0), {
+      recordKey: watchSidecarSnapshotKey(storageKey, 1),
+      chunkCount: 0,
+      nextRow: 0,
+    });
+
+    const protectedTargetMutation = await openWatchStateMutation(
+      protectedTargetStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await expect(protectedTargetMutation.append(watchEvent(2, { stored: true }), currentProtectedSnapshot))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+
+    const unrelatedTargetStorage = new MemoryStorage();
+    const firstUnrelatedMutation = await openWatchStateMutation(
+      unrelatedTargetStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await firstUnrelatedMutation.append(watchEvent(0, { stored: true }), firstProtectedSnapshot);
+    const secondUnrelatedMutation = await openWatchStateMutation(
+      unrelatedTargetStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await secondUnrelatedMutation.append(watchEvent(1, { stored: true }), currentProtectedSnapshot);
+    const unrelatedKey = sessionStorageKey("unrelated");
+    await unrelatedTargetStorage.put(unrelatedKey, { preserved: true });
+    await unrelatedTargetStorage.put(watchSidecarCleanupKey(storageKey, 0), {
+      recordKey: unrelatedKey,
+      chunkCount: 0,
+      nextRow: 0,
+    });
+
+    const unrelatedTargetMutation = await openWatchStateMutation(
+      unrelatedTargetStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await expect(unrelatedTargetMutation.append(watchEvent(2, { stored: true }), currentProtectedSnapshot))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+    await expect(unrelatedTargetStorage.get(unrelatedKey)).resolves.toEqual({ preserved: true });
+
+    const payloadStorage = new MemoryStorage();
+    const payloadMutation = await openWatchStateMutation(payloadStorage as unknown as WatchStorage, storageKey);
+    await payloadMutation.append(watchEvent(0, { stored: true }), null);
+    await payloadStorage.delete(watchSidecarEventKey(storageKey, 0));
+
+    await expect(readStoredWatchState(payloadStorage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+
+    const chunkedPayloadStorage = new MemoryStorage();
+    const chunkedPayloadMutation = await openWatchStateMutation(
+      chunkedPayloadStorage as unknown as WatchStorage,
+      storageKey,
+    );
+    await chunkedPayloadMutation.append(watchEvent(0, "x".repeat(80_000)), null);
+    await chunkedPayloadStorage.put(watchSidecarEventKey(storageKey, 0), { chunkCount: 1 });
+
+    await expect(readStoredWatchState(chunkedPayloadStorage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+
+    const summaryOnlyStorage = new MemoryStorage();
+    const summaryOnlyEvent = watchEvent(0, { stored: true });
+    const summaryOnlyMutation = await openWatchStateMutation(summaryOnlyStorage as unknown as WatchStorage, storageKey);
+    await summaryOnlyMutation.append(summaryOnlyEvent, null);
+    const { payload: _payload, snapshot: _snapshot, ...summaryOnlyRecord } = summaryOnlyEvent;
+    await summaryOnlyStorage.put(watchSidecarEventKey(storageKey, 0), summaryOnlyRecord);
+
+    await expect(readStoredWatchState(summaryOnlyStorage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+
+    const rootStorage = new MemoryStorage();
+    await writeStoredWatchState(rootStorage as unknown as WatchStorage, storageKey, predecessorState(1, 10));
+    const rootMutation = await openWatchStateMutation(rootStorage as unknown as WatchStorage, storageKey);
+    await rootMutation.append(watchEvent(1, { stored: true }), null);
+    await rootStorage.delete(storageKey);
+
+    await expect(readStoredWatchState(rootStorage as unknown as WatchStorage, storageKey))
+      .rejects.toThrow("watch sidecar storage is corrupt");
+  });
+
+  it("reads snapshot and event metadata without touching payload rows", async () => {
+    const storage = new MemoryStorage();
+    await writeStoredWatchState(storage as unknown as WatchStorage, storageKey, predecessorState(100, 23_000));
+    const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await mutation.append(watchEvent(100, { appended: true }), null);
+    storage.getKeys.length = 0;
+
+    const metadata = await readWatchStateMetadata(storage as unknown as WatchStorage, storageKey);
+    expect(metadata.events).toHaveLength(100);
+    expect(metadata.events.at(-1)).toMatchObject({ id: "event-100", terminalState: "watching" });
+    expect(storage.getKeys).toEqual([
+      watchSidecarIndexKey(storageKey),
+      watchSidecarSnapshotKey(storageKey, 0),
+    ]);
   });
 });

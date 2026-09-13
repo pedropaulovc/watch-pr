@@ -13,16 +13,28 @@ import type {
   OAuthRequestRecord,
   PrMonitorEvent,
   PrMonitorRegistration,
+  PullRequestCheck,
+  PullRequestComment,
+  PullRequestReview,
   PullRequestSnapshot,
+  PullRequestThread,
+  ReactionCounts,
   SessionRecord,
   StoredWatchState,
   WatchEvent,
+  WatchEventMetadata,
+  WatchEventSummary,
+  WatchStateMetadata,
 } from "./types";
 import {
   legacyWatchStorageKey,
   monitorCapabilityStorageKey,
   monitorScopeStorageKey,
   sessionStorageKey,
+  watchSidecarCleanupKey,
+  watchSidecarEventKey,
+  watchSidecarIndexKey,
+  watchSidecarSnapshotKey,
   watchStorageKey,
 } from "./types";
 
@@ -68,13 +80,74 @@ const MAX_WATCH_CHUNK_CHARACTERS = 16_000;
 const DELIVERY_DEDUPLICATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const WEBHOOK_TELEMETRY_SAMPLE_RATE = 0.01;
 const HIGH_WRITE_TELEMETRY_THRESHOLD = 4;
+const MAX_DEFERRED_CLEANUP_DATA_ROWS_PER_JOB = 8;
+const MIN_DEFERRED_CLEANUP_ROWS = MAX_DEFERRED_CLEANUP_DATA_ROWS_PER_JOB;
 
+/**
+ * Sidecar layout version. Version 3 uses immutable payload and snapshot records behind a
+ * compact index, so appending never rewrites or mass-deletes historical event data.
+ */
+const WATCH_SIDECAR_VERSION = 3;
 
-interface WatchStateIndex {
+const stateEncoder = new TextEncoder();
+
+/** Marker stored at a record key whose JSON was split across `${key}:chunk:<index>` rows. */
+interface ChunkedRecordIndex {
   chunkCount: number;
 }
 
-interface WatchStateWriteStats {
+interface WatchSnapshotRecord {
+  snapshot: PullRequestSnapshot | null;
+}
+
+/** Where the current snapshot keeps its immutable payload. */
+interface SidecarSnapshotRef {
+  sequence: number;
+  chunkCount: number;
+}
+
+/** Where one windowed event keeps its raw payload. */
+type SidecarPayloadRef =
+  | { source: "root"; position: number }
+  | { source: "sidecar"; sequence: number; chunkCount: number };
+
+interface SidecarEventRef {
+  meta: WatchEventSummary;
+  payload: SidecarPayloadRef;
+}
+
+/** A bounded cleanup job for one unreferenced immutable record. */
+interface SidecarCleanupJob {
+  recordKey: string;
+  chunkCount: number;
+  nextRow: number;
+}
+
+interface SidecarCleanupQueue {
+  cursor: number;
+  next: number;
+}
+
+interface WatchSidecarIndex {
+  version: number;
+  /** Next unused event payload sequence. */
+  nextSequence: number;
+  /** Next unused immutable snapshot sequence. */
+  nextSnapshotSequence: number;
+  /** Current snapshot payload. */
+  snapshot: SidecarSnapshotRef;
+  /**
+   * The predecessor root record, kept verbatim while it still holds payloads for `root`
+   * refs. Its chunk count is remembered so the record can be dropped without probing.
+   */
+  root: { chunkCount: number } | null;
+  /** Deferred retirement keeps a single append from deleting historical rows en masse. */
+  cleanup: SidecarCleanupQueue;
+  /** Oldest to newest, capped at MAX_EVENTS. */
+  events: SidecarEventRef[];
+}
+
+export interface WatchStateWriteStats {
   puts: number;
   deletes: number;
   encodedBytes: number;
@@ -82,9 +155,14 @@ interface WatchStateWriteStats {
   format: "compact" | "chunked";
 }
 
+export interface WatchAppendStats extends WatchStateWriteStats {
+  windowEvents: number;
+  rootReferences: number;
+}
+
 interface PublishResult {
   published: boolean;
-  write: WatchStateWriteStats | null;
+  write: WatchAppendStats | null;
 }
 
 interface WebhookProcessStats {
@@ -128,12 +206,20 @@ interface WebhookWatcher {
 interface WebhookTarget extends WebhookWatcher {
   repository: string;
   number: number;
-  previous: StoredWatchState;
+  previous: WatchStateMetadata;
 }
 
-
-
 export type WatchStorage = Pick<DurableObjectStorage, "get" | "put" | "delete">;
+
+/**
+ * One read pass over a watch, reused by the append that follows it. Mutating paths need the
+ * metadata projection to decide whether to publish, and the append then reuses the record
+ * layout discovered by that same read instead of reading it again.
+ */
+export interface WatchStateMutation {
+  metadata: WatchStateMetadata;
+  append(event: WatchEvent, snapshot: PullRequestSnapshot | null): Promise<WatchAppendStats>;
+}
 
 function emptyWatchState(): StoredWatchState {
   return { snapshot: null, events: [] };
@@ -148,7 +234,7 @@ function isStoredWatchState(value: unknown): value is StoredWatchState {
   );
 }
 
-function isWatchStateIndex(value: unknown): value is WatchStateIndex {
+function isChunkedRecordIndex(value: unknown): value is ChunkedRecordIndex {
   return Boolean(
     value &&
     typeof value === "object" &&
@@ -157,8 +243,235 @@ function isWatchStateIndex(value: unknown): value is WatchStateIndex {
   );
 }
 
-function watchChunkKey(storageKey: string, index: number): string {
-  return `${storageKey}:chunk:${index}`;
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isStringArray(value: unknown): value is string[] {
+  if (!Array.isArray(value)) return false;
+  for (const entry of value) {
+    if (typeof entry !== "string") return false;
+  }
+  return true;
+}
+
+function isSafeIntegerArray(value: unknown): value is number[] {
+  if (!Array.isArray(value)) return false;
+  for (const entry of value) {
+    if (!Number.isSafeInteger(entry)) return false;
+  }
+  return true;
+}
+
+function isArrayOf<T>(value: unknown, predicate: (entry: unknown) => entry is T): value is T[] {
+  if (!Array.isArray(value)) return false;
+  for (const entry of value) {
+    if (!predicate(entry)) return false;
+  }
+  return true;
+}
+
+function isOptionalString(record: Record<string, unknown>, key: string): boolean {
+  const value = record[key];
+  return value === undefined || typeof value === "string";
+}
+
+function isOptionalNullableSafeInteger(record: Record<string, unknown>, key: string): boolean {
+  const value = record[key];
+  return value === undefined || value === null || Number.isSafeInteger(value);
+}
+
+function isReactionCounts(value: unknown): value is ReactionCounts {
+  if (!isObjectRecord(value)) return false;
+  for (const key in value) {
+    if (Object.hasOwn(value, key) && typeof value[key] !== "number") return false;
+  }
+  return true;
+}
+
+function isPullRequestComment(value: unknown): value is PullRequestComment {
+  if (!isObjectRecord(value)) return false;
+  return Number.isSafeInteger(value.id) &&
+    isNullableString(value.author) &&
+    typeof value.body === "string" &&
+    isNullableString(value.createdAt) &&
+    isNullableString(value.updatedAt) &&
+    isReactionCounts(value.reactions) &&
+    isOptionalString(value, "path") &&
+    isOptionalNullableSafeInteger(value, "line") &&
+    isOptionalNullableSafeInteger(value, "startLine") &&
+    isOptionalString(value, "diffHunk") &&
+    isOptionalNullableSafeInteger(value, "inReplyToId") &&
+    isOptionalString(value, "htmlUrl");
+}
+
+function isPullRequestReview(value: unknown): value is PullRequestReview {
+  if (!isObjectRecord(value)) return false;
+  return Number.isSafeInteger(value.id) &&
+    isNullableString(value.author) &&
+    typeof value.state === "string" &&
+    typeof value.body === "string" &&
+    isNullableString(value.submittedAt) &&
+    isOptionalString(value, "htmlUrl");
+}
+
+function isPullRequestCheck(value: unknown): value is PullRequestCheck {
+  if (!isObjectRecord(value)) return false;
+  return Number.isSafeInteger(value.id) &&
+    typeof value.name === "string" &&
+    isNullableString(value.status) &&
+    isNullableString(value.conclusion) &&
+    isNullableString(value.completedAt) &&
+    isNullableString(value.startedAt) &&
+    isNullableString(value.url) &&
+    (value.kind === "check_run" || value.kind === "commit_status");
+}
+
+function isPullRequestThread(value: unknown): value is PullRequestThread {
+  if (!isObjectRecord(value)) return false;
+  return typeof value.id === "string" &&
+    typeof value.isResolved === "boolean" &&
+    isSafeIntegerArray(value.commentIds);
+}
+
+function isWatchEventSummary(value: unknown): value is WatchEventSummary {
+  if (!isObjectRecord(value)) return false;
+  const summary = value as Partial<WatchEventSummary>;
+  return typeof summary.id === "string" &&
+    typeof summary.deliveryId === "string" &&
+    typeof summary.receivedAt === "string" &&
+    typeof summary.githubEvent === "string" &&
+    (summary.action === null || typeof summary.action === "string") &&
+    typeof summary.repository === "string" &&
+    Number.isSafeInteger(summary.pullRequestNumber) &&
+    typeof summary.resourceUri === "string" &&
+    isStringArray(summary.changes);
+}
+
+function isSidecarPayloadRef(value: unknown): value is SidecarPayloadRef {
+  if (!value || typeof value !== "object") return false;
+  const ref = value as Partial<SidecarPayloadRef>;
+  if (ref.source === "root") return isNonNegativeSafeInteger(ref.position);
+  return ref.source === "sidecar" &&
+    isNonNegativeSafeInteger(ref.sequence) &&
+    isNonNegativeSafeInteger(ref.chunkCount);
+}
+
+function isSidecarEventRef(value: unknown): value is SidecarEventRef {
+  if (!value || typeof value !== "object") return false;
+  const ref = value as Partial<SidecarEventRef>;
+  return isWatchEventSummary(ref.meta) && isSidecarPayloadRef(ref.payload);
+}
+
+function isSidecarCleanupQueue(value: unknown): value is SidecarCleanupQueue {
+  if (!value || typeof value !== "object") return false;
+  const queue = value as Partial<SidecarCleanupQueue>;
+  return isNonNegativeSafeInteger(queue.cursor) &&
+    isNonNegativeSafeInteger(queue.next) &&
+    queue.cursor <= queue.next;
+}
+
+function sidecarCleanupQueue(index: WatchSidecarIndex): SidecarCleanupQueue {
+  return index.cleanup;
+}
+
+function isPullRequestSnapshot(value: unknown): value is PullRequestSnapshot {
+  if (!isObjectRecord(value)) return false;
+  const snapshot = value as Partial<PullRequestSnapshot>;
+  return typeof snapshot.repository === "string" &&
+    Number.isSafeInteger(snapshot.number) &&
+    typeof snapshot.url === "string" &&
+    typeof snapshot.title === "string" &&
+    typeof snapshot.body === "string" &&
+    typeof snapshot.state === "string" &&
+    typeof snapshot.draft === "boolean" &&
+    typeof snapshot.merged === "boolean" &&
+    isNullableString(snapshot.mergedAt) &&
+    (snapshot.mergeable === null || typeof snapshot.mergeable === "boolean") &&
+    isNullableString(snapshot.mergeableState) &&
+    isNullableString(snapshot.baseRefName) &&
+    isNullableString(snapshot.headRefName) &&
+    isNullableString(snapshot.headRepository) &&
+    isNullableString(snapshot.headSha) &&
+    isNullableString(snapshot.author) &&
+    typeof snapshot.fetchedAt === "string" &&
+    isReactionCounts(snapshot.bodyReactions) &&
+    isArrayOf(snapshot.comments, isPullRequestComment) &&
+    isArrayOf(snapshot.reviews, isPullRequestReview) &&
+    isArrayOf(snapshot.reviewComments, isPullRequestComment) &&
+    isArrayOf(snapshot.checks, isPullRequestCheck) &&
+    isArrayOf(snapshot.threads, isPullRequestThread);
+}
+
+function isWatchSnapshotRecord(value: unknown): value is WatchSnapshotRecord {
+  if (!isObjectRecord(value) || !Object.hasOwn(value, "snapshot")) return false;
+  const snapshot = value.snapshot;
+  return snapshot === null || isPullRequestSnapshot(snapshot);
+}
+
+function isSidecarSnapshotRef(value: unknown): value is SidecarSnapshotRef {
+  if (!value || typeof value !== "object") return false;
+  const ref = value as Partial<SidecarSnapshotRef>;
+  return isNonNegativeSafeInteger(ref.sequence) && isNonNegativeSafeInteger(ref.chunkCount);
+}
+
+function isWatchSidecarIndex(value: unknown): value is WatchSidecarIndex {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<WatchSidecarIndex>;
+  if (candidate.version !== WATCH_SIDECAR_VERSION) return false;
+  if (!isNonNegativeSafeInteger(candidate.nextSequence) ||
+    !isNonNegativeSafeInteger(candidate.nextSnapshotSequence) ||
+    !Array.isArray(candidate.events)) return false;
+  if (!isSidecarSnapshotRef(candidate.snapshot) ||
+    candidate.snapshot.sequence >= candidate.nextSnapshotSequence) return false;
+  if (candidate.events.length > MAX_EVENTS) return false;
+  if (candidate.root !== null && !isNonNegativeSafeInteger(candidate.root?.chunkCount)) return false;
+  if (!isSidecarCleanupQueue(candidate.cleanup)) return false;
+  const sidecarSequences = new Set<number>();
+  const rootPositions = new Set<number>();
+  for (const ref of candidate.events) {
+    if (!isSidecarEventRef(ref)) return false;
+    if (ref.payload.source === "sidecar") {
+      if (ref.payload.sequence >= candidate.nextSequence || sidecarSequences.has(ref.payload.sequence)) return false;
+      sidecarSequences.add(ref.payload.sequence);
+      continue;
+    }
+    if (rootPositions.has(ref.payload.position)) return false;
+    rootPositions.add(ref.payload.position);
+  }
+  return (candidate.root !== null) === (rootPositions.size > 0);
+}
+
+function chunkKey(recordKey: string, index: number): string {
+  return `${recordKey}:chunk:${index}`;
+}
+
+function chunkedRecordKeys(recordKey: string, chunkCount: number): string[] {
+  const keys = [recordKey];
+  for (let index = 0; index < chunkCount; index += 1) keys.push(chunkKey(recordKey, index));
+  return keys;
+}
+
+function eventSummary(event: WatchEvent): WatchEventSummary {
+  return {
+    id: event.id,
+    deliveryId: event.deliveryId,
+    receivedAt: event.receivedAt,
+    githubEvent: event.githubEvent,
+    action: event.action,
+    repository: event.repository,
+    pullRequestNumber: event.pullRequestNumber,
+    resourceUri: event.resourceUri,
+    changes: event.changes,
+  };
 }
 
 function storageBatches<T>(values: readonly T[]): T[][] {
@@ -189,42 +502,71 @@ async function deleteStorageKeys(storage: WatchStorage, keys: readonly string[])
   for (const batch of storageBatches(keys)) await storage.delete(batch);
 }
 
-export async function readStoredWatchState(storage: WatchStorage, storageKey: string): Promise<StoredWatchState> {
-  const stored = await storage.get<unknown>(storageKey);
-  if (isStoredWatchState(stored)) return stored;
-  if (!isWatchStateIndex(stored)) return emptyWatchState();
+interface ChunkedRecord<T> {
+  value: T | undefined;
+  chunkCount: number;
+  present: boolean;
+}
 
-  const keys = Array.from({ length: stored.chunkCount }, (_, index) => watchChunkKey(storageKey, index));
+async function readChunkedRecord<T>(storage: WatchStorage, recordKey: string): Promise<ChunkedRecord<T>> {
+  const stored = await storage.get<unknown>(recordKey);
+  if (stored === undefined) return { value: undefined, chunkCount: 0, present: false };
+  if (!isChunkedRecordIndex(stored)) return { value: stored as T, chunkCount: 0, present: true };
+  const keys = Array.from({ length: stored.chunkCount }, (_, index) => chunkKey(recordKey, index));
   const chunks = await getStorageEntries<string>(storage, keys);
   let encoded = "";
   for (const key of keys) {
     const chunk = chunks.get(key);
-    if (typeof chunk !== "string") return emptyWatchState();
+    if (typeof chunk !== "string") return { value: undefined, chunkCount: stored.chunkCount, present: true };
     encoded += chunk;
   }
   try {
-    const state: unknown = JSON.parse(encoded);
-    return isStoredWatchState(state) ? state : emptyWatchState();
+    return { value: JSON.parse(encoded) as T, chunkCount: stored.chunkCount, present: true };
   } catch {
-    return emptyWatchState();
+    return { value: undefined, chunkCount: stored.chunkCount, present: true };
   }
 }
 
-export async function writeStoredWatchState(
+/** Reads only the record's head row, which is all a rewrite needs to retire stale chunks. */
+async function readRecordChunkCount(storage: WatchStorage, recordKey: string): Promise<number> {
+  const stored = await storage.get<unknown>(recordKey);
+  return isChunkedRecordIndex(stored) ? stored.chunkCount : 0;
+}
+
+function assembleRecord<T>(entries: Map<string, unknown>, recordKey: string, chunkCount: number): T | undefined {
+  const head = entries.get(recordKey);
+  if (chunkCount === 0) {
+    if (head === undefined || isChunkedRecordIndex(head)) return undefined;
+    return head as T;
+  }
+  if (!isChunkedRecordIndex(head) || head.chunkCount !== chunkCount) return undefined;
+  let encoded = "";
+  for (let index = 0; index < chunkCount; index += 1) {
+    const chunk = entries.get(chunkKey(recordKey, index));
+    if (typeof chunk !== "string") return undefined;
+    encoded += chunk;
+  }
+  try {
+    return JSON.parse(encoded) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeChunkedRecord(
   storage: WatchStorage,
-  storageKey: string,
-  state: StoredWatchState,
+  recordKey: string,
+  value: unknown,
+  previousChunkCount: number,
 ): Promise<WatchStateWriteStats> {
-  const encoded = JSON.stringify(state);
-  const previous = await storage.get<unknown>(storageKey);
-  const previousChunkCount = isWatchStateIndex(previous) ? previous.chunkCount : 0;
-  const encodedBytes = new TextEncoder().encode(encoded).byteLength;
+  const encoded = JSON.stringify(value);
+  const encodedBytes = stateEncoder.encode(encoded).byteLength;
   if (encodedBytes <= MAX_WATCH_STATE_BYTES) {
-    await storage.put(storageKey, state);
+    await storage.put(recordKey, value);
     if (previousChunkCount === 0) {
       return { puts: 1, deletes: 0, encodedBytes, chunkCount: 0, format: "compact" };
     }
-    const staleChunks = Array.from({ length: previousChunkCount }, (_, index) => watchChunkKey(storageKey, index));
+    const staleChunks = Array.from({ length: previousChunkCount }, (_, index) => chunkKey(recordKey, index));
     await deleteStorageKeys(storage, staleChunks);
     return { puts: 1, deletes: staleChunks.length, encodedBytes, chunkCount: 0, format: "compact" };
   }
@@ -232,7 +574,7 @@ export async function writeStoredWatchState(
   const chunkCount = Math.ceil(encoded.length / MAX_WATCH_CHUNK_CHARACTERS);
   const chunks: Record<string, string> = {};
   for (let index = 0; index < chunkCount; index += 1) {
-    chunks[watchChunkKey(storageKey, index)] = encoded.slice(
+    chunks[chunkKey(recordKey, index)] = encoded.slice(
       index * MAX_WATCH_CHUNK_CHARACTERS,
       (index + 1) * MAX_WATCH_CHUNK_CHARACTERS,
     );
@@ -240,26 +582,511 @@ export async function writeStoredWatchState(
   await putStorageEntries(storage, chunks);
   let puts = chunkCount;
   if (previousChunkCount !== chunkCount) {
-    await storage.put(storageKey, { chunkCount } satisfies WatchStateIndex);
+    await storage.put(recordKey, { chunkCount } satisfies ChunkedRecordIndex);
     puts += 1;
   }
   const staleChunkCount = Math.max(previousChunkCount - chunkCount, 0);
   if (staleChunkCount > 0) {
     await deleteStorageKeys(
       storage,
-      Array.from({ length: staleChunkCount }, (_, index) => watchChunkKey(storageKey, chunkCount + index)),
+      Array.from({ length: staleChunkCount }, (_, index) => chunkKey(recordKey, chunkCount + index)),
     );
   }
   return { puts, deletes: staleChunkCount, encodedBytes, chunkCount, format: "chunked" };
 }
 
+function sidecarCorruption(): Error {
+  return new Error("watch sidecar storage is corrupt");
+}
+
+function cleanupRowCount(job: SidecarCleanupJob): number {
+  return 1 + job.chunkCount;
+}
+
+function isSidecarCleanupJob(value: unknown): value is SidecarCleanupJob {
+  if (!value || typeof value !== "object") return false;
+  const job = value as Partial<SidecarCleanupJob>;
+  if (typeof job.recordKey !== "string" || job.recordKey.length === 0) return false;
+  if (!isNonNegativeSafeInteger(job.chunkCount) || !isNonNegativeSafeInteger(job.nextRow)) return false;
+  return job.nextRow < 1 + job.chunkCount;
+}
+
+function cleanupRowKey(job: SidecarCleanupJob, row: number): string {
+  return row === 0 ? job.recordKey : chunkKey(job.recordKey, row - 1);
+}
+
+function retireRecord(recordKey: string, chunkCount: number): SidecarCleanupJob {
+  return { recordKey, chunkCount, nextRow: 0 };
+}
+
+function isDecimalText(value: string): boolean {
+  if (value.length === 0) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 48 || code > 57) return false;
+  }
+  return true;
+}
+
+function isSidecarPayloadRecordKey(storageKey: string, recordKey: string): boolean {
+  const prefix = `${storageKey}:sidecar:`;
+  if (!recordKey.startsWith(prefix)) return false;
+  const suffix = recordKey.slice(prefix.length);
+  const separator = suffix.indexOf(":");
+  if (separator <= 0) return false;
+  const kind = suffix.slice(0, separator);
+  return (kind === "event" || kind === "snapshot") && isDecimalText(suffix.slice(separator + 1));
+}
+
+function isCleanupRecordKey(storageKey: string, recordKey: string): boolean {
+  return recordKey === storageKey || isSidecarPayloadRecordKey(storageKey, recordKey);
+}
+
+function protectedCleanupRecordKeys(
+  storageKey: string,
+  snapshot: SidecarSnapshotRef,
+  events: readonly SidecarEventRef[],
+  root: { chunkCount: number } | null,
+): Set<string> {
+  const protectedKeys = new Set<string>([watchSidecarSnapshotKey(storageKey, snapshot.sequence)]);
+  for (const event of events) {
+    if (event.payload.source === "sidecar") {
+      protectedKeys.add(watchSidecarEventKey(storageKey, event.payload.sequence));
+    }
+  }
+  if (root) protectedKeys.add(storageKey);
+  return protectedKeys;
+}
+
+interface CleanupAdvance {
+  cleanup: SidecarCleanupQueue;
+  puts: number;
+  deletes: number;
+  dataDeletes: number;
+}
+
+/**
+ * Retires at most a fixed number of data rows from one unreferenced record. Partial jobs
+ * rotate to the tail, so a large predecessor never blocks cleanup of later records.
+ */
+async function advanceDeferredCleanup(
+  storage: WatchStorage,
+  storageKey: string,
+  protectedRecordKeys: ReadonlySet<string>,
+  cleanup: SidecarCleanupQueue,
+  budget: number,
+): Promise<CleanupAdvance> {
+  if (budget <= 0 || cleanup.cursor === cleanup.next) {
+    return { cleanup, puts: 0, deletes: 0, dataDeletes: 0 };
+  }
+
+  const jobKey = watchSidecarCleanupKey(storageKey, cleanup.cursor);
+  const stored = await storage.get<unknown>(jobKey);
+  if (!isSidecarCleanupJob(stored)) throw sidecarCorruption();
+  if (!isCleanupRecordKey(storageKey, stored.recordKey) || protectedRecordKeys.has(stored.recordKey)) {
+    throw sidecarCorruption();
+  }
+
+  const rows = cleanupRowCount(stored);
+  const remainingRows = rows - stored.nextRow;
+  const rowsToDelete = Math.min(remainingRows, budget, MAX_DEFERRED_CLEANUP_DATA_ROWS_PER_JOB);
+  if (rowsToDelete === 0) return { cleanup, puts: 0, deletes: 0, dataDeletes: 0 };
+
+  const keys = Array.from(
+    { length: rowsToDelete },
+    (_, index) => cleanupRowKey(stored, stored.nextRow + index),
+  );
+  await deleteStorageKeys(storage, keys);
+  const nextRow = stored.nextRow + rowsToDelete;
+
+  if (nextRow === rows) {
+    await storage.delete(jobKey);
+    return {
+      cleanup: { cursor: cleanup.cursor + 1, next: cleanup.next },
+      puts: 0,
+      deletes: keys.length + 1,
+      dataDeletes: keys.length,
+    };
+  }
+
+  const next = cleanup.next + 1;
+  if (!Number.isSafeInteger(next)) throw sidecarCorruption();
+  await storage.put(
+    watchSidecarCleanupKey(storageKey, cleanup.next),
+    { ...stored, nextRow } satisfies SidecarCleanupJob,
+  );
+  await storage.delete(jobKey);
+  return {
+    cleanup: { cursor: cleanup.cursor + 1, next },
+    puts: 1,
+    deletes: keys.length + 1,
+    dataDeletes: keys.length,
+  };
+}
+
+async function enqueueDeferredCleanup(
+  storage: WatchStorage,
+  storageKey: string,
+  cleanup: SidecarCleanupQueue,
+  jobs: readonly SidecarCleanupJob[],
+): Promise<{ cleanup: SidecarCleanupQueue; puts: number }> {
+  if (jobs.length === 0) return { cleanup, puts: 0 };
+  const next = cleanup.next + jobs.length;
+  if (!Number.isSafeInteger(next)) throw sidecarCorruption();
+  const entries: Record<string, SidecarCleanupJob> = {};
+  for (const [offset, job] of jobs.entries()) {
+    entries[watchSidecarCleanupKey(storageKey, cleanup.next + offset)] = job;
+  }
+  await putStorageEntries(storage, entries);
+  return { cleanup: { cursor: cleanup.cursor, next }, puts: jobs.length };
+}
+
+function sameSnapshot(current: PullRequestSnapshot | null, next: PullRequestSnapshot | null): boolean {
+  if (current === next) return true;
+  if (!current || !next) return false;
+  if (current.fetchedAt !== next.fetchedAt) return false;
+  return JSON.stringify(current) === JSON.stringify(next);
+}
+
+/** Reads the predecessor single-record layout, which stays authoritative until a sidecar exists. */
+async function readRootWatchState(storage: WatchStorage, storageKey: string): Promise<StoredWatchState> {
+  const record = await readChunkedRecord<unknown>(storage, storageKey);
+  return isStoredWatchState(record.value) ? record.value : emptyWatchState();
+}
+
+async function readRequiredRootWatchState(storage: WatchStorage, storageKey: string): Promise<StoredWatchState> {
+  const record = await readChunkedRecord<unknown>(storage, storageKey);
+  if (!record.present || !isStoredWatchState(record.value)) throw sidecarCorruption();
+  return record.value;
+}
+
+async function readSidecarIndex(storage: WatchStorage, storageKey: string): Promise<WatchSidecarIndex | undefined> {
+  const record = await readChunkedRecord<unknown>(storage, watchSidecarIndexKey(storageKey));
+  if (!record.present) return undefined;
+  if (!isWatchSidecarIndex(record.value)) throw sidecarCorruption();
+  return record.value;
+}
+
+async function readSidecarSnapshot(
+  storage: WatchStorage,
+  storageKey: string,
+  ref: SidecarSnapshotRef,
+): Promise<PullRequestSnapshot | null> {
+  const record = await readChunkedRecord<unknown>(storage, watchSidecarSnapshotKey(storageKey, ref.sequence));
+  if (!record.present || record.chunkCount !== ref.chunkCount || !isWatchSnapshotRecord(record.value)) {
+    throw sidecarCorruption();
+  }
+  return record.value.snapshot;
+}
+
+function isStoredWatchEvent(value: unknown): value is WatchEvent {
+  if (!isObjectRecord(value) || !isWatchEventSummary(value)) return false;
+  if (!Object.hasOwn(value, "payload") || !Object.hasOwn(value, "snapshot")) return false;
+  const snapshot = (value as Partial<WatchEvent>).snapshot;
+  return snapshot === null || isPullRequestSnapshot(snapshot);
+}
+
+function matchesSidecarEvent(value: unknown, summary: WatchEventSummary): value is WatchEvent {
+  return isStoredWatchEvent(value) &&
+    JSON.stringify(eventSummary(value)) === JSON.stringify(summary);
+}
+
+async function readSidecarPayloads(
+  storage: WatchStorage,
+  storageKey: string,
+  refs: readonly SidecarEventRef[],
+): Promise<Map<number, WatchEvent>> {
+  const payloads = new Map<number, WatchEvent>();
+  const keys: string[] = [];
+  for (const ref of refs) {
+    if (ref.payload.source !== "sidecar") continue;
+    keys.push(...chunkedRecordKeys(watchSidecarEventKey(storageKey, ref.payload.sequence), ref.payload.chunkCount));
+  }
+  if (keys.length === 0) return payloads;
+  const entries = await getStorageEntries<unknown>(storage, keys);
+  for (const ref of refs) {
+    if (ref.payload.source !== "sidecar") continue;
+    const event = assembleRecord<unknown>(
+      entries,
+      watchSidecarEventKey(storageKey, ref.payload.sequence),
+      ref.payload.chunkCount,
+    );
+    if (!matchesSidecarEvent(event, ref.meta)) throw sidecarCorruption();
+    payloads.set(ref.payload.sequence, event);
+  }
+  return payloads;
+}
+
+/**
+ * Hydrates every raw payload in the window. Only consumers of a complete `StoredWatchState`
+ * (MCP `get_pr`, `list_pr_events`, the pull request resource) should pay for this.
+ */
+export async function readStoredWatchState(storage: WatchStorage, storageKey: string): Promise<StoredWatchState> {
+  const index = await readSidecarIndex(storage, storageKey);
+  if (!index) return readRootWatchState(storage, storageKey);
+
+  const snapshot = await readSidecarSnapshot(storage, storageKey, index.snapshot);
+  const rootEvents = index.events.some((ref) => ref.payload.source === "root")
+    ? (await readRequiredRootWatchState(storage, storageKey)).events
+    : [];
+  const payloads = await readSidecarPayloads(storage, storageKey, index.events);
+  const newest = index.events.length - 1;
+  const events: WatchEvent[] = [];
+  for (const [position, ref] of index.events.entries()) {
+    const stored = ref.payload.source === "root"
+      ? rootEvents[ref.payload.position]
+      : payloads.get(ref.payload.sequence);
+    if (!matchesSidecarEvent(stored, ref.meta)) throw sidecarCorruption();
+    // Only the newest event carries the snapshot, exactly as the single-record layout stored it.
+    events.push({ ...stored, snapshot: position === newest ? snapshot : null });
+  }
+  return { snapshot, events };
+}
+
+/**
+ * Snapshot plus per-event metadata without touching any payload row. Webhook routing,
+ * polling, monitor replay and registration lists read watches through this projection.
+ */
+export async function readWatchStateMetadata(storage: WatchStorage, storageKey: string): Promise<WatchStateMetadata> {
+  const index = await readSidecarIndex(storage, storageKey);
+  if (!index) {
+    const root = await readRootWatchState(storage, storageKey);
+    return {
+      snapshot: root.snapshot,
+      events: root.events.map((event) => ({ ...eventSummary(event), terminalState: terminalState(event.snapshot) })),
+    };
+  }
+  const snapshot = await readSidecarSnapshot(storage, storageKey, index.snapshot);
+  return { snapshot, events: sidecarEventMetadata(index.events, snapshot) };
+}
+
+function sidecarEventMetadata(
+  refs: readonly SidecarEventRef[],
+  snapshot: PullRequestSnapshot | null,
+): WatchEventMetadata[] {
+  const newest = refs.length - 1;
+  return refs.map((ref, position) => ({
+    ...ref.meta,
+    terminalState: position === newest ? terminalState(snapshot) : "watching",
+  }));
+}
+
+/**
+ * Opens one watch for mutation. The first append over a predecessor record indexes the
+ * existing events by position and leaves their payloads where they are, so no watch ever
+ * pays a full-history rewrite.
+ */
+export async function openWatchStateMutation(
+  storage: WatchStorage,
+  storageKey: string,
+): Promise<WatchStateMutation> {
+  const indexRecord = await readChunkedRecord<unknown>(storage, watchSidecarIndexKey(storageKey));
+  if (indexRecord.present && !isWatchSidecarIndex(indexRecord.value)) throw sidecarCorruption();
+  const index: WatchSidecarIndex | undefined = indexRecord.present
+    ? indexRecord.value as WatchSidecarIndex
+    : undefined;
+
+  let refs: readonly SidecarEventRef[];
+  let nextSequence: number;
+  let root: { chunkCount: number } | null;
+  let cleanup: SidecarCleanupQueue;
+  let snapshot: PullRequestSnapshot | null;
+  let snapshotRef: SidecarSnapshotRef | null;
+  let nextSnapshotSequence: number;
+  let metadata: WatchStateMetadata;
+  let indexChunkCount = indexRecord.chunkCount;
+  let hasSidecar = index !== undefined;
+
+  if (index) {
+    snapshot = await readSidecarSnapshot(storage, storageKey, index.snapshot);
+    snapshotRef = index.snapshot;
+    nextSnapshotSequence = index.nextSnapshotSequence;
+    refs = index.events;
+    nextSequence = index.nextSequence;
+    root = index.root;
+    cleanup = sidecarCleanupQueue(index);
+    metadata = { snapshot, events: sidecarEventMetadata(index.events, snapshot) };
+  } else {
+    const rootRecord = await readChunkedRecord<unknown>(storage, storageKey);
+    const rootState = isStoredWatchState(rootRecord.value) ? rootRecord.value : emptyWatchState();
+    snapshot = rootState.snapshot;
+    snapshotRef = null;
+    nextSnapshotSequence = 0;
+    refs = rootState.events.map((event, position): SidecarEventRef => ({
+      meta: eventSummary(event),
+      payload: { source: "root", position },
+    }));
+    nextSequence = 0;
+    root = rootRecord.present ? { chunkCount: rootRecord.chunkCount } : null;
+    cleanup = { cursor: 0, next: 0 };
+    metadata = {
+      snapshot,
+      events: rootState.events.map((event) => ({
+        ...eventSummary(event),
+        terminalState: terminalState(event.snapshot),
+      })),
+    };
+  }
+
+  return {
+    get metadata() {
+      return metadata;
+    },
+    append: async (event, appendSnapshot) => {
+      let nextCleanup = cleanup;
+      let cleanupPuts = 0;
+      let cleanupDeletes = 0;
+      const sequence = nextSequence;
+      const payloadWrite = await writeChunkedRecord(
+        storage,
+        watchSidecarEventKey(storageKey, sequence),
+        // The snapshot lives in the snapshot record; a full read re-attaches it to the newest event.
+        { ...event, snapshot: null },
+        0,
+      );
+      let puts = payloadWrite.puts;
+      let deletes = payloadWrite.deletes;
+      let encodedBytes = payloadWrite.encodedBytes;
+      let chunkCount = payloadWrite.chunkCount;
+      let incomingRows = payloadWrite.puts;
+
+      const windowed: SidecarEventRef[] = [...refs, {
+        meta: eventSummary(event),
+        payload: { source: "sidecar", sequence, chunkCount: payloadWrite.chunkCount },
+      }];
+      const evicted = windowed.splice(0, Math.max(windowed.length - MAX_EVENTS, 0));
+      const rootReferences = windowed.filter((ref) => ref.payload.source === "root").length;
+      const retirements: SidecarCleanupJob[] = [];
+
+      let nextSnapshotRef = snapshotRef;
+      let nextSnapshotSequenceValue = nextSnapshotSequence;
+      if (!hasSidecar || !sameSnapshot(snapshot, appendSnapshot)) {
+        const snapshotSequence = nextSnapshotSequenceValue;
+        const snapshotWrite = await writeChunkedRecord(
+          storage,
+          watchSidecarSnapshotKey(storageKey, snapshotSequence),
+          { snapshot: appendSnapshot } satisfies WatchSnapshotRecord,
+          0,
+        );
+        puts += snapshotWrite.puts;
+        deletes += snapshotWrite.deletes;
+        encodedBytes += snapshotWrite.encodedBytes;
+        incomingRows += snapshotWrite.puts;
+        chunkCount = Math.max(chunkCount, snapshotWrite.chunkCount);
+        nextSnapshotRef = { sequence: snapshotSequence, chunkCount: snapshotWrite.chunkCount };
+        nextSnapshotSequenceValue = snapshotSequence + 1;
+        if (snapshotRef) {
+          retirements.push(retireRecord(
+            watchSidecarSnapshotKey(storageKey, snapshotRef.sequence),
+            snapshotRef.chunkCount,
+          ));
+        }
+      }
+      if (!nextSnapshotRef) throw sidecarCorruption();
+
+      for (const ref of evicted) {
+        if (ref.payload.source !== "sidecar") continue;
+        retirements.push(retireRecord(
+          watchSidecarEventKey(storageKey, ref.payload.sequence),
+          ref.payload.chunkCount,
+        ));
+      }
+      const nextRoot = rootReferences > 0 ? root : null;
+      if (root && nextRoot === null) retirements.push(retireRecord(storageKey, root.chunkCount));
+
+      const protectedRecordKeys = protectedCleanupRecordKeys(
+        storageKey,
+        nextSnapshotRef,
+        windowed,
+        nextRoot,
+      );
+      let cleanupDataBudget = Math.max(MIN_DEFERRED_CLEANUP_ROWS, incomingRows + retirements.length);
+      let jobsToAdvance = nextCleanup.next - nextCleanup.cursor;
+      while (cleanupDataBudget > 0 && jobsToAdvance > 0) {
+        const advance = await advanceDeferredCleanup(
+          storage,
+          storageKey,
+          protectedRecordKeys,
+          nextCleanup,
+          cleanupDataBudget,
+        );
+        if (advance.dataDeletes === 0) break;
+        nextCleanup = advance.cleanup;
+        cleanupPuts += advance.puts;
+        cleanupDeletes += advance.deletes;
+        cleanupDataBudget -= advance.dataDeletes;
+        jobsToAdvance -= 1;
+      }
+      puts += cleanupPuts;
+      deletes += cleanupDeletes;
+
+
+      const enqueued = await enqueueDeferredCleanup(storage, storageKey, nextCleanup, retirements);
+      nextCleanup = enqueued.cleanup;
+      puts += enqueued.puts;
+
+      const nextIndex: WatchSidecarIndex = {
+        version: WATCH_SIDECAR_VERSION,
+        nextSequence: sequence + 1,
+        nextSnapshotSequence: nextSnapshotSequenceValue,
+        snapshot: nextSnapshotRef,
+        root: nextRoot,
+        cleanup: nextCleanup,
+        events: windowed,
+      };
+      const indexWrite = await writeChunkedRecord(
+        storage,
+        watchSidecarIndexKey(storageKey),
+        nextIndex,
+        indexChunkCount,
+      );
+      puts += indexWrite.puts;
+      deletes += indexWrite.deletes;
+      encodedBytes += indexWrite.encodedBytes;
+      chunkCount = Math.max(chunkCount, indexWrite.chunkCount);
+      indexChunkCount = indexWrite.chunkCount;
+
+      refs = windowed;
+      nextSequence = sequence + 1;
+      snapshotRef = nextSnapshotRef;
+      nextSnapshotSequence = nextSnapshotSequenceValue;
+      root = nextRoot;
+      cleanup = nextCleanup;
+      hasSidecar = true;
+      snapshot = appendSnapshot;
+      metadata = { snapshot, events: sidecarEventMetadata(windowed, snapshot) };
+      return {
+        puts,
+        deletes,
+        encodedBytes,
+        chunkCount,
+        format: chunkCount > 0 ? "chunked" : "compact",
+        windowEvents: windowed.length,
+        rootReferences,
+      };
+    },
+  };
+}
+
+/**
+ * Writes the predecessor single-record layout. Only the unscoped-to-scoped session
+ * migration and tests seeding historical state still produce it.
+ */
+export async function writeStoredWatchState(
+  storage: WatchStorage,
+  storageKey: string,
+  state: StoredWatchState,
+): Promise<WatchStateWriteStats> {
+  const previousChunkCount = await readRecordChunkCount(storage, storageKey);
+  return writeChunkedRecord(storage, storageKey, state, previousChunkCount);
+}
 
 function sampleStorageTelemetry(): boolean {
   const value = crypto.getRandomValues(new Uint32Array(1))[0]!;
   return value / 0x1_0000_0000 < WEBHOOK_TELEMETRY_SAMPLE_RATE;
 }
 
-function logWatchStateWrite(event: WatchEvent, write: WatchStateWriteStats): void {
+function logWatchStateWrite(event: WatchEvent, write: WatchAppendStats): void {
   const storageKeyWrites = write.puts + write.deletes;
   const sampled = sampleStorageTelemetry();
   const sampleReason = storageKeyWrites >= HIGH_WRITE_TELEMETRY_THRESHOLD
@@ -282,6 +1109,8 @@ function logWatchStateWrite(event: WatchEvent, write: WatchStateWriteStats): voi
     encoded_state_bytes: write.encodedBytes,
     state_chunk_count: write.chunkCount,
     state_format: write.format,
+    windowed_events: write.windowEvents,
+    predecessor_payload_references: write.rootReferences,
   }));
 }
 
@@ -329,7 +1158,7 @@ function resumesClosedWatch(event: WatchEvent, snapshot: PullRequestSnapshot | n
   );
 }
 
-function compactMonitorEvent(event: WatchEvent, state = terminalState(event.snapshot)): PrMonitorEvent {
+function compactMonitorEvent(event: WatchEventSummary, state: MonitorTerminalState): PrMonitorEvent {
   return {
     id: event.id,
     repository: event.repository,
@@ -343,7 +1172,7 @@ function compactMonitorEvent(event: WatchEvent, state = terminalState(event.snap
 }
 
 function reconciliationMonitorEvent(
-  state: StoredWatchState,
+  state: WatchStateMetadata,
   action: "cursor_miss" | "terminal_snapshot",
   repository: string,
   pullRequestNumber: number,
@@ -436,15 +1265,15 @@ export class WatchPrHub {
       return this.monitorError(400, "invalid_cursor", `monitor cursor must not exceed ${MAX_MONITOR_CURSOR_LENGTH} characters`);
     }
 
-    const watchState = await this.watchState(record.userId, key);
+    const watchState = await this.watchStateMetadata(record.userId, key);
     const currentTerminalState = terminalState(watchState.snapshot);
     let events: PrMonitorEvent[];
     if (!cursor) {
-      events = watchState.events.map((event) => compactMonitorEvent(event));
+      events = watchState.events.map((event) => compactMonitorEvent(event, event.terminalState));
     } else {
       const cursorIndex = watchState.events.findIndex((event) => event.id === cursor);
       events = cursorIndex >= 0
-        ? watchState.events.slice(cursorIndex + 1).map((event) => compactMonitorEvent(event))
+        ? watchState.events.slice(cursorIndex + 1).map((event) => compactMonitorEvent(event, event.terminalState))
         : [reconciliationMonitorEvent(watchState, "cursor_miss", record.repository, record.pullRequestNumber)];
     }
     if (currentTerminalState !== "watching" && events.length === 0) {
@@ -730,7 +1559,7 @@ export class WatchPrHub {
       subscriptions.add(key);
       return existed;
     });
-    const state = await this.watchState(active.record.user.id, key);
+    const state = await this.watchStateMetadata(active.record.user.id, key);
     const refreshScheduled = terminalState(state.snapshot) !== "merged";
     if (refreshScheduled) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "watch");
     if (!wasWatched) await this.notifyResourceListChanged(active);
@@ -793,7 +1622,7 @@ export class WatchPrHub {
       });
     }
 
-    const state = await this.watchState(record.userId, key);
+    const state = await this.watchStateMetadata(record.userId, key);
     const cursor = state.events.at(-1)?.id ?? null;
     const monitorUrl = new URL(`${this.baseUrl()}/monitor/${capability}`);
     if (cursor) monitorUrl.searchParams.set("cursor", cursor);
@@ -857,7 +1686,7 @@ export class WatchPrHub {
     const registrations: WatchRegistration[] = [];
     for (const key of [...active.watches].sort()) {
       const parsed = parseWatchKey(key);
-      const state = await this.watchState(active.record.user.id, key);
+      const state = await this.watchStateMetadata(active.record.user.id, key);
       registrations.push({
         key,
         repository: parsed.repository,
@@ -873,7 +1702,7 @@ export class WatchPrHub {
   private async readWatch(active: ActiveSession, repository: string, number: number): Promise<StoredWatchState> {
     const key = watchKey(repository, number);
     if (!active.watches.has(key)) throw new Error("pull request is not watched by this session");
-    const state = await this.watchState(active.record.user.id, key);
+    const state = await this.watchStateFull(active.record.user.id, key);
     if (!state.snapshot) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "read");
     return state;
   }
@@ -1029,6 +1858,8 @@ export class WatchPrHub {
       const legacyState = await readStoredWatchState(this.state.storage, legacyKey);
       await this.state.storage.transaction(async (storage) => {
         if ((await storage.get<unknown>(scopedKey)) !== undefined) return;
+        // A sidecar already owns this watch: its predecessor record was retired on purpose.
+        if ((await storage.get<unknown>(watchSidecarIndexKey(scopedKey))) !== undefined) return;
         await writeStoredWatchState(storage, scopedKey, legacyState);
       });
     }
@@ -1152,14 +1983,14 @@ export class WatchPrHub {
         continue;
       }
       if (eventName !== "push" && parsed.repository !== repository) continue;
-      let previous: StoredWatchState | undefined;
-      if (eventName === "push") previous = await this.watchState(watcher.userId, watcher.key);
+      let previous: WatchStateMetadata | undefined;
+      if (eventName === "push") previous = await this.watchStateMetadata(watcher.userId, watcher.key);
       const targetNumbers = eventPullRequestNumbers(eventName, payload, [{
         key: watcher.key,
         snapshot: previous?.snapshot ?? null,
       }]);
       if (!targetNumbers.includes(parsed.number)) continue;
-      previous ??= await this.watchState(watcher.userId, watcher.key);
+      previous ??= await this.watchStateMetadata(watcher.userId, watcher.key);
       const previousTerminalState = terminalState(previous.snapshot);
       if (previousTerminalState === "merged") continue;
       if (previousTerminalState === "closed" && (eventName !== "pull_request" || webhookAction !== "reopened")) continue;
@@ -1237,7 +2068,7 @@ export class WatchPrHub {
     sessionToken: string,
     reason: string,
   ): Promise<void> {
-    const initialState = await this.watchState(userId, key);
+    const initialState = await this.watchStateMetadata(userId, key);
     const initialTerminalState = terminalState(initialState.snapshot);
     if (initialTerminalState === "merged" || (initialTerminalState === "closed" && reason !== "watch")) return;
     const parsed = parseWatchKey(key);
@@ -1248,7 +2079,7 @@ export class WatchPrHub {
       if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken, githubToken);
       return;
     }
-    const current = await this.watchState(userId, key);
+    const current = await this.watchStateMetadata(userId, key);
     const currentTerminalState = terminalState(current.snapshot);
     if (currentTerminalState === "merged" || (currentTerminalState === "closed" && reason !== "watch")) return;
     const changes = snapshotChanges(current.snapshot, snapshot);
@@ -1274,7 +2105,7 @@ export class WatchPrHub {
     let scheduled = 0;
     for (const [sessionToken, record] of sessions) {
       for (const key of record.watches) {
-        const state = await this.watchState(record.user.id, key);
+        const state = await this.watchStateMetadata(record.user.id, key);
         if (terminalState(state.snapshot) !== "watching") continue;
         scheduled += 1;
         if (this.scheduleRefresh(record.user.id, key, record.githubAccessToken, sessionToken, "poll")) refreshesStarted += 1;
@@ -1298,9 +2129,11 @@ export class WatchPrHub {
     const storageKey = watchStorageKey(userId, event.repository, event.pullRequestNumber);
     let deliveredEvent = event;
     let published = false;
-    let write: WatchStateWriteStats | null = null;
+    let write: WatchAppendStats | null = null;
     await this.state.storage.transaction(async (storage) => {
-      const current = await readStoredWatchState(storage, storageKey);
+      const mutation = await openWatchStateMutation(storage, storageKey);
+      const current = mutation.metadata;
+      if (current.events.some((storedEvent) => storedEvent.deliveryId === event.deliveryId)) return;
       const currentTerminalState = terminalState(current.snapshot);
       if (currentTerminalState === "merged") return;
       let snapshot = state.snapshot;
@@ -1320,16 +2153,16 @@ export class WatchPrHub {
       }
       if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
       deliveredEvent = { ...event, snapshot, changes };
-      const events = [...current.events, deliveredEvent].slice(-MAX_EVENTS);
-      const storedEvents = events.map((entry, index) => (
-        index === events.length - 1 ? entry : { ...entry, snapshot: null }
-      ));
-      write = await writeStoredWatchState(storage, storageKey, { snapshot, events: storedEvents });
+      write = await mutation.append(deliveredEvent, snapshot);
       published = true;
     });
     if (!published || !write) return { published: false, write: null };
     logWatchStateWrite(deliveredEvent, write);
-    this.publishMonitorEvent(userId, key, compactMonitorEvent(deliveredEvent));
+    this.publishMonitorEvent(
+      userId,
+      key,
+      compactMonitorEvent(deliveredEvent, terminalState(deliveredEvent.snapshot)),
+    );
 
     const active = [...this.activeSessions.values()].filter(
       (session) =>
@@ -1415,7 +2248,12 @@ export class WatchPrHub {
     }
   }
 
-  private async watchState(userId: number, key: string): Promise<StoredWatchState> {
+  private async watchStateMetadata(userId: number, key: string): Promise<WatchStateMetadata> {
+    const parsed = parseWatchKey(key);
+    return readWatchStateMetadata(this.state.storage, watchStorageKey(userId, parsed.repository, parsed.number));
+  }
+
+  private async watchStateFull(userId: number, key: string): Promise<StoredWatchState> {
     const parsed = parseWatchKey(key);
     return readStoredWatchState(this.state.storage, watchStorageKey(userId, parsed.repository, parsed.number));
   }

@@ -146,6 +146,8 @@ describe("OTLP sanitizer", () => {
               event: "watch_pr.do_storage",
               sample_rate: 0.01,
               state_format: "sidecar",
+              windowed_events: 100,
+              predecessor_payload_references: 99,
               chunked: true,
               repository: "private-repository",
               api_key: "secret-key",
@@ -168,6 +170,8 @@ describe("OTLP sanitizer", () => {
       attributes: [
         { key: "watch_pr.sample_rate", value: { doubleValue: 0.01 } },
         { key: "watch_pr.state_format", value: str("sidecar") },
+        { key: "watch_pr.windowed_events", value: { intValue: 100 } },
+        { key: "watch_pr.predecessor_payload_references", value: { intValue: 99 } },
       ],
     });
     expect(records[2]).toEqual({ body: str("watch_pr.poll") });

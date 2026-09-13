@@ -1,7 +1,37 @@
 import { describe, expect, it } from "vitest";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "../src/mcp";
+import {
+  openWatchStateMutation,
+  readStoredWatchState,
+  writeStoredWatchState,
+  type WatchStorage,
+} from "../src/hub";
 import type { PullRequestSnapshot, StoredWatchState, WatchEvent } from "../src/types";
+import { watchStorageKey } from "../src/types";
+
+function memoryStorage(): WatchStorage {
+  const values = new Map<string, unknown>();
+  return {
+    get: async (key: string | string[]) => (Array.isArray(key)
+      ? new Map<string, unknown>(key.flatMap((entry): [string, unknown][] => (
+        values.has(entry) ? [[entry, values.get(entry)]] : []
+      )))
+      : values.get(key)),
+    put: async (key: string | Record<string, unknown>, value?: unknown) => {
+      if (typeof key === "string") {
+        values.set(key, value);
+        return;
+      }
+      for (const [entry, entryValue] of Object.entries(key)) values.set(entry, entryValue);
+    },
+    delete: async (key: string | string[]) => {
+      let deleted = false;
+      for (const entry of Array.isArray(key) ? key : [key]) deleted = values.delete(entry) || deleted;
+      return deleted;
+    },
+  } as unknown as WatchStorage;
+}
 
 const snapshot: PullRequestSnapshot = {
   repository: "owner/repo",
@@ -127,12 +157,13 @@ async function callTool(
   name: string,
   arguments_: Record<string, unknown>,
   currentSnapshot: PullRequestSnapshot = snapshot,
+  sessionContext: McpSessionContext = context(currentSnapshot),
 ): Promise<string> {
   const transport = new WebStandardStreamableHTTPServerTransport({
     enableJsonResponse: true,
     sessionIdGenerator: () => "test-session",
   });
-  const server = createMcpServer(context(currentSnapshot));
+  const server = createMcpServer(sessionContext);
   await server.connect(transport);
   const request = (body: unknown, sessionId?: string) => transport.handleRequest(new Request("https://watch-pr.test/mcp", {
     method: "POST",
@@ -219,6 +250,38 @@ describe("MCP output modes", () => {
       monitorUrl: "https://watch-pr.test/monitor/capability?cursor=event-1",
       cursor: "event-1",
       terminalState: "watching",
+    });
+  });
+
+  it("serializes a sidecar-backed event history in full mode", async () => {
+    const storage = memoryStorage();
+    const storageKey = watchStorageKey(42, "owner/repo", 7);
+    const predecessor: WatchEvent = {
+      ...event,
+      id: "event-predecessor",
+      deliveryId: "delivery-predecessor",
+      payload: { body: "x".repeat(20_000) },
+    };
+    await writeStoredWatchState(storage, storageKey, { snapshot, events: [predecessor] });
+    const mutation = await openWatchStateMutation(storage, storageKey);
+    const appended: WatchEvent = {
+      ...event,
+      id: "event-appended",
+      deliveryId: "delivery-appended",
+      payload: { appended: true },
+    };
+    await mutation.append(appended, snapshot);
+
+    const full = await callTool(
+      "list_pr_events",
+      { repository: "owner/repo", number: 7, mode: "full" },
+      snapshot,
+      { ...context(), readWatch: async () => readStoredWatchState(storage, storageKey) },
+    );
+    expect(JSON.parse(full)).toEqual({
+      repository: "owner/repo",
+      number: 7,
+      events: [{ ...predecessor, snapshot: null }, appended],
     });
   });
 });

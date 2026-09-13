@@ -13,21 +13,27 @@ import {
   monitorCapabilityStorageKey,
   monitorScopeStorageKey,
   sessionStorageKey,
+  watchSidecarEventKey,
+  watchSidecarIndexKey,
   watchStorageKey,
 } from "../src/types";
 
 class MemoryStorage {
   private readonly values = new Map<string, unknown>();
   readonly deleteKeys: string[] = [];
+  readonly putKeys: string[] = [];
+  readonly getKeys: string[] = [];
   afterGet?: (key: string) => void | Promise<void>;
   putError?: (key: string) => unknown;
   async get<T>(key: string | string[]): Promise<T | undefined | Map<string, T>> {
     if (Array.isArray(key)) {
+      this.getKeys.push(...key);
       return new Map(key.flatMap((entry) => {
         const value = this.values.get(entry);
         return value === undefined ? [] : [[entry, value as T]];
       }));
     }
+    this.getKeys.push(key);
     const value = this.values.get(key) as T | undefined;
     await this.afterGet?.(key);
     return value;
@@ -37,12 +43,14 @@ class MemoryStorage {
     if (typeof key === "string") {
       const error = this.putError?.(key);
       if (error !== undefined) throw error;
+      this.putKeys.push(key);
       this.values.set(key, value);
       return;
     }
     for (const [entry, entryValue] of Object.entries(key)) {
       const error = this.putError?.(entry);
       if (error !== undefined) throw error;
+      this.putKeys.push(entry);
       this.values.set(entry, entryValue);
     }
   }
@@ -315,6 +323,8 @@ type HubInternals = {
     refreshScheduled: boolean;
   }>;
   unwatch(active: TestActiveSession, repository: string, number: number): Promise<boolean>;
+  listWatches(active: TestActiveSession): Promise<{ key: string }[]>;
+  readWatch(active: TestActiveSession, repository: string, number: number): Promise<StoredWatchState>;
   publishEvent(
     userId: number,
     key: string,
@@ -445,6 +455,21 @@ describe("native monitor feed", () => {
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-terminal"]);
   });
 
+  it("deduplicates an already-persisted delivery inside the state transaction", async () => {
+    const { hub, storage } = hubFixture();
+    const incoming = event("event-duplicate", snapshot());
+    const internals = hub as unknown as HubInternals;
+
+    await internals.publishEvent(userId, watch, incoming, { snapshot: incoming.snapshot });
+    await internals.publishEvent(userId, watch, incoming, { snapshot: incoming.snapshot });
+
+    const stored = await readStoredWatchState(
+      storage as unknown as DurableObjectStorage,
+      watchStorageKey(userId, repository, number),
+    );
+    expect(stored.events.map((storedEvent) => storedEvent.deliveryId)).toEqual([incoming.deliveryId]);
+  });
+
   it("logs multi-chunk Durable Object state writes without sampling", async () => {
     const { hub } = hubFixture();
     const current = snapshot();
@@ -533,7 +558,8 @@ describe("native monitor feed", () => {
       "x-github-event": "pull_request",
       "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
     };
-    storage.putError = (key) => key === watchStorageKey(userId, repository, number)
+    const indexKey = watchSidecarIndexKey(watchStorageKey(userId, repository, number));
+    storage.putError = (key) => key === indexKey
       ? new Error("watch state write failed")
       : undefined;
     const fetchMock = openPullRequestFetch();
@@ -585,7 +611,8 @@ describe("native monitor feed", () => {
         { snapshot: snapshot(), events: [] },
       );
     }
-    storage.putError = (key) => key === watchStorageKey(45, repository, number)
+    const failingIndexKey = watchSidecarIndexKey(watchStorageKey(45, repository, number));
+    storage.putError = (key) => key === failingIndexKey
       ? new Error("later watch state write failed")
       : undefined;
     const deliveryId = "partial-failure-delivery";
@@ -617,8 +644,11 @@ describe("native monitor feed", () => {
         sample_reason: "high_write",
         routed_watches: 5,
         published_watches: 4,
-        storage_key_puts: 4,
-        storage_key_writes: 4,
+        // Each published watch writes an immutable event payload, snapshot, cleanup job, and
+        // index. Retiring its predecessor is deferred to a bounded later append.
+        storage_key_puts: 16,
+        storage_key_deletes: 0,
+        storage_key_writes: 16,
       });
       expect(records.find((entry) => entry.event === "watch_pr.webhook_failure")).toMatchObject({
         delivery_fingerprint: await sha256Base64Url(deliveryId),
@@ -983,16 +1013,19 @@ describe("native monitor feed", () => {
       const reopened = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
       expect(reopened.snapshot).toMatchObject({ state: "open", headSha: "reopened" });
 
+      // The watch now owns a sidecar, so the merge has to arrive the way production
+      // delivers it: as a published event, not as a raw predecessor-record overwrite.
       const merged = snapshot({
         state: "closed",
         merged: true,
         mergedAt: "2026-09-10T12:04:00.000Z",
-        fetchedAt: "2026-09-10T12:04:00.000Z",
+        fetchedAt: new Date(Date.now() + 60_000).toISOString(),
       });
-      await writeStoredWatchState(
-        storage as unknown as DurableObjectStorage,
-        watchStorageKey(userId, repository, number),
-        { snapshot: merged, events: [event("event-merged", merged, { action: "closed" })] },
+      await internals.publishEvent(
+        userId,
+        watch,
+        event("event-merged", merged, { action: "closed", changes: ["lifecycle"] }),
+        { snapshot: merged },
       );
       fetchMock.mockClear();
       const mergedRegistration = await internals.watch(active, repository, number);
@@ -1040,5 +1073,128 @@ describe("native monitor feed", () => {
     }
     expect(fetchMock).not.toHaveBeenCalled();
     await expect(storage.get(monitorCapabilityStorageKey(capability))).resolves.toBeUndefined();
+  });
+
+  it("hydrates full payloads and order across indexed predecessor and sidecar events", async () => {
+    const { hub, storage } = hubFixture();
+    const record = sessionRecord();
+    const legacy = event("event-legacy", snapshot(), { payload: { legacy: "x".repeat(20_000) } });
+    await storeMonitor(storage, { snapshot: legacy.snapshot, events: [legacy] }, record);
+    const internals = hub as unknown as HubInternals;
+    const active = internals.newActiveSession(sessionToken, record, "stateful");
+    const appendedSnapshot = snapshot({ headSha: "appended", fetchedAt: "2026-09-10T12:05:00.000Z" });
+    const appended = event("event-appended", appendedSnapshot, { payload: { appended: true } });
+    await internals.publishEvent(userId, watch, appended, { snapshot: appendedSnapshot });
+
+    const storageKey = watchStorageKey(userId, repository, number);
+    await expect(storage.get(watchSidecarIndexKey(storageKey))).resolves.toBeDefined();
+    const state = await internals.readWatch(active, repository, number);
+    expect(state.snapshot).toMatchObject({ headSha: "appended" });
+    // The predecessor payload is still served from the untouched root record, and only the
+    // newest event carries the snapshot, exactly as the single-record layout did.
+    expect(state.events).toEqual([{ ...legacy, snapshot: null }, appended]);
+  });
+
+  it("keeps hot read paths off sidecar payload rows", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const record = sessionRecord();
+    const seeded = event("event-seeded", snapshot(), { payload: { seeded: "x".repeat(20_000) } });
+    await storeMonitor(storage, { snapshot: seeded.snapshot, events: [seeded] }, record);
+    const internals = hub as unknown as HubInternals;
+    const active = internals.newActiveSession(sessionToken, record, "stateful");
+    internals.activeSessions.set("mcp-session", active);
+    const appendedSnapshot = snapshot({ headSha: "appended", fetchedAt: "2026-09-10T12:05:00.000Z" });
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-appended", appendedSnapshot, { payload: { appended: true } }),
+      { snapshot: appendedSnapshot },
+    );
+
+    const storageKey = watchStorageKey(userId, repository, number);
+    const fetchMock = openPullRequestFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      storage.getKeys.length = 0;
+
+      const registration = await internals.openMonitor(active, repository, number);
+      expect(registration.cursor).toBe("event-appended");
+      const feed = feedReader(await hub.fetch(new Request(
+        `https://watch-pr.test/monitor/${capability}?cursor=event-seeded`,
+      )));
+      await expect(nextMonitorEvent(feed)).resolves.toMatchObject({ id: "event-appended" });
+      await feed.reader.cancel();
+
+      await expect(internals.listWatches(active)).resolves.toMatchObject([{ key: watch }]);
+
+      await internals.processWebhook("pull_request", "delivery-event-appended", {
+        action: "synchronize",
+        repository: { full_name: repository },
+        pull_request: { number },
+      });
+
+      const poll = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(poll.status).toBe(202);
+      await Promise.all(pending.splice(0));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(storage.getKeys).toContain(watchSidecarIndexKey(storageKey));
+    expect(storage.getKeys.some((key) => key.startsWith(`${storageKey}:sidecar:snapshot:`))).toBe(true);
+    const payloadKeys = [0, 1, 2, 3].map((sequence) => watchSidecarEventKey(storageKey, sequence));
+    expect(storage.getKeys.filter((key) => payloadKeys.includes(key))).toEqual([]);
+    expect(storage.getKeys).not.toContain(storageKey);
+  });
+
+  it("stores distinct deliveries that carry no snapshot change", async () => {
+    const { hub, storage } = hubFixture();
+    await storeMonitor(storage, { snapshot: snapshot({ headSha: "reopened" }), events: [] });
+    const internals = hub as unknown as HubInternals;
+    const payload = {
+      action: "synchronize",
+      repository: { full_name: repository },
+      pull_request: { number },
+    };
+    const fetchMock = openPullRequestFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await internals.processWebhook("pull_request", "delivery-first", payload);
+      await internals.processWebhook("pull_request", "delivery-second", payload);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    const stored = await readStoredWatchState(
+      storage as unknown as DurableObjectStorage,
+      watchStorageKey(userId, repository, number),
+    );
+    expect(stored.events.map((storedEvent) => storedEvent.deliveryId)).toEqual(["delivery-first", "delivery-second"]);
+    expect(stored.events.map((storedEvent) => storedEvent.changes)).toEqual([[], []]);
+  });
+
+  it("writes nothing when a polled refresh finds no snapshot change", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const unchanged = snapshot({ headSha: "reopened" });
+    await storeMonitor(storage, { snapshot: unchanged, events: [event("event-1", unchanged)] });
+    const storageKey = watchStorageKey(userId, repository, number);
+    const fetchMock = openPullRequestFetch();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      storage.putKeys.length = 0;
+      storage.deleteKeys.length = 0;
+      const poll = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(poll.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      expect(fetchMock).toHaveBeenCalled();
+      expect(storage.putKeys).toEqual([]);
+      expect(storage.deleteKeys).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    await expect(storage.get(watchSidecarIndexKey(storageKey))).resolves.toBeUndefined();
+    const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+    expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
   });
 });
