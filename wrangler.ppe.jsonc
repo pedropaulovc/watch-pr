@@ -7,7 +7,10 @@
   "account_id": "a30acccb05b2f4058c1b13c249056b4c",
   "workers_dev": true,
   "preview_urls": false,
-  "observability": { "enabled": true },
+  "observability": {
+    "enabled": true,
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
+  },
   "triggers": {
     "crons": ["*/1 * * * *"]
   },

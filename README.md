@@ -32,7 +32,7 @@ Snapshots include PR lifecycle and mergeability, base/head refs, checks and comm
 - User permissions: read-only access to repository metadata, pull requests, issues, checks, commit statuses, deployments, and merge queues.
 - Subscribe to `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `status`, `push`, `deployment`, `deployment_status`, `merge_group`, and `commit_comment`.
 
-The webhook handler verifies `X-Hub-Signature-256` and deduplicates `X-GitHub-Delivery` IDs. GitHub has no reaction-specific webhook, so the scheduled refresh is required for reaction parity.
+The webhook handler verifies `X-Hub-Signature-256` and deduplicates `X-GitHub-Delivery` IDs in memory during fanout. Each successfully published watch persists its delivery ID in its own watch state; the global `delivery:<id>` marker is written only after every matched watch has been handled. These per-watch IDs make a manual GitHub redelivery resume a partial fanout without duplicating completed watches. Because GitHub has already received the asynchronous handler's `202`, it does not automatically redeliver a later fanout failure; scheduled polling reconciles the snapshot. It does not persist unmatched delivery IDs. GitHub has no reaction-specific webhook, so the scheduled refresh is required for reaction parity.
 
 ## Cloudflare environments
 
@@ -45,6 +45,12 @@ The environment files intentionally pin both the account ID and Worker name:
 
 Both Workers use the `WatchPrHub` SQLite Durable Object and a one-minute cron trigger. Production receives the GitHub webhook; PPE intentionally has no webhook secret and uses the scheduled refresh path.
 When an existing session first resumes, its predecessor `watch:<repository>:<number>` records are copied to `watch:<user-id>:<repository>:<number>` using that session's GitHub user ID; legacy records remain intact during the migration.
+
+## Observability
+
+Both deployments emit Workers Logs and sample 1% of automatic traces. Trace samples include Durable Object KV `put` and `delete` spans.
+
+The hub logs `watch_pr.poll` for each cron tick. Sampled `watch_pr.do_storage` records each persisted watch state. `watch_pr.webhook_fanout` aggregates the matched watches for a webhook delivery. Both include event type, logical storage-key puts and deletes, serialized state size, and chunk count. Records with four or more logical key writes are always logged with `sample_rate: 1`; randomly sampled records use `sample_rate: 0.01`. These records omit delivery IDs, repository names, tokens, snapshots, and webhook payloads. A `watch_pr.webhook_failure` record includes a SHA-256 delivery fingerprint, so an operator can match a GitHub delivery for manual recovery without logging its raw ID.
 
 Set the runtime secrets before the first authenticated request:
 
