@@ -168,6 +168,23 @@ export interface StoredWatchState {
   events: WatchEvent[];
 }
 
+/**
+ * Every `WatchEvent` field except the two unbounded ones. Hot paths (webhook routing,
+ * polling, monitor replay, registration lists) only ever need this projection, so it is
+ * what the sidecar index persists inline.
+ */
+export type WatchEventSummary = Omit<WatchEvent, "payload" | "snapshot">;
+
+export interface WatchEventMetadata extends WatchEventSummary {
+  /** Terminal state implied by the snapshot this event carries in a full read. */
+  terminalState: MonitorTerminalState;
+}
+
+export interface WatchStateMetadata {
+  snapshot: PullRequestSnapshot | null;
+  events: WatchEventMetadata[];
+}
+
 export function sessionStorageKey(token: string): string {
   return `session:${token}`;
 }
@@ -177,6 +194,22 @@ export function watchStorageKey(userId: number, repository: string, number: numb
 }
 export function legacyWatchStorageKey(repository: string, number: number): string {
   return `watch:${repository}:${number}`;
+}
+
+export function watchSidecarIndexKey(storageKey: string): string {
+  return `${storageKey}:sidecar`;
+}
+
+export function watchSidecarSnapshotKey(storageKey: string, sequence: number): string {
+  return `${storageKey}:sidecar:snapshot:${sequence}`;
+}
+
+export function watchSidecarEventKey(storageKey: string, sequence: number): string {
+  return `${storageKey}:sidecar:event:${sequence}`;
+}
+
+export function watchSidecarCleanupKey(storageKey: string, sequence: number): string {
+  return `${storageKey}:sidecar:cleanup:${sequence}`;
 }
 
 export function monitorCapabilityStorageKey(capability: string): string {
