@@ -27,6 +27,13 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
         run: test "$CLOUDFLARE_ACCOUNT_ID" = "a30acccb05b2f4058c1b13c249056b4c"
+      - name: Verify PPE telemetry signing keys
+        env:
+          TELEMETRY_OIDC_SIGNING_KEY: ${{ secrets.TELEMETRY_OIDC_SIGNING_KEY }}
+          TELEMETRY_OIDC_PUBLIC_JWK: ${{ vars.TELEMETRY_OIDC_PUBLIC_JWK }}
+          TELEMETRY_OIDC_PREVIOUS_SIGNING_KEY: ${{ secrets.TELEMETRY_OIDC_PREVIOUS_SIGNING_KEY }}
+          TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK: ${{ vars.TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK }}
+        run: node scripts/verify-telemetry-key.mjs
       - name: Remove any PPE webhook secret
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
@@ -51,6 +58,100 @@ jobs:
           rm -f "$response_file"
           printf 'PPE webhook-secret cleanup failed with HTTP %s\n' "$status" >&2
           exit 1
+      - name: Render PPE telemetry configs
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WORKERS_DEV_SUBDOMAIN: ${{ vars.WORKERS_DEV_SUBDOMAIN }}
+          TELEMETRY_AZURE_TENANT_ID: ${{ vars.TELEMETRY_AZURE_TENANT_ID }}
+          TELEMETRY_AZURE_APP_CLIENT_ID: ${{ vars.TELEMETRY_AZURE_APP_CLIENT_ID }}
+          TELEMETRY_OTLP_TRACES_ENDPOINT: ${{ vars.TELEMETRY_OTLP_TRACES_ENDPOINT }}
+          TELEMETRY_OTLP_LOGS_ENDPOINT: ${{ vars.TELEMETRY_OTLP_LOGS_ENDPOINT }}
+          TELEMETRY_OIDC_ISSUER_URL: ${{ vars.TELEMETRY_OIDC_ISSUER_URL }}
+          TELEMETRY_GATEWAY_ORIGIN: ${{ vars.TELEMETRY_GATEWAY_ORIGIN }}
+          TELEMETRY_OIDC_SIGNING_KID: ${{ vars.TELEMETRY_OIDC_SIGNING_KID }}
+          TELEMETRY_OIDC_PUBLIC_JWK: ${{ vars.TELEMETRY_OIDC_PUBLIC_JWK }}
+          TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK: ${{ vars.TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK }}
+        run: node scripts/render-telemetry-config.mjs --environment ppe
+      - name: Verify PPE telemetry bearer rotation
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
+          TELEMETRY_GATEWAY_ORIGIN: ${{ vars.TELEMETRY_GATEWAY_ORIGIN }}
+          TELEMETRY_GATEWAY_INGEST_BEARER: ${{ secrets.TELEMETRY_GATEWAY_INGEST_BEARER }}
+          TELEMETRY_GATEWAY_PREVIOUS_INGEST_BEARER: ${{ secrets.TELEMETRY_GATEWAY_PREVIOUS_INGEST_BEARER }}
+        run: node scripts/configure-observability.mjs --verify-bearer-rotation
+      - name: Deploy PPE telemetry gateway bootstrap
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler deploy --config .wrangler/telemetry/ppe/wrangler.telemetry-gateway-bootstrap.json
+      - name: Configure PPE telemetry signing key ring
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TELEMETRY_OIDC_SIGNING_KID: ${{ vars.TELEMETRY_OIDC_SIGNING_KID }}
+          TELEMETRY_OIDC_SIGNING_KEY: ${{ secrets.TELEMETRY_OIDC_SIGNING_KEY }}
+          TELEMETRY_OIDC_PREVIOUS_SIGNING_KEY: ${{ secrets.TELEMETRY_OIDC_PREVIOUS_SIGNING_KEY }}
+          TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK: ${{ vars.TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK }}
+        run: |
+          set -euo pipefail
+          node scripts/render-telemetry-gateway-secrets.mjs signing-keys |
+            npx wrangler secret put OIDC_SIGNING_KEYS --config .wrangler/telemetry/ppe/wrangler.telemetry-gateway-bootstrap.json
+      - name: Deploy PPE telemetry OIDC issuer
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler deploy --config .wrangler/telemetry/ppe/wrangler.oidc-issuer.json
+      - name: Verify PPE telemetry OIDC issuer
+        env:
+          TELEMETRY_OIDC_ISSUER_URL: ${{ vars.TELEMETRY_OIDC_ISSUER_URL }}
+          TELEMETRY_OIDC_SIGNING_KID: ${{ vars.TELEMETRY_OIDC_SIGNING_KID }}
+          TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK: ${{ vars.TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --retry 6 --retry-delay 5 --retry-all-errors \
+            "${TELEMETRY_OIDC_ISSUER_URL}/.well-known/openid-configuration" |
+            jq -e --arg issuer "$TELEMETRY_OIDC_ISSUER_URL" '.issuer == $issuer and .jwks_uri == ($issuer + "/.well-known/jwks.json")' >/dev/null
+          curl --fail --silent --show-error --retry 6 --retry-delay 5 --retry-all-errors \
+            "${TELEMETRY_OIDC_ISSUER_URL}/.well-known/jwks.json" |
+            jq -e --arg kid "$TELEMETRY_OIDC_SIGNING_KID" '(.keys | map(select(.kid == $kid and .kty == "RSA" and .alg == "RS256")) | length) == 1' >/dev/null
+          if [ -n "$TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK" ]; then
+            previous_kid="$(printf '%s' "$TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK" | jq -er '.kid')"
+            curl --fail --silent --show-error --retry 6 --retry-delay 5 --retry-all-errors \
+              "${TELEMETRY_OIDC_ISSUER_URL}/.well-known/jwks.json" |
+              jq -e --arg kid "$previous_kid" '(.keys | map(select(.kid == $kid and .kty == "RSA" and .alg == "RS256")) | length) == 1' >/dev/null
+          fi
+      - name: Verify PPE telemetry Entra federation
+        env:
+          TELEMETRY_AZURE_TENANT_ID: ${{ vars.TELEMETRY_AZURE_TENANT_ID }}
+          TELEMETRY_AZURE_APP_CLIENT_ID: ${{ vars.TELEMETRY_AZURE_APP_CLIENT_ID }}
+          TELEMETRY_OIDC_ISSUER_URL: ${{ vars.TELEMETRY_OIDC_ISSUER_URL }}
+          TELEMETRY_OIDC_SIGNING_KID: ${{ vars.TELEMETRY_OIDC_SIGNING_KID }}
+          TELEMETRY_OIDC_SIGNING_KEY: ${{ secrets.TELEMETRY_OIDC_SIGNING_KEY }}
+        run: node scripts/verify-entra-federation.mjs
+      - name: Deploy PPE telemetry gateway
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler deploy --config .wrangler/telemetry/ppe/wrangler.telemetry-gateway.json
+      - name: Configure PPE telemetry gateway ingest bearers
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TELEMETRY_GATEWAY_INGEST_BEARER: ${{ secrets.TELEMETRY_GATEWAY_INGEST_BEARER }}
+          TELEMETRY_GATEWAY_PREVIOUS_INGEST_BEARER: ${{ secrets.TELEMETRY_GATEWAY_PREVIOUS_INGEST_BEARER }}
+        run: |
+          set -euo pipefail
+          node scripts/render-telemetry-gateway-secrets.mjs ingest-bearers |
+            npx wrangler secret put INGEST_BEARERS --config .wrangler/telemetry/ppe/wrangler.telemetry-gateway.json
+      - name: Configure PPE observability destinations
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
+          TELEMETRY_GATEWAY_ORIGIN: ${{ vars.TELEMETRY_GATEWAY_ORIGIN }}
+          TELEMETRY_GATEWAY_INGEST_BEARER: ${{ secrets.TELEMETRY_GATEWAY_INGEST_BEARER }}
+          TELEMETRY_GATEWAY_PREVIOUS_INGEST_BEARER: ${{ secrets.TELEMETRY_GATEWAY_PREVIOUS_INGEST_BEARER }}
+        run: node scripts/configure-observability.mjs
       - name: Deploy PPE Worker
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
