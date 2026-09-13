@@ -714,6 +714,39 @@ describe("watch state sidecar storage", () => {
     expect(hydrated.events.at(-1)).toEqual(appended);
   });
 
+  it("hydrates predecessor snapshots that predate head repository persistence", async () => {
+    const storage = new MemoryStorage();
+    const { headRepository: _headRepository, ...legacySnapshot } = pullRequestSnapshot(
+      "legacy snapshot",
+      "2026-09-12T00:00:00.000Z",
+    );
+    const migratedSnapshot = { ...legacySnapshot, headRepository: null };
+    const legacyEvent = { ...watchEvent(0, { legacy: true }), snapshot: legacySnapshot };
+    await writeStoredWatchState(
+      storage as unknown as WatchStorage,
+      storageKey,
+      { snapshot: legacySnapshot, events: [legacyEvent] } as StoredWatchState,
+    );
+
+    const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await mutation.append(
+      { ...watchEvent(1, { appended: true }), snapshot: legacySnapshot } as WatchEvent,
+      legacySnapshot as PullRequestSnapshot,
+    );
+
+    await expect(readWatchStateMetadata(storage as unknown as WatchStorage, storageKey)).resolves.toMatchObject({
+      snapshot: migratedSnapshot,
+      events: [{ id: "event-0" }, { id: "event-1" }],
+    });
+    await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey)).resolves.toMatchObject({
+      snapshot: migratedSnapshot,
+      events: [
+        { id: "event-0", snapshot: null },
+        { id: "event-1", snapshot: migratedSnapshot },
+      ],
+    });
+  });
+
   it("keeps steady append writes bounded regardless of stored payload size", async () => {
     const large = new MemoryStorage();
     const small = new MemoryStorage();
@@ -738,35 +771,29 @@ describe("watch state sidecar storage", () => {
     });
   });
 
-  it("retires an evicted payload through bounded deferred cleanup", async () => {
+  it("retires an evicted compact payload in the appending transaction", async () => {
     const storage = new MemoryStorage();
-    for (let index = 0; index < 101; index += 1) {
+    for (let index = 0; index < 100; index += 1) {
       const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
       await mutation.append(watchEvent(index, { sequence: index }), null);
     }
 
     await expect(storage.get(watchSidecarEventKey(storageKey, 0))).resolves.toMatchObject({ id: "event-0" });
-    await expect(storage.get(watchSidecarCleanupKey(storageKey, 0))).resolves.toMatchObject({
-      recordKey: watchSidecarEventKey(storageKey, 0),
-    });
-
+    storage.deleteKeys.length = 0;
     const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
-    await mutation.append(watchEvent(101, { sequence: 101 }), null);
+    await mutation.append(watchEvent(100, { sequence: 100 }), null);
 
-    expect(storage.deleteKeys).toEqual([
-      watchSidecarEventKey(storageKey, 0),
-      watchSidecarCleanupKey(storageKey, 0),
-    ]);
+    expect(storage.deleteKeys).toEqual([watchSidecarEventKey(storageKey, 0)]);
     await expect(storage.get(watchSidecarEventKey(storageKey, 0))).resolves.toBeUndefined();
-    await expect(storage.get(watchSidecarEventKey(storageKey, 1))).resolves.toMatchObject({ id: "event-1" });
+    await expect(storage.get(watchSidecarCleanupKey(storageKey, 0))).resolves.toBeUndefined();
 
     const hydrated = await readStoredWatchState(storage as unknown as WatchStorage, storageKey);
     expect(hydrated.events).toHaveLength(100);
-    expect(hydrated.events[0]).toMatchObject({ id: "event-2", payload: { sequence: 2 } });
-    expect(hydrated.events.at(-1)).toMatchObject({ id: "event-101", payload: { sequence: 101 } });
+    expect(hydrated.events[0]).toMatchObject({ id: "event-1", payload: { sequence: 1 } });
+    expect(hydrated.events.at(-1)).toMatchObject({ id: "event-100", payload: { sequence: 100 } });
   });
 
-  it("drains compact snapshot and event retirements faster than they are enqueued", async () => {
+  it("retires compact snapshot and event records without cleanup rows", async () => {
     const storage = new MemoryStorage();
     for (let index = 0; index < 120; index += 1) {
       const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
@@ -777,7 +804,7 @@ describe("watch state sidecar storage", () => {
     }
 
     const cleanupRows = await storage.list({ prefix: `${storageKey}:sidecar:cleanup:` });
-    expect(cleanupRows.size).toBe(2);
+    expect(cleanupRows.size).toBe(0);
     await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey)).resolves.toMatchObject({
       snapshot: { body: "snapshot-119" },
     });
@@ -823,7 +850,7 @@ describe("watch state sidecar storage", () => {
       (key) => key === storageKey || key.startsWith(`${storageKey}:chunk:`),
     );
     expect(predecessorDeletes).toHaveLength(8);
-    expect(write.deletes).toBe(9);
+    expect(write.deletes).toBe(10);
     await expect(storage.get(watchSidecarCleanupKey(storageKey, 1))).resolves.toMatchObject({ nextRow: 8 });
   });
 
@@ -898,7 +925,7 @@ describe("watch state sidecar storage", () => {
       .rejects.toThrow("watch sidecar storage is corrupt");
 
     const protectedTargetStorage = new MemoryStorage();
-    const firstProtectedSnapshot = pullRequestSnapshot("first", "2026-09-13T00:00:00.000Z");
+    const firstProtectedSnapshot = pullRequestSnapshot("first".repeat(20_000), "2026-09-13T00:00:00.000Z");
     const currentProtectedSnapshot = pullRequestSnapshot("current", "2026-09-13T00:01:00.000Z");
     const firstProtectedMutation = await openWatchStateMutation(
       protectedTargetStorage as unknown as WatchStorage,

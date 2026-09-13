@@ -141,7 +141,7 @@ interface WatchSidecarIndex {
    * refs. Its chunk count is remembered so the record can be dropped without probing.
    */
   root: { chunkCount: number } | null;
-  /** Deferred retirement keeps a single append from deleting historical rows en masse. */
+  /** Deferred retirement of chunked records keeps a single append from deleting historical rows en masse. */
   cleanup: SidecarCleanupQueue;
   /** Oldest to newest, capped at MAX_EVENTS. */
   events: SidecarEventRef[];
@@ -223,6 +223,25 @@ export interface WatchStateMutation {
 
 function emptyWatchState(): StoredWatchState {
   return { snapshot: null, events: [] };
+}
+
+/** Adds the fork-routing field introduced after predecessor records already existed. */
+function normalizePullRequestSnapshot(snapshot: PullRequestSnapshot | null): PullRequestSnapshot | null {
+  if (snapshot === null || snapshot.headRepository !== undefined) return snapshot;
+  return { ...snapshot, headRepository: null };
+}
+
+function normalizeStoredWatchState(state: StoredWatchState): StoredWatchState {
+  const snapshot = normalizePullRequestSnapshot(state.snapshot);
+  let events: WatchEvent[] | undefined;
+  for (const [index, event] of state.events.entries()) {
+    const eventSnapshot = normalizePullRequestSnapshot(event.snapshot);
+    if (eventSnapshot === event.snapshot) continue;
+    events ??= [...state.events];
+    events[index] = { ...event, snapshot: eventSnapshot };
+  }
+  if (snapshot === state.snapshot && events === undefined) return state;
+  return { snapshot, events: events ?? state.events };
 }
 
 function isStoredWatchState(value: unknown): value is StoredWatchState {
@@ -399,7 +418,8 @@ function isPullRequestSnapshot(value: unknown): value is PullRequestSnapshot {
     isNullableString(snapshot.mergeableState) &&
     isNullableString(snapshot.baseRefName) &&
     isNullableString(snapshot.headRefName) &&
-    isNullableString(snapshot.headRepository) &&
+    // Snapshots stored before fork-aware routing omitted this persisted field.
+    (snapshot.headRepository === undefined || isNullableString(snapshot.headRepository)) &&
     isNullableString(snapshot.headSha) &&
     isNullableString(snapshot.author) &&
     typeof snapshot.fetchedAt === "string" &&
@@ -751,13 +771,13 @@ function sameSnapshot(current: PullRequestSnapshot | null, next: PullRequestSnap
 /** Reads the predecessor single-record layout, which stays authoritative until a sidecar exists. */
 async function readRootWatchState(storage: WatchStorage, storageKey: string): Promise<StoredWatchState> {
   const record = await readChunkedRecord<unknown>(storage, storageKey);
-  return isStoredWatchState(record.value) ? record.value : emptyWatchState();
+  return isStoredWatchState(record.value) ? normalizeStoredWatchState(record.value) : emptyWatchState();
 }
 
 async function readRequiredRootWatchState(storage: WatchStorage, storageKey: string): Promise<StoredWatchState> {
   const record = await readChunkedRecord<unknown>(storage, storageKey);
   if (!record.present || !isStoredWatchState(record.value)) throw sidecarCorruption();
-  return record.value;
+  return normalizeStoredWatchState(record.value);
 }
 
 async function readSidecarIndex(storage: WatchStorage, storageKey: string): Promise<WatchSidecarIndex | undefined> {
@@ -776,7 +796,7 @@ async function readSidecarSnapshot(
   if (!record.present || record.chunkCount !== ref.chunkCount || !isWatchSnapshotRecord(record.value)) {
     throw sidecarCorruption();
   }
-  return record.value.snapshot;
+  return normalizePullRequestSnapshot(record.value.snapshot);
 }
 
 function isStoredWatchEvent(value: unknown): value is WatchEvent {
@@ -908,7 +928,9 @@ export async function openWatchStateMutation(
     metadata = { snapshot, events: sidecarEventMetadata(index.events, snapshot) };
   } else {
     const rootRecord = await readChunkedRecord<unknown>(storage, storageKey);
-    const rootState = isStoredWatchState(rootRecord.value) ? rootRecord.value : emptyWatchState();
+    const rootState = isStoredWatchState(rootRecord.value)
+      ? normalizeStoredWatchState(rootRecord.value)
+      : emptyWatchState();
     snapshot = rootState.snapshot;
     snapshotRef = null;
     nextSnapshotSequence = 0;
@@ -1000,7 +1022,18 @@ export async function openWatchStateMutation(
         windowed,
         nextRoot,
       );
-      let cleanupDataBudget = Math.max(MIN_DEFERRED_CLEANUP_ROWS, incomingRows + retirements.length);
+      const deferredRetirements = retirements.filter((retirement) => retirement.chunkCount > 0);
+      const immediateRetirementKeys = retirements
+        .filter((retirement) => retirement.chunkCount === 0)
+        .map((retirement) => retirement.recordKey);
+      if (immediateRetirementKeys.some((key) => protectedRecordKeys.has(key))) {
+        throw sidecarCorruption();
+      }
+      if (immediateRetirementKeys.length > 0) {
+        await deleteStorageKeys(storage, immediateRetirementKeys);
+        deletes += immediateRetirementKeys.length;
+      }
+      let cleanupDataBudget = Math.max(MIN_DEFERRED_CLEANUP_ROWS, incomingRows + deferredRetirements.length);
       let jobsToAdvance = nextCleanup.next - nextCleanup.cursor;
       while (cleanupDataBudget > 0 && jobsToAdvance > 0) {
         const advance = await advanceDeferredCleanup(
@@ -1021,7 +1054,7 @@ export async function openWatchStateMutation(
       deletes += cleanupDeletes;
 
 
-      const enqueued = await enqueueDeferredCleanup(storage, storageKey, nextCleanup, retirements);
+      const enqueued = await enqueueDeferredCleanup(storage, storageKey, nextCleanup, deferredRetirements);
       nextCleanup = enqueued.cleanup;
       puts += enqueued.puts;
 
