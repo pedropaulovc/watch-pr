@@ -431,17 +431,19 @@ function resolveReactionKnowledge(
     !observedLater(source.reactionsObservedAt, base.reactionsObservedAt);
   if (base.reactionDetails !== undefined) {
     if (base.reactionDetailsState !== "borrowed") {
-      if (
-        basePublishes &&
-        source?.reactionDetails !== undefined &&
+      const sourceCompleteSupersedes = source?.reactionDetails !== undefined &&
         source.reactionDetailsState !== "borrowed" &&
-        readIsNewer(source, base)
-      ) {
+        readIsNewer(source, base);
+      const sourceProgressSupersedes = source?.reactionProgress !== undefined &&
+        !agrees &&
+        readIsNewer(source, base);
+      if (basePublishes && (sourceCompleteSupersedes || sourceProgressSupersedes)) {
         return {
           reactions: source.reactions,
           reactionsObservedAt: source.reactionsObservedAt,
           reactionDetails: source.reactionDetails,
           reactionDetailsReadAt: source.reactionDetailsReadAt,
+          reactionProgress: source.reactionProgress,
         };
       }
       return undefined;

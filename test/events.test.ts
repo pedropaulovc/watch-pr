@@ -823,6 +823,34 @@ describe("watch-pr event contracts", () => {
     expect(merged.bodyReactionDetailsReadAt).toBe("2026-09-03T00:02:00.000Z");
   });
 
+  it("keeps a newer partial cursor over stale complete details", () => {
+    const heart = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "now" };
+    const staleComplete = snapshot({
+      fetchedAt: "2026-09-03T00:05:00.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionsObservedAt: "2026-09-03T00:01:00.000Z",
+      bodyReactionDetails: [heart],
+      bodyReactionDetailsReadAt: "2026-09-03T00:01:00.000Z",
+    });
+    const newerPartial = snapshot({
+      fetchedAt: "2026-09-03T00:04:00.000Z",
+      bodyReactions: { heart: 101, total_count: 101 },
+      bodyReactionsObservedAt: "2026-09-03T00:02:00.000Z",
+      bodyReactionDetails: undefined,
+      bodyReactionDetailsReadAt: "2026-09-03T00:03:00.000Z",
+      bodyReactionProgress: {
+        records: [heart],
+        nextUrl: "https://api.github.com/reactions?page=2",
+      },
+    });
+
+    const merged = mergeReactionKnowledge(staleComplete, newerPartial);
+    expect(merged.bodyReactions).toEqual(newerPartial.bodyReactions);
+    expect(merged.bodyReactionDetails).toBeUndefined();
+    expect(merged.bodyReactionProgress).toEqual(newerPartial.bodyReactionProgress);
+    expect(merged.bodyReactionDetailsReadAt).toBe("2026-09-03T00:03:00.000Z");
+  });
+
   it("orders reaction details by each target's own read, not by the snapshot around it", () => {
     const heart = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:00:30.000Z" };
     const rocket = { id: 2, content: "rocket", author: "dave", authorId: 12, createdAt: "2026-09-03T00:02:30.000Z" };
