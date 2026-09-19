@@ -227,8 +227,6 @@ interface ReactionTargetRead {
   /** Index of the target slot this read fills. */
   slot: number;
   path: string;
-  /** Last stored state of this target, kept whole when the read fails. */
-  fallback: ReactionState | undefined;
 }
 
 interface SnapshotReactions {
@@ -246,13 +244,11 @@ interface SnapshotReactions {
  * details still describe the target. The residual blind spot is a swap that leaves every
  * count identical - one `heart` replaced by another actor's `heart` between two refreshes -
  * which the summary cannot express and only a per-target read would reveal.
- *
- * A failed read is isolated to its own target, and the target keeps its whole previous
- * reaction state, counts included: the counts are what the next refresh compares against, so
- * rolling them back with the details is what makes the next refresh notice the same delta
- * and read the target again instead of trusting stale details forever. A target with no
- * stored details stays unknown, which also forces a retry. Every other snapshot field still
- * advances.
+ * A failed or internally inconsistent read leaves that target unknown. Its current summary
+ * counts still advance, but the absent details force the next refresh to read the target
+ * again. Unknown details also let the transactional merge preserve reaction knowledge that
+ * another concurrent refresh committed while this request was in flight. Every other
+ * snapshot field still advances.
  */
 async function snapshotReactions(
   token: string,
@@ -271,7 +267,7 @@ async function snapshotReactions(
     const slot = slots.push({ reactions }) - 1;
     if (reactionTotal(reactions) === 0) slots[slot].reactionDetails = [];
     else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) slots[slot].reactionDetails = prior.reactionDetails;
-    else reads.push({ slot, path, fallback: prior?.reactionDetails ? prior : undefined });
+    else reads.push({ slot, path });
     return slot;
   };
 
@@ -302,7 +298,7 @@ async function snapshotReactions(
       }
       return { reactions, reactionDetails };
     } catch {
-      return read.fallback ?? slots[read.slot];
+      return slots[read.slot];
     }
   });
   for (const [position, read] of reads.entries()) slots[read.slot] = states[position];

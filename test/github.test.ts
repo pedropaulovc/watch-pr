@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { monitorEventDetails } from "../src/events";
+import { mergeReactionKnowledge, monitorEventDetails } from "../src/events";
 import { githubUser, pullRequestSnapshot } from "../src/github";
 
 /** A PR with no comments, reviews, or checks, so only its body carries reactions. */
@@ -277,7 +277,7 @@ describe("GitHub API adapter", () => {
     }]);
   });
 
-  it("rolls a failed reaction read back to its stored counts so the next refresh retries", async () => {
+  it("leaves a failed reaction read unknown so transactional state wins and the next refresh retries", async () => {
     const requested: string[] = [];
     stubPullRequest({ title: "seed", bodyReactions: { heart: 1, total_count: 1 }, reactions: () => Response.json([HEART]), requested });
     const stored = await pullRequestSnapshot("token", "owner/repo", 7);
@@ -290,12 +290,16 @@ describe("GitHub API adapter", () => {
       requested,
     });
     const failed = await pullRequestSnapshot("token", "owner/repo", 7, stored);
-    // The target keeps its whole stored state; everything else this refresh read advances.
+    // Unknown details tell the transactional merge not to overwrite knowledge a concurrent
+    // refresh may have committed while this read was in flight.
     expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
-    expect(failed.bodyReactions).toEqual({ heart: 1, total_count: 1 });
-    expect(failed.bodyReactionDetails).toEqual(stored.bodyReactionDetails);
+    expect(failed.bodyReactions).toEqual({ heart: 1, rocket: 1, total_count: 2 });
+    expect(failed.bodyReactionDetails).toBeUndefined();
     expect(failed.title).toBe("upstream moved");
     expect(monitorEventDetails(stored, failed)).toEqual([]);
+    const preserved = mergeReactionKnowledge(failed, stored);
+    expect(preserved.bodyReactions).toEqual(stored.bodyReactions);
+    expect(preserved.bodyReactionDetails).toEqual(stored.bodyReactionDetails);
 
     requested.length = 0;
     stubPullRequest({
@@ -304,11 +308,11 @@ describe("GitHub API adapter", () => {
       reactions: () => Response.json([HEART, ROCKET]),
       requested,
     });
-    // The same upstream summary is still a delta against the rolled-back counts, so it retries.
-    const recovered = await pullRequestSnapshot("token", "owner/repo", 7, failed);
+    // Unknown details force another read even though the summary itself is unchanged.
+    const recovered = await pullRequestSnapshot("token", "owner/repo", 7, preserved);
     expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
     expect(recovered.bodyReactions).toEqual({ heart: 1, rocket: 1, total_count: 2 });
-    expect(monitorEventDetails(failed, recovered)).toEqual([
+    expect(monitorEventDetails(preserved, recovered)).toEqual([
       "reaction created: @dave ROCKET on PR #7 @author https://github.com/owner/repo/pull/7",
     ]);
   });
