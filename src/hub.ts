@@ -2190,9 +2190,22 @@ export class WatchPrHub {
     await this.publishEvent(userId, key, event, { snapshot });
   }
 
+  private async revokeExpiredMonitorCapabilities(): Promise<number> {
+    const records = await this.state.storage.list<MonitorCapabilityRecord>({ prefix: "monitor:" });
+    let revoked = 0;
+    const now = Date.now();
+    for (const [storageKey, record] of records) {
+      if (Math.min(record.expiresAt, record.createdAt + MONITOR_TTL_MS) > now) continue;
+      const capability = storageKey.slice("monitor:".length);
+      revoked += await this.revokeMonitorCapability(capability, record);
+    }
+    return revoked;
+  }
+
   private async handlePoll(request: Request): Promise<Response> {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     await this.reconcileActiveSessions();
+    const expiredMonitorsRevoked = await this.revokeExpiredMonitorCapabilities();
     const sessions = await this.sessionRecords();
     let refreshesStarted = 0;
     let scheduled = 0;
@@ -2209,6 +2222,7 @@ export class WatchPrHub {
       active_sessions: sessions.size,
       scheduled_watches: scheduled,
       refreshes_started: refreshesStarted,
+      expired_monitors_revoked: expiredMonitorsRevoked,
     }));
     return this.accepted({ accepted: true, scheduled });
   }

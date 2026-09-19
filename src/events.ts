@@ -24,6 +24,49 @@ export const SUPPORTED_GITHUB_EVENTS = [
 
 const supportedEvents = new Set<string>(SUPPORTED_GITHUB_EVENTS);
 
+const MAX_MONITOR_DETAIL_LINES = 24;
+const MAX_MONITOR_DETAIL_LENGTH = 500;
+const MAX_MONITOR_DETAILS_LENGTH = 3_900;
+const MAX_MONITOR_BODY_LENGTH = 240;
+const ANSI_ESCAPE_SEQUENCE_RE = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~])/gu;
+
+function truncate(value: string, maximumLength: number): string {
+  if (value.length <= maximumLength) return value;
+  return `${value.slice(0, maximumLength - 1)}…`;
+}
+
+function boundedDetails(lines: string[]): string[] {
+  const candidates = [...new Set(lines)].map((line) => truncate(line, MAX_MONITOR_DETAIL_LENGTH));
+  const details: string[] = [];
+  let length = 0;
+  let index = 0;
+  while (index < candidates.length && details.length < MAX_MONITOR_DETAIL_LINES) {
+    const line = candidates[index];
+    if (length + line.length > MAX_MONITOR_DETAILS_LENGTH) break;
+    details.push(line);
+    length += line.length;
+    index += 1;
+  }
+  if (index === candidates.length) return details;
+
+  let omitted = candidates.length - index;
+  let marker = `+${omitted} more changes`;
+  if (details.length >= MAX_MONITOR_DETAIL_LINES) {
+    const removed = details.pop()!;
+    length -= removed.length;
+    omitted += 1;
+    marker = `+${omitted} more changes`;
+  }
+  while (details.length > 0 && length + marker.length > MAX_MONITOR_DETAILS_LENGTH) {
+    const removed = details.pop()!;
+    length -= removed.length;
+    omitted += 1;
+    marker = `+${omitted} more changes`;
+  }
+  if (details.length < MAX_MONITOR_DETAIL_LINES) details.push(marker);
+  return details;
+}
+
 export function isSupportedGithubEvent(eventName: string): boolean {
   return supportedEvents.has(eventName);
 }
@@ -224,6 +267,8 @@ function checkBucket(check: PullRequestCheck): "pending" | "pass" | "fail" | "sk
     case "success":
     case "neutral":
       return "pass";
+    case "pending":
+      return "pending";
     case "skipped":
       return "skipping";
     case "cancelled":
@@ -280,8 +325,31 @@ function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[])
   return lines;
 }
 
+function reconciliationCheckDetails(checks: PullRequestCheck[]): string[] {
+  const lines = checks
+    .filter((check) => checkBucket(check) === "fail" || checkBucket(check) === "cancel")
+    .map((check) => `check ${check.name}: ${checkBucket(check)}${check.url ? ` ${check.url}` : ""}`);
+  const pendingNames = [...new Set(
+    checks.filter((check) => checkBucket(check) === "pending").map((check) => check.name),
+  )].sort();
+  if (pendingNames.length > 0) {
+    lines.push(`checks: pending (${pendingNames.join(", ")})`);
+  } else if (checks.length > 0) {
+    lines.push(checkTerminalSummary(checks));
+  }
+  return lines;
+}
+
 function compactBody(value: string): string {
-  return value.replace(/<!--[\s\S]*?-->/gu, "").replace(/\s+/gu, " ").trim();
+  return truncate(
+    value
+      .replace(ANSI_ESCAPE_SEQUENCE_RE, "")
+      .replace(/<!--[\s\S]*?-->/gu, "")
+      .replace(/\s+/gu, " ")
+      .replace(/[\u0000-\u001f\u007f-\u009f]/gu, "")
+      .trim(),
+    MAX_MONITOR_BODY_LENGTH,
+  );
 }
 
 function commentLocation(comment: PullRequestComment): string {
@@ -330,6 +398,22 @@ function changedReviews(
   });
 }
 
+function removedComments(
+  previous: PullRequestComment[],
+  current: PullRequestComment[],
+): PullRequestComment[] {
+  const currentIds = new Set(current.map((comment) => comment.id));
+  return previous.filter((comment) => !currentIds.has(comment.id));
+}
+
+function removedReviews(
+  previous: PullRequestReview[],
+  current: PullRequestReview[],
+): PullRequestReview[] {
+  const currentIds = new Set(current.map((review) => review.id));
+  return previous.filter((review) => !currentIds.has(review.id));
+}
+
 function commentDetail(comment: PullRequestComment): string {
   const body = compactBody(comment.body);
   return `comment #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
@@ -344,7 +428,7 @@ function reviewCommentDetail(comment: PullRequestComment, snapshot: PullRequestS
   const thread = snapshot.threads.find((candidate) => candidate.commentIds.includes(comment.id));
   const location = commentLocation(comment);
   const body = compactBody(comment.body);
-  return `feedback [${thread?.id ?? comment.id}] #${comment.id}${location ? ` ${location}` : ""} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+  return `feedback [${thread?.id ?? "-"}] #${comment.id}${location ? ` ${location}` : ""} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
 }
 
 function mergeabilityDetails(
@@ -352,17 +436,35 @@ function mergeabilityDetails(
   current: PullRequestSnapshot,
 ): string[] {
   const lines: string[] = [];
-  if (!previous || previous.headRefName !== current.headRefName || previous.headSha !== current.headSha) {
+  if (
+    (!previous || previous.headRefName !== current.headRefName || previous.headSha !== current.headSha) &&
+    current.headRefName &&
+    current.headSha
+  ) {
     lines.push(`head: ${current.headRefName}@${current.headSha}`);
   }
-  const mergeableState = current.mergeableState?.toUpperCase();
-  if (
-    (mergeableState === "BEHIND" || mergeableState === "DIRTY") &&
-    (!previous || previous.mergeableState?.toUpperCase() !== mergeableState)
-  ) {
-    lines.push(`rebase: ${mergeableState}`);
+  if (previous && previous.baseRefName !== current.baseRefName) {
+    lines.push(`base: ${previous.baseRefName ?? "<unknown>"} -> ${current.baseRefName ?? "<unknown>"}`);
+  }
+  const previousState = previous?.mergeableState?.toUpperCase();
+  const currentState = current.mergeableState?.toUpperCase();
+  const previousNeedsRebase = previousState === "BEHIND" || previousState === "DIRTY";
+  const currentNeedsRebase = currentState === "BEHIND" || currentState === "DIRTY";
+  if (currentNeedsRebase && previousState !== currentState) {
+    lines.push(`rebase: ${currentState}`);
+  } else if (previous && previousNeedsRebase && previousState !== currentState) {
+    lines.push(`rebase: ${currentState ?? "UNKNOWN"}`);
   }
   return lines;
+}
+
+function threadDetails(previous: PullRequestSnapshot, current: PullRequestSnapshot): string[] {
+  const previousById = new Map(previous.threads.map((thread) => [thread.id, thread]));
+  return current.threads.flatMap((thread) => {
+    const prior = previousById.get(thread.id);
+    if (!prior || prior.isResolved === thread.isResolved) return [];
+    return [`thread ${thread.id}: ${thread.isResolved ? "resolved" : "reopened"}`];
+  });
 }
 
 export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): string[] {
@@ -371,13 +473,14 @@ export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): str
       .filter((thread) => !thread.isResolved)
       .flatMap((thread) => thread.commentIds),
   );
-  return [
+  const reviewComments = snapshot.threads.length === 0
+    ? snapshot.reviewComments
+    : snapshot.reviewComments.filter((comment) => unresolvedCommentIds.has(comment.id));
+  return boundedDetails([
     ...mergeabilityDetails(null, snapshot),
-    ...checkDetails([], snapshot.checks),
-    ...snapshot.reviewComments
-      .filter((comment) => unresolvedCommentIds.has(comment.id))
-      .map((comment) => reviewCommentDetail(comment, snapshot)),
-  ];
+    ...reconciliationCheckDetails(snapshot.checks),
+    ...reviewComments.map((comment) => reviewCommentDetail(comment, snapshot)),
+  ]);
 }
 
 export function monitorEventDetails(
@@ -389,14 +492,24 @@ export function monitorEventDetails(
     ...mergeabilityDetails(previous, current),
     ...checkDetails(previous.checks, current.checks),
     ...changedComments(previous.comments, current.comments).map(commentDetail),
+    ...removedComments(previous.comments, current.comments)
+      .map((comment) => `comment #${comment.id} deleted`),
     ...changedReviews(previous.reviews, current.reviews).map(reviewDetail),
+    ...removedReviews(previous.reviews, current.reviews)
+      .map((review) => `review #${review.id} deleted`),
     ...changedComments(previous.reviewComments, current.reviewComments)
       .map((comment) => reviewCommentDetail(comment, current)),
+    ...removedComments(previous.reviewComments, current.reviewComments)
+      .map((comment) => {
+        const thread = previous.threads.find((candidate) => candidate.commentIds.includes(comment.id));
+        return `feedback [${thread?.id ?? "-"}] #${comment.id} deleted`;
+      }),
+    ...threadDetails(previous, current),
   ];
   if (previous.state !== current.state || previous.draft !== current.draft) {
     lines.unshift(`PR state: ${current.state.toUpperCase()}${current.draft ? " DRAFT" : ""}`);
   }
-  return [...new Set(lines)];
+  return boundedDetails(lines);
 }
 
 export function createWatchEvent(input: {

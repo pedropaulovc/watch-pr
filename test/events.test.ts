@@ -3,6 +3,7 @@ import { hmacSha256Hex, verifyGithubSignature } from "../src/crypto";
 import {
   eventPullRequestNumbers,
   monitorEventDetails,
+  monitorReconciliationDetails,
   parseResourceUri,
   resourceUri,
   snapshotChanges,
@@ -244,6 +245,119 @@ describe("watch-pr event contracts", () => {
     ]);
   });
 
+  it("keeps pending commit statuses in the check wave instead of reporting failures", () => {
+    const pendingStatus = {
+      id: 9,
+      name: "buildkite/build",
+      status: "completed",
+      conclusion: "pending",
+      completedAt: "2026-09-19T12:00:00.000Z",
+      startedAt: null,
+      url: "https://buildkite.com/build/9",
+      kind: "commit_status" as const,
+    };
+
+    expect(monitorEventDetails(snapshot(), snapshot({ checks: [pendingStatus] }))).toEqual([
+      "checks: rerun started (pending: buildkite/build)",
+    ]);
+  });
+
+  it("renders current check state and review feedback during reconciliation", () => {
+    const pending = {
+      id: 1,
+      name: "CI",
+      status: "in_progress",
+      conclusion: null,
+      completedAt: null,
+      startedAt: "2026-09-19T12:00:00.000Z",
+      url: null,
+      kind: "check_run" as const,
+    };
+    const feedback = {
+      id: 22,
+      author: "reviewer",
+      body: "Please keep this visible.",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      path: "src/retry.ts",
+      line: 9,
+    };
+
+    expect(monitorReconciliationDetails(snapshot({
+      checks: [pending],
+      reviewComments: [feedback],
+      threads: [],
+    }))).toEqual([
+      "head: feature@abc",
+      "checks: pending (CI)",
+      "feedback [-] #22 src/retry.ts:9 @reviewer: Please keep this visible.",
+    ]);
+    expect(monitorReconciliationDetails(snapshot({
+      checks: [{ ...pending, status: "completed", conclusion: "success" }],
+    }))).toEqual([
+      "head: feature@abc",
+      "checks: all terminal (pass: 1, fail: 0, skipping: 0, cancel: 0)",
+    ]);
+  });
+
+  it("reports retargets, cleared conflicts, reopened threads, and deleted feedback", () => {
+    const comment = {
+      id: 21,
+      author: "reviewer",
+      body: "Old feedback",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+    };
+    const review = {
+      id: 31,
+      author: "reviewer",
+      body: "Old review",
+      state: "CHANGES_REQUESTED",
+      submittedAt: "2026-09-19T12:00:00.000Z",
+    };
+    const reviewComment = { ...comment, id: 41, path: "src/retry.ts", line: 12 };
+    const before = snapshot({
+      mergeableState: "dirty",
+      comments: [comment],
+      reviews: [review],
+      reviewComments: [reviewComment],
+      threads: [{ id: "PRRT_thread", isResolved: true, commentIds: [41] }],
+    });
+    const after = snapshot({
+      baseRefName: "release/2",
+      mergeableState: "clean",
+      threads: [{ id: "PRRT_thread", isResolved: false, commentIds: [41] }],
+    });
+
+    expect(monitorEventDetails(before, after)).toEqual([
+      "base: main -> release/2",
+      "rebase: CLEAN",
+      "comment #21 deleted",
+      "review #31 deleted",
+      "feedback [PRRT_thread] #41 deleted",
+      "thread PRRT_thread: reopened",
+    ]);
+  });
+
+  it("omits unavailable head references and bounds persisted monitor details", () => {
+    expect(monitorReconciliationDetails(snapshot({ headRefName: null, headSha: null }))).toEqual([]);
+    const comments = Array.from({ length: 30 }, (_, index) => ({
+      id: index + 1,
+      author: "reviewer",
+      body: `feedback ${index} ${"x".repeat(1_000)}`,
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+    }));
+    const details = monitorEventDetails(snapshot(), snapshot({ comments }));
+
+    expect(details.length).toBeLessThanOrEqual(24);
+    expect(details.join("").length).toBeLessThanOrEqual(3_900);
+    expect(details.at(-1)).toMatch(/^\+\d+ more changes$/u);
+  });
+
   it("emits only the changed comment body after a PR accumulates many comments", () => {
     const existing = Array.from({ length: 20 }, (_, index) => ({
       id: index + 1,
@@ -257,7 +371,7 @@ describe("watch-pr event contracts", () => {
     const newComment = {
       id: 21,
       author: "reviewer",
-      body: "<!-- hidden -->Please cover the retry race\nbefore merging.",
+      body: "<!-- hidden -->Please \u001b[2Kcover the retry race\nbefore merging.",
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: {},

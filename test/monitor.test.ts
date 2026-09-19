@@ -1304,6 +1304,38 @@ describe("native monitor feed", () => {
     }
   });
 
+  it("reaps expired capabilities that were never opened", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-09-19T12:00:00.000Z");
+    vi.setSystemTime(now);
+    const { hub, storage, pending } = hubFixture();
+    const record = sessionRecord({ expiresAt: now.getTime() + 30 * 24 * 60 * 60 * 1000 });
+    await storeMonitor(storage, {
+      snapshot: snapshot({ state: "closed", merged: true, mergedAt: now.toISOString() }),
+      events: [],
+    }, record);
+    await storage.put(monitorCapabilityStorageKey(capability), {
+      sessionToken,
+      userId,
+      repository,
+      pullRequestNumber: number,
+      createdAt: now.getTime() - 12 * 60 * 60 * 1000 - 1,
+      expiresAt: record.expiresAt,
+    } satisfies MonitorCapabilityRecord);
+
+    try {
+      const response = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending);
+      await expect(storage.get(monitorCapabilityStorageKey(capability))).resolves.toBeUndefined();
+      await expect(storage.get(
+        monitorScopeStorageKey(sessionToken, repository, number),
+      )).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects invalid, expired, and out-of-scope capabilities without GitHub access", async () => {
     const { hub, storage } = hubFixture();
     await expect(hub.fetch(new Request("https://watch-pr.test/monitor/unknown-capability"))).resolves.toMatchObject({ status: 404 });
