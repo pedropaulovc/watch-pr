@@ -2,7 +2,14 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { ReadResourceRequestSchema, SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
-import { parseResourceUri, reactionStateLine, resourceUri, snapshotReactions, watchKey } from "./events";
+import {
+  normalizedLogin,
+  parseResourceUri,
+  reactionStateLine,
+  resourceUri,
+  snapshotReactions,
+  watchKey,
+} from "./events";
 import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestComment, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
 
 export type McpOutputMode = "brief" | "full";
@@ -111,9 +118,11 @@ function feedbackLines(threads: PullRequestThread[], comments: PullRequestCommen
 function briefReactionLines(snapshot: PullRequestSnapshot, user: GithubUser): string[] {
   // Reactions the watcher left are their own activity; everyone else's is the signal.
   // The actor's numeric ID is the identity: a renamed or recased login must still be theirs.
+  // Records persisted before actor IDs were stored have none - null or absent - and fall
+  // back to the login, compared normalized so at least a recase is still recognised.
   const lines = snapshotReactions(snapshot)
-    .filter((entry) => (entry.reaction.authorId === null
-      ? entry.reaction.author !== user.login
+    .filter((entry) => (entry.reaction.authorId == null
+      ? normalizedLogin(entry.reaction.author) !== normalizedLogin(user.login)
       : entry.reaction.authorId !== user.id))
     .map(reactionStateLine)
     .sort();

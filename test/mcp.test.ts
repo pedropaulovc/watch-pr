@@ -363,4 +363,26 @@ describe("MCP output modes", () => {
     expect(briefAtCap.split("\n").filter((line) => line.startsWith("reaction @"))).toHaveLength(12);
     expect(briefAtCap).not.toContain("more reactions");
   });
+
+  it("filters the watcher's own reactions from records that carry no actor ID", async () => {
+    // Persisted before actor IDs: one record omits the key, one stored it as null.
+    const legacy = [
+      { id: 1_100, content: "eyes", author: "PedroPauloVC", createdAt: "2026-09-05T00:00:00.000Z" },
+      { id: 1_101, content: "heart", author: "pedropaulovc", authorId: null, createdAt: "2026-09-05T00:01:00.000Z" },
+      { id: 1_102, content: "rocket", author: "dave", createdAt: "2026-09-05T00:02:00.000Z" },
+    ] as PullRequestSnapshot["bodyReactionDetails"];
+    const unattributed: PullRequestSnapshot = {
+      ...snapshot,
+      bodyReactions: { eyes: 1, heart: 1, rocket: 1, total_count: 3 },
+      bodyReactionDetails: legacy,
+      comments: [],
+      reviewComments: [],
+      threads: [],
+    };
+
+    const brief = await callTool("get_pr", { repository: "owner/repo", number: 7 }, unattributed);
+    expect(brief.split("\n").filter((line) => line.startsWith("reaction @"))).toEqual([
+      "reaction @dave ROCKET on PR #7 @author https://github.com/owner/repo/pull/7",
+    ]);
+  });
 });

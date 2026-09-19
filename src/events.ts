@@ -301,42 +301,53 @@ export function reactionKnowledgeAdvanced(
 }
 
 /**
- * Carries reaction knowledge forward from the snapshot already stored into the one about to
- * replace it. Two refreshes can be in flight over the same watch and each can learn a
- * different subset of targets - one reads the body while the other's body read fails and it
- * reads a comment instead - so the later writer must not publish its own gaps over what the
- * earlier writer proved. Only targets the incoming snapshot does not know are filled, and a
- * filled target also takes the stored aggregate counts, because the counts are what the next
- * refresh compares against: details from one refresh beside counts from another would either
- * hide a real change or force a pointless re-read. Never overwrites known details, so the
- * merge only ever adds knowledge.
+ * Returns `base` with every reaction target it does not know filled in from `source`, and
+ * nothing else: each non-reaction field, `fetchedAt` included, comes from `base` alone. Two
+ * refreshes can be in flight over one watch and each can learn a different subset of targets
+ * - one reads the PR body while the other's body read fails and it reads a comment instead -
+ * so whichever writes second must add the other's knowledge without publishing its own view
+ * of anything else. The caller picks the base accordingly: a silent enrichment keeps the
+ * stored snapshot as the base, so it can never revert a title, head or check that landed
+ * while it was in flight, while a published event keeps its own snapshot as the base,
+ * because reporting that change is the point of the write.
+ *
+ * A filled target also takes `source`'s aggregate counts, because the counts are what the
+ * next refresh compares against: details from one refresh beside counts from another would
+ * either hide a real change or force a pointless re-read. Known details are never
+ * overwritten, so the merge only ever adds knowledge, and `base` is returned untouched when
+ * there was nothing to add.
  */
 export function mergeReactionKnowledge(
-  current: PullRequestSnapshot,
-  incoming: PullRequestSnapshot,
+  base: PullRequestSnapshot,
+  source: PullRequestSnapshot,
 ): PullRequestSnapshot {
   let merged = false;
-  let bodyReactions = incoming.bodyReactions;
-  let bodyReactionDetails = incoming.bodyReactionDetails;
-  if (bodyReactionDetails === undefined && current.bodyReactionDetails !== undefined) {
-    bodyReactions = current.bodyReactions;
-    bodyReactionDetails = current.bodyReactionDetails;
+  let bodyReactions = base.bodyReactions;
+  let bodyReactionDetails = base.bodyReactionDetails;
+  if (bodyReactionDetails === undefined && source.bodyReactionDetails !== undefined) {
+    bodyReactions = source.bodyReactions;
+    bodyReactionDetails = source.bodyReactionDetails;
     merged = true;
   }
-  const mergeComments = (stored: PullRequestComment[], next: PullRequestComment[]): PullRequestComment[] => {
-    const storedById = new Map(stored.map((comment) => [comment.id, comment] as const));
-    return next.map((comment) => {
+  const fill = (targets: PullRequestComment[], known: PullRequestComment[]): PullRequestComment[] => {
+    const knownById = new Map(known.map((comment) => [comment.id, comment] as const));
+    return targets.map((comment) => {
       if (comment.reactionDetails !== undefined) return comment;
-      const known = storedById.get(comment.id);
-      if (!known?.reactionDetails) return comment;
+      const learned = knownById.get(comment.id);
+      if (learned?.reactionDetails === undefined) return comment;
       merged = true;
-      return { ...comment, reactions: known.reactions, reactionDetails: known.reactionDetails };
+      return { ...comment, reactions: learned.reactions, reactionDetails: learned.reactionDetails };
     });
   };
-  const comments = mergeComments(current.comments, incoming.comments);
-  const reviewComments = mergeComments(current.reviewComments, incoming.reviewComments);
-  if (!merged) return incoming;
-  return { ...incoming, bodyReactions, bodyReactionDetails, comments, reviewComments };
+  const comments = fill(base.comments, source.comments);
+  const reviewComments = fill(base.reviewComments, source.reviewComments);
+  if (!merged) return base;
+  return { ...base, bodyReactions, bodyReactionDetails, comments, reviewComments };
+}
+
+/** Logins are renameable and recasable, so they are only ever compared normalized. */
+export function normalizedLogin(login: string | null | undefined): string {
+  return (login ?? "").toLowerCase();
 }
 
 export function snapshotChanges(
@@ -659,9 +670,17 @@ function reactionChangeLine(
   return `reaction ${action}: @${reaction.author ?? "unknown"} ${reactionContentName(reaction.content)} ${preposition} ${reactionTargetDescription(target)}`;
 }
 
-function reactionIdentity(reaction: PullRequestReaction): string {
-  // Logins are renameable, so the actor's numeric ID identifies them whenever GitHub gave one.
-  return `${reaction.content}\u0000${reaction.authorId ?? `@${reaction.author ?? ""}`}`;
+/**
+ * Whether two records of the same reaction ID describe the same reaction. Numeric actor IDs
+ * decide it whenever both sides have one, because logins are renameable. A record persisted
+ * before actor IDs were stored has none, so enriching it with a freshly read copy of the
+ * same reaction must not look like a different actor: those fall back to the login, compared
+ * normalized, which is also all a recased login needs.
+ */
+function sameReaction(prior: PullRequestReaction, next: PullRequestReaction): boolean {
+  if (prior.content !== next.content) return false;
+  if (prior.authorId != null && next.authorId != null) return prior.authorId === next.authorId;
+  return normalizedLogin(prior.author) === normalizedLogin(next.author);
 }
 
 function reactionTargetDetails(
@@ -675,13 +694,13 @@ function reactionTargetDetails(
     ...current
       .filter((reaction) => {
         const prior = previousById.get(reaction.id);
-        return !prior || reactionIdentity(prior) !== reactionIdentity(reaction);
+        return !prior || !sameReaction(prior, reaction);
       })
       .map((reaction) => reactionChangeLine("created", reaction, target)),
     ...previous
       .filter((reaction) => {
         const next = currentById.get(reaction.id);
-        return !next || reactionIdentity(next) !== reactionIdentity(reaction);
+        return !next || !sameReaction(reaction, next);
       })
       .map((reaction) => reactionChangeLine("deleted", reaction, target)),
   ];

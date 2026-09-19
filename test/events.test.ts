@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { hmacSha256Hex, verifyGithubSignature } from "../src/crypto";
 import {
   eventPullRequestNumbers,
+  mergeReactionKnowledge,
   monitorEventDetails,
   monitorReconciliationDetails,
   parseResourceUri,
@@ -662,6 +663,70 @@ describe("watch-pr event contracts", () => {
     });
 
     expect(monitorEventDetails(before, renamed)).toEqual([]);
+  });
+
+  it("enriches a reaction record that predates actor IDs without reporting a swap", () => {
+    const legacyDetails = [{ id: 909, content: "heart", author: "Alice", createdAt: "2026-09-19T12:14:00.000Z" }];
+    // Persisted before actor IDs were stored: the record has no `authorId` at all.
+    const legacy = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: legacyDetails as PullRequestSnapshot["bodyReactionDetails"],
+    });
+    const enriched = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [{ id: 909, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-19T12:14:00.000Z" }],
+    });
+    const swapped = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [{ id: 909, content: "heart", author: "erin", authorId: 14, createdAt: "2026-09-19T12:15:00.000Z" }],
+    });
+
+    expect(monitorEventDetails(legacy, enriched)).toEqual([]);
+    expect(monitorEventDetails(legacy, swapped)).toEqual([
+      "reaction created: @erin HEART on PR #7 @author https://github.com/owner/repo/pull/7",
+      "reaction deleted: @Alice HEART from PR #7 @author https://github.com/owner/repo/pull/7",
+    ]);
+  });
+
+  it("merges reaction knowledge into the base snapshot without taking anything else from the source", () => {
+    const reaction = { id: 910, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-19T12:16:00.000Z" };
+    const comment = {
+      id: 21,
+      author: "bob",
+      body: "Top-level note",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: { rocket: 1, total_count: 1 },
+      htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
+    };
+    const commentReaction = { id: 911, content: "rocket", author: "dave", authorId: 12, createdAt: "2026-09-19T12:17:00.000Z" };
+    const base = snapshot({
+      title: "renamed while a refresh was in flight",
+      headSha: "pushed",
+      checks: [{ id: 1, name: "CI", status: "completed", conclusion: "failure", completedAt: "now", startedAt: "then", url: null, kind: "check_run" }],
+      fetchedAt: "2026-09-19T12:30:00.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: undefined,
+      comments: [comment],
+    });
+    const source = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [reaction],
+      comments: [{ ...comment, reactionDetails: [commentReaction] }],
+    });
+
+    const merged = mergeReactionKnowledge(base, source);
+    expect(merged).toMatchObject({
+      title: base.title,
+      headSha: "pushed",
+      checks: base.checks,
+      fetchedAt: "2026-09-19T12:30:00.000Z",
+      bodyReactionDetails: [reaction],
+      comments: [{ reactionDetails: [commentReaction] }],
+    });
+    // Known details are never replaced, and a snapshot that learns nothing is untouched.
+    expect(mergeReactionKnowledge(source, base)).toBe(source);
+    expect(mergeReactionKnowledge(merged, source)).toBe(merged);
   });
 
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {

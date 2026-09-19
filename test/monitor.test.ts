@@ -1914,4 +1914,82 @@ describe("native monitor feed", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it("adds learned reactions to the stored snapshot without reverting a concurrent change", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const storageKey = watchStorageKey(userId, repository, number);
+    const unknown = snapshot({
+      headSha: "reopened",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: undefined,
+    });
+    await storeMonitor(storage, { snapshot: unknown, events: [event("event-1", unknown)] });
+    // What another writer stored after this refresh compared snapshots and before it opened
+    // its own transaction: a title, a head revision and a check this refresh never saw.
+    const concurrent = snapshot({
+      title: "renamed while a refresh was in flight",
+      headSha: "pushed",
+      checks: [{
+        id: 1,
+        name: "CI",
+        status: "completed",
+        conclusion: "failure",
+        completedAt: "2026-09-10T12:20:00.000Z",
+        startedAt: "2026-09-10T12:10:00.000Z",
+        url: null,
+        kind: "check_run",
+      }],
+      fetchedAt: "2026-09-10T12:30:00.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: undefined,
+    });
+    let stateReads = 0;
+    let writing = false;
+    storage.afterGet = async (key) => {
+      if (writing || key !== storageKey) return;
+      stateReads += 1;
+      // Reads one and two happen before the refresh fetches; three is the comparison it
+      // makes against stored state, so writing here lands in the window before its own
+      // transaction opens.
+      if (stateReads !== 3) return;
+      writing = true;
+      const mutation = await openWatchStateMutation(storage as unknown as DurableObjectStorage, storageKey);
+      await mutation.replaceSnapshot(concurrent);
+      writing = false;
+    };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/issues/7")) return Response.json({ reactions: { heart: 1, total_count: 1 } });
+      if (url.endsWith("/issues/7/reactions?per_page=100")) {
+        return Response.json([{
+          id: 901,
+          content: "heart",
+          user: { login: "alice", id: 11 },
+          created_at: "2026-09-10T12:00:00.000Z",
+        }]);
+      }
+      return openPullRequestFetch()(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const poll = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(poll.status).toBe(202);
+      await Promise.all(pending.splice(0));
+    } finally {
+      vi.unstubAllGlobals();
+      storage.afterGet = undefined;
+    }
+
+    const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+    // The silent write adds the reactions it read and nothing else.
+    expect(stored.snapshot?.bodyReactionDetails).toEqual([
+      { id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-10T12:00:00.000Z" },
+    ]);
+    expect(stored.snapshot?.title).toBe("renamed while a refresh was in flight");
+    expect(stored.snapshot?.headSha).toBe("pushed");
+    expect(stored.snapshot?.checks).toEqual(concurrent.checks);
+    expect(stored.snapshot?.fetchedAt).toBe("2026-09-10T12:30:00.000Z");
+    expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+  });
 });

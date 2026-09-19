@@ -877,36 +877,40 @@ describe("watch state sidecar storage", () => {
       .resolves.toMatchObject({ snapshot: replacement });
   });
 
-  it("keeps a chunked retirement reachable when a snapshot is replaced without an event", async () => {
+  it("reclaims a chunked retirement in the transaction that replaces a snapshot", async () => {
     const storage = new MemoryStorage();
     const chunked = pullRequestSnapshot("x".repeat(80_000), "2026-09-13T00:00:00.000Z");
     const learned = pullRequestSnapshot("learned", "2026-09-13T00:01:00.000Z");
     const first = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
     await first.append(watchEvent(0, { stored: true }), chunked);
     const retiredKey = watchSidecarSnapshotKey(storageKey, 0);
+    expect((await storage.list({ prefix: `${retiredKey}:chunk:` })).size).toBeGreaterThan(0);
 
     const silent = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
     await silent.replaceSnapshot(learned);
 
-    // The enqueued job is only reachable through the queue pointer the index carries.
-    await expect(storage.get(watchSidecarCleanupKey(storageKey, 0))).resolves.toMatchObject({
-      recordKey: retiredKey,
-    });
+    // The retirement fits the per-transaction budget, so the silent write pays for it here
+    // rather than parking rows until the watch happens to publish something. The queue
+    // pointer it leaves behind is only durable because the index is written after the drain.
+    await expect(storage.list({ prefix: `${retiredKey}:chunk:` })).resolves.toMatchObject({ size: 0 });
+    await expect(storage.get(retiredKey)).resolves.toBeUndefined();
+    await expect(storage.list({ prefix: `${storageKey}:sidecar:cleanup:` })).resolves.toMatchObject({ size: 0 });
     await expect(storage.get(watchSidecarIndexKey(storageKey))).resolves.toMatchObject({
-      cleanup: { cursor: 0, next: 1 },
+      cleanup: { cursor: 1, next: 1 },
     });
     await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey))
       .resolves.toMatchObject({ snapshot: learned });
 
-    for (let index = 1; index <= 4; index += 1) {
+    // Repeated silent replacements retire each other's records at the same rate.
+    let previousKeys = 0;
+    for (let index = 1; index <= 12; index += 1) {
       const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
-      await mutation.append(watchEvent(index, { stored: true }), learned);
+      await mutation.replaceSnapshot(pullRequestSnapshot("y".repeat(80_000), `2026-09-13T00:${10 + index}:00.000Z`));
+      const keys = (await storage.list({})).size;
+      if (index > 1) expect(keys).toBe(previousKeys);
+      previousKeys = keys;
+      expect((await storage.list({ prefix: `${storageKey}:sidecar:cleanup:` })).size).toBe(0);
     }
-
-    // Ordinary appends drain the queue, so the replaced snapshot's chunks are reclaimed.
-    await expect(storage.list({ prefix: `${retiredKey}:chunk:` })).resolves.toMatchObject({ size: 0 });
-    await expect(storage.list({ prefix: `${storageKey}:sidecar:cleanup:` })).resolves.toMatchObject({ size: 0 });
-    await expect(storage.get(retiredKey)).resolves.toBeUndefined();
   });
 
   it("retires an event-less predecessor record when a snapshot is replaced without an event", async () => {
@@ -941,23 +945,17 @@ describe("watch state sidecar storage", () => {
     const chunked = await openWatchStateMutation(chunkedStorage as unknown as WatchStorage, storageKey);
     await chunked.replaceSnapshot(learned);
 
-    // A chunked predecessor goes through the deferred queue, with the pointer in the index.
-    await expect(chunkedStorage.get(watchSidecarCleanupKey(storageKey, 0))).resolves.toMatchObject({
-      recordKey: storageKey,
-    });
+    // A chunked predecessor goes through the deferred queue, which the same transaction
+    // drains, so the record and every chunk it owned are already gone.
     await expect(chunkedStorage.get(watchSidecarIndexKey(storageKey))).resolves.toMatchObject({
       root: null,
-      cleanup: { cursor: 0, next: 1 },
+      cleanup: { cursor: 1, next: 1 },
     });
-    await expect(readStoredWatchState(chunkedStorage as unknown as WatchStorage, storageKey))
-      .resolves.toMatchObject({ snapshot: learned, events: [] });
-
-    for (let index = 0; index < 4; index += 1) {
-      const mutation = await openWatchStateMutation(chunkedStorage as unknown as WatchStorage, storageKey);
-      await mutation.append(watchEvent(index, { stored: true }), learned);
-    }
     await expect(chunkedStorage.list({ prefix: `${storageKey}:chunk:` })).resolves.toMatchObject({ size: 0 });
     await expect(chunkedStorage.get(storageKey)).resolves.toBeUndefined();
+    await expect(chunkedStorage.list({ prefix: `${storageKey}:sidecar:cleanup:` })).resolves.toMatchObject({ size: 0 });
+    await expect(readStoredWatchState(chunkedStorage as unknown as WatchStorage, storageKey))
+      .resolves.toMatchObject({ snapshot: learned, events: [] });
   });
 
   it("fails closed for a present but unreadable sidecar index", async () => {

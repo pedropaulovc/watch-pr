@@ -1235,14 +1235,31 @@ export async function openWatchStateMutation(
         await deleteStorageKeys(storage, immediateRetirementKeys);
         deletes += immediateRetirementKeys.length;
       }
-      const enqueued = await enqueueDeferredCleanup(
-        storage,
-        storageKey,
-        nextCleanup,
-        retirements.filter((retirement) => retirement.chunkCount > 0),
-      );
+      const deferredRetirements = retirements.filter((retirement) => retirement.chunkCount > 0);
+      const enqueued = await enqueueDeferredCleanup(storage, storageKey, nextCleanup, deferredRetirements);
       nextCleanup = enqueued.cleanup;
       puts += enqueued.puts;
+
+      // Drained at the same bounded rate an append uses, and over the work just enqueued as
+      // well, so a silent replacement pays for the record it retired instead of parking it
+      // until the watch happens to publish something.
+      let cleanupDataBudget = Math.max(MIN_DEFERRED_CLEANUP_ROWS, snapshotWrite.puts + deferredRetirements.length);
+      let jobsToAdvance = nextCleanup.next - nextCleanup.cursor;
+      while (cleanupDataBudget > 0 && jobsToAdvance > 0) {
+        const advance = await advanceDeferredCleanup(
+          storage,
+          storageKey,
+          protectedRecordKeys,
+          nextCleanup,
+          cleanupDataBudget,
+        );
+        if (advance.dataDeletes === 0) break;
+        nextCleanup = advance.cleanup;
+        puts += advance.puts;
+        deletes += advance.deletes;
+        cleanupDataBudget -= advance.dataDeletes;
+        jobsToAdvance -= 1;
+      }
 
       // The events stay exactly where they are; only the snapshot record is replaced.
       const nextIndex: WatchSidecarIndex = {
@@ -2443,8 +2460,9 @@ export class WatchPrHub {
       const currentTime = Date.parse(current.fetchedAt);
       const incomingTime = Date.parse(snapshot.fetchedAt);
       if (Number.isFinite(currentTime) && Number.isFinite(incomingTime) && currentTime > incomingTime) return;
-      // Both checked against what is stored right now, and merged first so a partial
-      // enrichment written while this refresh was in flight is carried forward, not erased.
+      // The stored snapshot is the base: this write reports nothing, so it must add the
+      // reactions this refresh read and change nothing else. A title, head or check that
+      // landed while the refresh was in flight stays exactly as the writer that saw it left it.
       const next = mergeReactionKnowledge(current, snapshot);
       if (!reactionKnowledgeAdvanced(current, next)) return;
       await mutation.replaceSnapshot(next);
@@ -2487,9 +2505,10 @@ export class WatchPrHub {
             snapshot = current.snapshot;
             changes = [];
           } else {
-            // An ordinary event must not regress reaction knowledge either: this refresh may
-            // have failed a read another in-flight refresh already stored.
-            snapshot = mergeReactionKnowledge(current.snapshot, snapshot);
+            // This event's own snapshot is the base - reporting its change is the point of
+            // the write - but it must not regress reaction knowledge: a read it failed may
+            // already have been stored by another refresh in flight.
+            snapshot = mergeReactionKnowledge(snapshot, current.snapshot);
             changes = snapshotChanges(current.snapshot, snapshot);
           }
         }
