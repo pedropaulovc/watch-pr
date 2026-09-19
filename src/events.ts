@@ -499,7 +499,8 @@ function resolveReactionKnowledge(
   if (
     source.reactionProgress &&
     (!base.reactionProgress ||
-      supersedes && source.reactionProgress.records.length > base.reactionProgress.records.length)
+      supersedes &&
+        (!agrees || source.reactionProgress.records.length > base.reactionProgress.records.length))
   ) {
     return {
       reactions: source.reactions,

@@ -793,6 +793,36 @@ describe("watch-pr event contracts", () => {
     expect(snapshotChanges(stored, merged)).toEqual(["reactions"]);
   });
 
+  it("prefers a newer cursor over a longer cursor for different aggregate counts", () => {
+    const heart = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "now" };
+    const rocket = { id: 2, content: "rocket", author: "bob", authorId: 12, createdAt: "now" };
+    const olderLonger = snapshot({
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      bodyReactionsObservedAt: "2026-09-03T00:01:00.000Z",
+      bodyReactionDetails: undefined,
+      bodyReactionDetailsReadAt: "2026-09-03T00:01:00.000Z",
+      bodyReactionProgress: {
+        records: [heart, rocket],
+        nextUrl: "https://api.github.com/reactions?page=3",
+      },
+    });
+    const newerShorter = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionsObservedAt: "2026-09-03T00:02:00.000Z",
+      bodyReactionDetails: undefined,
+      bodyReactionDetailsReadAt: "2026-09-03T00:02:00.000Z",
+      bodyReactionProgress: {
+        records: [heart],
+        nextUrl: "https://api.github.com/reactions?page=2",
+      },
+    });
+
+    const merged = mergeReactionKnowledge(olderLonger, newerShorter);
+    expect(merged.bodyReactions).toEqual(newerShorter.bodyReactions);
+    expect(merged.bodyReactionProgress).toEqual(newerShorter.bodyReactionProgress);
+    expect(merged.bodyReactionDetailsReadAt).toBe("2026-09-03T00:02:00.000Z");
+  });
+
   it("orders reaction details by each target's own read, not by the snapshot around it", () => {
     const heart = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:00:30.000Z" };
     const rocket = { id: 2, content: "rocket", author: "dave", authorId: 12, createdAt: "2026-09-03T00:02:30.000Z" };
