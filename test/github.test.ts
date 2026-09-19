@@ -43,7 +43,7 @@ describe("GitHub API adapter", () => {
       if (url.includes("/commits/abc/check-runs?page=2")) return Response.json({ check_runs: [{ id: 5, name: "Lint", status: "completed", conclusion: "success", completed_at: "now", started_at: "then", html_url: "https://github.com/lint" }] });
       if (url.endsWith("/commits/abc/statuses?per_page=100")) {
         return Response.json([
-          { id: 9, context: "buildkite/build", state: "pending", created_at: "2026-09-19T12:00:00.000Z", updated_at: "2026-09-19T12:00:00.000Z", target_url: "https://buildkite.com/build/9" },
+          { id: 9, context: "Buildkite/Build", state: "pending", created_at: "2026-09-19T12:00:00.000Z", updated_at: "2026-09-19T12:00:00.000Z", target_url: "https://buildkite.com/build/9" },
           { id: 11, context: "coverage", state: "failure", created_at: "2026-09-19T12:02:00.000Z", updated_at: "2026-09-19T12:02:00.000Z", target_url: "https://example.test/coverage" },
           { id: 10, context: "buildkite/build", state: "success", created_at: "2026-09-19T12:01:00.000Z", updated_at: "2026-09-19T12:01:00.000Z", target_url: "https://buildkite.com/build/10" },
         ]);

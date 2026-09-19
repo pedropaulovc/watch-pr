@@ -1511,6 +1511,106 @@ describe("native monitor feed", () => {
     expect(internals.activeMonitorFeeds.size).toBe(0);
   });
 
+  it("buffers a reopen that arrives while a terminal replay hydrates", async () => {
+    const { hub, storage } = hubFixture();
+    const record = sessionRecord();
+    const seeded = event("event-seeded", snapshot(), { payload: { seeded: "x".repeat(20_000) } });
+    await storeMonitor(storage, { snapshot: seeded.snapshot, events: [seeded] }, record);
+    const internals = hub as unknown as HubInternals;
+    const closedSnapshot = snapshot({
+      state: "closed",
+      fetchedAt: "2026-09-10T12:05:00.000Z",
+    });
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-closed", closedSnapshot, { action: "closed" }),
+      { snapshot: closedSnapshot },
+    );
+
+    let hydrationStartedResolve!: () => void;
+    let releaseHydration!: () => void;
+    const hydrationStarted = new Promise<void>((resolve) => {
+      hydrationStartedResolve = resolve;
+    });
+    const hydrationGate = new Promise<void>((resolve) => {
+      releaseHydration = resolve;
+    });
+    const payloadKey = watchSidecarEventKey(
+      watchStorageKey(userId, repository, number),
+      0,
+    );
+    storage.afterGet = async (key) => {
+      if (key !== payloadKey) return;
+      storage.afterGet = undefined;
+      hydrationStartedResolve();
+      await hydrationGate;
+    };
+
+    const responsePromise = hub.fetch(new Request(
+      `https://watch-pr.test/monitor/${capability}?cursor=event-seeded`,
+    ));
+    await hydrationStarted;
+    const reopenedSnapshot = snapshot({
+      headSha: "reopened",
+      fetchedAt: "2026-09-10T12:06:00.000Z",
+    });
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-reopened", reopenedSnapshot, { action: "reopened" }),
+      { snapshot: reopenedSnapshot },
+    );
+    releaseHydration();
+
+    const feed = feedReader(await responsePromise);
+    await expect(nextMonitorEvent(feed)).resolves.toMatchObject({
+      id: "event-reopened",
+      action: "reopened",
+      terminalState: "watching",
+    });
+    expect(internals.activeMonitorFeeds.size).toBe(1);
+    await feed.reader.cancel();
+    expect(internals.activeMonitorFeeds.size).toBe(0);
+  });
+
+  it("cleans up a pending feed when replay hydration fails", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-09-19T12:00:00.000Z"));
+      const { hub, storage } = hubFixture();
+      const record = sessionRecord();
+      const seeded = event("event-seeded", snapshot(), { payload: { seeded: "x".repeat(20_000) } });
+      await storeMonitor(storage, { snapshot: seeded.snapshot, events: [seeded] }, record);
+      const internals = hub as unknown as HubInternals;
+      const appendedSnapshot = snapshot({
+        headSha: "appended",
+        fetchedAt: "2026-09-10T12:05:00.000Z",
+      });
+      await internals.publishEvent(
+        userId,
+        watch,
+        event("event-appended", appendedSnapshot, { payload: { appended: true } }),
+        { snapshot: appendedSnapshot },
+      );
+      const payloadKey = watchSidecarEventKey(
+        watchStorageKey(userId, repository, number),
+        0,
+      );
+      storage.afterGet = (key) => {
+        if (key === payloadKey) throw new Error("replay hydration failed");
+      };
+
+      await expect(hub.fetch(new Request(
+        `https://watch-pr.test/monitor/${capability}?cursor=event-seeded`,
+      ))).rejects.toThrow("replay hydration failed");
+      expect(internals.activeMonitorFeeds.size).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("stores distinct deliveries that carry no snapshot change", async () => {
     const { hub, storage } = hubFixture();
     await storeMonitor(storage, { snapshot: snapshot({ headSha: "reopened" }), events: [] });

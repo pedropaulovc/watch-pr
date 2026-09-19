@@ -1389,15 +1389,11 @@ export class WatchPrHub {
       }
     }
 
-    let activeFeed: ActiveMonitorFeed | undefined;
+    let activeFeed!: ActiveMonitorFeed;
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
     const body = new ReadableStream<Uint8Array>({
       start: (controller) => {
         streamController = controller;
-        if (currentTerminalState !== "watching") return;
-        for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) {
-          this.closeMonitorFeed(feed);
-        }
         const heartbeat = setInterval(() => {
           if (!activeFeed || activeFeed.closed || !activeFeed.ready) return;
           try {
@@ -1432,56 +1428,53 @@ export class WatchPrHub {
       },
     });
 
-    const hydrated = await readStoredWatchEvents(
-      this.state.storage,
-      watchStorageKey(record.userId, record.repository, record.pullRequestNumber),
-      selected.map((event) => event.id),
-    );
-    const metadataById = new Map(selected.map((event) => [event.id, event]));
-    let events = hydrated.map((event) =>
-      compactMonitorEvent(event, metadataById.get(event.id)?.terminalState ?? "watching"));
-    if (reconciliationAction) {
-      events = [reconciliationMonitorEvent(
-        watchState,
-        reconciliationAction,
-        record.repository,
-        record.pullRequestNumber,
-      )];
-    }
-
-    const confirmed = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
-    if (
-      !confirmed ||
-      confirmed.sessionToken !== record.sessionToken ||
-      confirmed.userId !== record.userId ||
-      confirmed.repository !== record.repository ||
-      confirmed.pullRequestNumber !== record.pullRequestNumber ||
-      confirmed.expiresAt !== record.expiresAt
-    ) {
-      if (activeFeed) this.closeMonitorFeed(activeFeed);
-      return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
-    }
-    if (!activeFeed?.closed) {
-      streamController.enqueue(monitorEncoder.encode(": connected\n\n"));
-      for (const event of events) streamController.enqueue(monitorFrame(event));
-      if (activeFeed) {
-        activeFeed.ready = true;
-        const pending = activeFeed.pending.splice(0);
-        for (const event of pending) {
-          try {
-            streamController.enqueue(monitorFrame(event));
-          } catch {
-            this.closeMonitorFeed(activeFeed);
-            break;
-          }
-          if (event.terminalState !== "watching") {
-            this.closeMonitorFeed(activeFeed);
-            break;
-          }
-        }
-      } else {
-        streamController.close();
+    try {
+      const hydrated = await readStoredWatchEvents(
+        this.state.storage,
+        watchStorageKey(record.userId, record.repository, record.pullRequestNumber),
+        selected.map((event) => event.id),
+      );
+      const metadataById = new Map(selected.map((event) => [event.id, event]));
+      let events = hydrated.map((event) =>
+        compactMonitorEvent(event, metadataById.get(event.id)?.terminalState ?? "watching"));
+      if (reconciliationAction) {
+        events = [reconciliationMonitorEvent(
+          watchState,
+          reconciliationAction,
+          record.repository,
+          record.pullRequestNumber,
+        )];
       }
+
+      const confirmed = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
+      if (
+        !confirmed ||
+        confirmed.sessionToken !== record.sessionToken ||
+        confirmed.userId !== record.userId ||
+        confirmed.repository !== record.repository ||
+        confirmed.pullRequestNumber !== record.pullRequestNumber ||
+        confirmed.expiresAt !== record.expiresAt
+      ) {
+        this.closeMonitorFeed(activeFeed);
+        return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+      }
+      if (!activeFeed.closed) {
+        for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) {
+          if (feed !== activeFeed) this.closeMonitorFeed(feed);
+        }
+        const pending = activeFeed.pending.splice(0);
+        const finalTerminalState = pending.at(-1)?.terminalState ?? currentTerminalState;
+        const queued = finalTerminalState === "watching"
+          ? [...events, ...pending].filter((event) => event.terminalState === "watching")
+          : [...events, ...pending];
+        activeFeed.ready = true;
+        streamController.enqueue(monitorEncoder.encode(": connected\n\n"));
+        for (const event of queued) streamController.enqueue(monitorFrame(event));
+        if (finalTerminalState !== "watching") this.closeMonitorFeed(activeFeed);
+      }
+    } catch (error) {
+      this.closeMonitorFeed(activeFeed);
+      throw error;
     }
     return new Response(body, {
       headers: {

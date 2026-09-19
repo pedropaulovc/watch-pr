@@ -248,7 +248,7 @@ describe("watch-pr event contracts", () => {
   it("tracks commit status waves by context when GitHub assigns a new status ID", () => {
     const pendingStatus = {
       id: 9,
-      name: "buildkite/build",
+      name: "Buildkite/Build",
       status: "completed",
       conclusion: "pending",
       completedAt: "2026-09-19T12:00:00.000Z",
@@ -259,13 +259,14 @@ describe("watch-pr event contracts", () => {
     const completedStatus = {
       ...pendingStatus,
       id: 10,
+      name: "buildkite/build",
       conclusion: "success",
       completedAt: "2026-09-19T12:01:00.000Z",
       url: "https://buildkite.com/build/10",
     };
 
     expect(monitorEventDetails(snapshot(), snapshot({ checks: [pendingStatus] }))).toEqual([
-      "checks: buildkite/build -> pending",
+      "checks: Buildkite/Build -> pending",
     ]);
     expect(monitorEventDetails(
       snapshot({ checks: [pendingStatus] }),

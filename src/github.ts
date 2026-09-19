@@ -188,9 +188,10 @@ function latestCommitStatuses(records: GithubRecord[]): PullRequestCheck[] {
   const latestByContext = new Map<string, PullRequestCheck>();
   for (const [index, record] of records.entries()) {
     const candidate = normalizeCommitStatus(record, index);
-    const previous = latestByContext.get(candidate.name);
+    const contextKey = candidate.name.toLowerCase();
+    const previous = latestByContext.get(contextKey);
     if (!previous) {
-      latestByContext.set(candidate.name, candidate);
+      latestByContext.set(contextKey, candidate);
       continue;
     }
     const candidateTime = Date.parse(candidate.completedAt ?? candidate.startedAt ?? "");
@@ -199,7 +200,7 @@ function latestCommitStatuses(records: GithubRecord[]): PullRequestCheck[] {
     const previousTimestamp = Number.isNaN(previousTime) ? Number.NEGATIVE_INFINITY : previousTime;
     if (candidateTimestamp > previousTimestamp ||
       (candidateTimestamp === previousTimestamp && candidate.id > previous.id)) {
-      latestByContext.set(candidate.name, candidate);
+      latestByContext.set(contextKey, candidate);
     }
   }
   return [...latestByContext.values()];
