@@ -248,6 +248,31 @@ function isPullRequestIssue(value: unknown): boolean {
   return Boolean(value && typeof value === "object" && (value as Record<string, unknown>).pull_request);
 }
 
+/**
+ * Comment content, without the reaction details that ride along on the same record: those
+ * are compared as reactions so an unknown-to-known reaction read is not read as an edit.
+ */
+function commentsKey(comments: PullRequestComment[]): string {
+  return JSON.stringify(comments, (key, value: unknown) => (key === "reactionDetails" ? undefined : value));
+}
+
+function reactionDetailsChanged(
+  previous: PullRequestReaction[] | undefined,
+  current: PullRequestReaction[] | undefined,
+): boolean {
+  // Unknown on either side is a baseline being learned or lost, not reaction activity.
+  if (previous === undefined || current === undefined) return false;
+  return JSON.stringify(previous) !== JSON.stringify(current);
+}
+
+function commentReactionsChanged(previous: PullRequestComment[], current: PullRequestComment[]): boolean {
+  const previousById = new Map(previous.map((comment) => [comment.id, comment] as const));
+  return current.some((comment) => {
+    const prior = previousById.get(comment.id);
+    return prior !== undefined && reactionDetailsChanged(prior.reactionDetails, comment.reactionDetails);
+  });
+}
+
 export function snapshotChanges(
   previous: PullRequestSnapshot | null,
   current: PullRequestSnapshot,
@@ -268,13 +293,15 @@ export function snapshotChanges(
     previous.headRefName !== current.headRefName ||
     previous.headSha !== current.headSha
   ) changes.push("mergeability");
-  if (JSON.stringify(previous.comments) !== JSON.stringify(current.comments)) changes.push("comments");
+  if (commentsKey(previous.comments) !== commentsKey(current.comments)) changes.push("comments");
   if (JSON.stringify(previous.reviews) !== JSON.stringify(current.reviews)) changes.push("reviews");
-  if (JSON.stringify(previous.reviewComments) !== JSON.stringify(current.reviewComments)) changes.push("review_comments");
+  if (commentsKey(previous.reviewComments) !== commentsKey(current.reviewComments)) changes.push("review_comments");
   if (JSON.stringify(previous.checks) !== JSON.stringify(current.checks)) changes.push("checks");
   if (
     JSON.stringify(previous.bodyReactions) !== JSON.stringify(current.bodyReactions) ||
-    JSON.stringify(previous.bodyReactionDetails) !== JSON.stringify(current.bodyReactionDetails)
+    reactionDetailsChanged(previous.bodyReactionDetails, current.bodyReactionDetails) ||
+    commentReactionsChanged(previous.comments, current.comments) ||
+    commentReactionsChanged(previous.reviewComments, current.reviewComments)
   ) changes.push("reactions");
   if (JSON.stringify(previous.threads) !== JSON.stringify(current.threads)) changes.push("review_threads");
   return changes;
@@ -519,7 +546,8 @@ function commentReactionTarget(comment: PullRequestComment, kind: "comment" | "f
 
 interface ReactionGroup {
   target: ReactionTarget;
-  reactions: PullRequestReaction[];
+  /** Undefined is unknown: never read, or read and failed. It is not "no reactions". */
+  reactions: PullRequestReaction[] | undefined;
 }
 
 /** Every reaction target the snapshot knows, including the ones carrying no reactions. */
@@ -544,7 +572,7 @@ function reactionGroups(snapshot: PullRequestSnapshot): Map<string, ReactionGrou
 
 export function snapshotReactions(snapshot: PullRequestSnapshot): AttributedReaction[] {
   return [...reactionGroups(snapshot).values()]
-    .flatMap(({ target, reactions }) => reactions.map((reaction) => ({ reaction, target })));
+    .flatMap(({ target, reactions }) => (reactions ?? []).map((reaction) => ({ reaction, target })));
 }
 
 function reactionTargetDescription(target: ReactionTarget): string {
@@ -566,7 +594,8 @@ function reactionChangeLine(
 }
 
 function reactionIdentity(reaction: PullRequestReaction): string {
-  return `${reaction.content}\u0000${reaction.author ?? ""}`;
+  // Logins are renameable, so the actor's numeric ID identifies them whenever GitHub gave one.
+  return `${reaction.content}\u0000${reaction.authorId ?? `@${reaction.author ?? ""}`}`;
 }
 
 function reactionTargetDetails(
@@ -598,16 +627,19 @@ function reactionTargetDetails(
  * reconciliation suppresses reaction history, and it never reaches here: `monitorEventDetails`
  * routes a null predecessor to `monitorReconciliationDetails`. A target that disappeared is
  * reported by its own deletion line, so its reactions are not repeated here.
+ *
+ * A target whose previous reactions are unknown - a snapshot persisted before individual
+ * reactions existed, or a read that failed - reports nothing on the refresh that first learns
+ * them: those reactions are a baseline, not activity. It is diffed normally from then on.
  */
 function reactionDetails(previous: PullRequestSnapshot, current: PullRequestSnapshot): string[] {
   const previousGroups = reactionGroups(previous);
   const lines: string[] = [];
   for (const [label, group] of reactionGroups(current)) {
-    lines.push(...reactionTargetDetails(
-      previousGroups.get(label)?.reactions ?? [],
-      group.reactions,
-      group.target,
-    ));
+    if (group.reactions === undefined) continue;
+    const prior = previousGroups.get(label);
+    if (prior && prior.reactions === undefined) continue;
+    lines.push(...reactionTargetDetails(prior?.reactions ?? [], group.reactions, group.target));
   }
   return lines;
 }

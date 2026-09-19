@@ -7,6 +7,10 @@ import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestCo
 
 export type McpOutputMode = "brief" | "full";
 
+/** A brief snapshot spends at most this many lines, and this many characters, on reactions. */
+const MAX_BRIEF_REACTION_LINES = 12;
+const MAX_BRIEF_REACTION_LENGTH = 1_000;
+
 export interface WatchRegistration {
   key: string;
   repository: string;
@@ -100,10 +104,34 @@ function feedbackLines(threads: PullRequestThread[], comments: PullRequestCommen
     });
 }
 
-function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): string[] {
-  const comments = snapshot.comments.filter((comment) => comment.author !== login);
-  const reviewComments = snapshot.reviewComments.filter((comment) => comment.author !== login);
-  const reviews = snapshot.reviews.filter((review) => review.author !== login);
+/**
+ * A brief listing summarises many PRs at once, so the attributed reaction lines of one
+ * snapshot are bounded; the overflow is reported as a count rather than dropped silently.
+ */
+function briefReactionLines(snapshot: PullRequestSnapshot, user: GithubUser): string[] {
+  // Reactions the watcher left are their own activity; everyone else's is the signal.
+  // The actor's numeric ID is the identity: a renamed or recased login must still be theirs.
+  const lines = snapshotReactions(snapshot)
+    .filter((entry) => (entry.reaction.authorId === null
+      ? entry.reaction.author !== user.login
+      : entry.reaction.authorId !== user.id))
+    .map(reactionStateLine)
+    .sort();
+  const kept: string[] = [];
+  let length = 0;
+  for (const line of lines) {
+    if (kept.length === MAX_BRIEF_REACTION_LINES || length + line.length > MAX_BRIEF_REACTION_LENGTH) break;
+    kept.push(line);
+    length += line.length;
+  }
+  if (kept.length < lines.length) kept.push(`+${lines.length - kept.length} more reactions`);
+  return kept;
+}
+
+function briefSnapshotLines(snapshot: PullRequestSnapshot, user: GithubUser): string[] {
+  const comments = snapshot.comments.filter((comment) => comment.author !== user.login);
+  const reviewComments = snapshot.reviewComments.filter((comment) => comment.author !== user.login);
+  const reviews = snapshot.reviews.filter((review) => review.author !== user.login);
   const mergeableState = snapshot.mergeableState?.toUpperCase();
   const mergeable = snapshot.mergeable === null ? "unknown" : snapshot.mergeable ? "yes" : "no";
   const lines = [
@@ -111,10 +139,7 @@ function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): strin
     `head: ${snapshot.headRefName}@${snapshot.headSha}`,
     `mergeable: ${mergeable}${mergeableState ? ` (${mergeableState})` : ""}`,
     ...checkLines(snapshot.checks),
-    // Reactions the watcher left are their own activity; everyone else's is the signal.
-    ...snapshotReactions(snapshot)
-      .filter((entry) => entry.reaction.author !== login)
-      .map(reactionStateLine),
+    ...briefReactionLines(snapshot, user),
     ...reviews.map((review) => `review ${review.author ?? "unknown"}: ${review.state}${review.submittedAt ? ` @${review.submittedAt}` : ""}`),
     `reviews: ${reviews.length}`,
     `comments: ${comments.length}`,
@@ -127,9 +152,9 @@ function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): strin
 }
 
 
-function briefRegistration(registration: WatchRegistration, login: string): string[] {
+function briefRegistration(registration: WatchRegistration, user: GithubUser): string[] {
   const lines = [`watching ${registration.key}`, `resource: ${registration.resourceUri}`];
-  if (registration.snapshot) lines.push(...briefSnapshotLines(registration.snapshot, login));
+  if (registration.snapshot) lines.push(...briefSnapshotLines(registration.snapshot, user));
   else if (registration.refreshScheduled) lines.push("snapshot: refresh scheduled");
   return lines;
 }
@@ -164,7 +189,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     },
     async ({ repository, number, mode }) => {
       const registration = await context.watch(repository, number);
-      return textResult(registration, mode, briefRegistration(registration, context.user.login));
+      return textResult(registration, mode, briefRegistration(registration, context.user));
     },
   );
 
@@ -210,7 +235,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       return textResult(
         registrations,
         mode,
-        registrations.flatMap((registration) => briefRegistration(registration, context.user.login)),
+        registrations.flatMap((registration) => briefRegistration(registration, context.user)),
       );
     },
   );
@@ -225,7 +250,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     async ({ repository, number, mode }) => {
       const state = await context.readWatch(repository, number);
       const lines = state.snapshot
-        ? briefSnapshotLines(state.snapshot, context.user.login)
+        ? briefSnapshotLines(state.snapshot, context.user)
         : ["snapshot: unavailable"];
       return textResult(state.snapshot, mode, lines);
     },

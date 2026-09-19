@@ -91,7 +91,10 @@ export interface PullRequestReaction {
   id: number;
   /** GitHub reaction content key, for example `+1` or `heart`. */
   content: string;
+  /** Display login at read time; renameable, so never an identity. */
   author: string | null;
+  /** Stable GitHub user ID of the actor, which a rename or a case change does not move. */
+  authorId: number | null;
   createdAt: string | null;
 }
 
@@ -102,7 +105,8 @@ export interface PullRequestComment {
   createdAt: string | null;
   updatedAt: string | null;
   reactions: ReactionCounts;
-  reactionDetails: PullRequestReaction[];
+  /** Undefined is unknown, not empty: persisted before individual reactions, or unread. */
+  reactionDetails?: PullRequestReaction[];
   path?: string;
   line?: number | null;
   startLine?: number | null;
@@ -156,7 +160,8 @@ export interface PullRequestSnapshot {
   author: string | null;
   fetchedAt: string;
   bodyReactions: ReactionCounts;
-  bodyReactionDetails: PullRequestReaction[];
+  /** Undefined is unknown, not empty: persisted before individual reactions, or unread. */
+  bodyReactionDetails?: PullRequestReaction[];
   comments: PullRequestComment[];
   reviews: PullRequestReview[];
   reviewComments: PullRequestComment[];

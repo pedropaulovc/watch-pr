@@ -263,33 +263,13 @@ function emptyWatchState(): StoredWatchState {
 
 /**
  * The one read boundary that repairs persisted snapshots written before a field existed:
- * fork routing, and the per-reaction detail arrays that replaced aggregate-only reactions.
- * Every stored snapshot reaches a caller through here, so nothing downstream re-checks.
+ * fork routing. Reaction detail arrays are deliberately not repaired here - a snapshot that
+ * predates individual reactions has unknown reactions, not empty ones, and claiming empty
+ * would make every reaction already on the PR look newly created on the next refresh.
  */
 function normalizePullRequestSnapshot(snapshot: PullRequestSnapshot | null): PullRequestSnapshot | null {
-  if (snapshot === null) return snapshot;
-  const comments = normalizeCommentReactions(snapshot.comments);
-  const reviewComments = normalizeCommentReactions(snapshot.reviewComments);
-  if (
-    snapshot.headRepository !== undefined &&
-    snapshot.bodyReactionDetails !== undefined &&
-    comments === snapshot.comments &&
-    reviewComments === snapshot.reviewComments
-  ) return snapshot;
-  return {
-    ...snapshot,
-    headRepository: snapshot.headRepository ?? null,
-    bodyReactionDetails: snapshot.bodyReactionDetails ?? [],
-    comments,
-    reviewComments,
-  };
-}
-
-function normalizeCommentReactions(comments: PullRequestComment[]): PullRequestComment[] {
-  if (comments.every((comment) => comment.reactionDetails !== undefined)) return comments;
-  return comments.map((comment) => (
-    comment.reactionDetails === undefined ? { ...comment, reactionDetails: [] } : comment
-  ));
+  if (snapshot === null || snapshot.headRepository !== undefined) return snapshot;
+  return { ...snapshot, headRepository: null };
 }
 
 function normalizeStoredWatchState(state: StoredWatchState): StoredWatchState {
@@ -382,10 +362,11 @@ function isPullRequestReaction(value: unknown): value is PullRequestReaction {
   return Number.isSafeInteger(value.id) &&
     typeof value.content === "string" &&
     isNullableString(value.author) &&
+    isOptionalNullableSafeInteger(value, "authorId") &&
     isNullableString(value.createdAt);
 }
 
-/** Snapshots stored before attributed reactions omitted this persisted field. */
+/** Undefined is the persisted form of unknown: stored before individual reactions, or unread. */
 function isOptionalReactionDetails(value: unknown): boolean {
   return value === undefined || isArrayOf(value, isPullRequestReaction);
 }
@@ -2219,7 +2200,7 @@ export class WatchPrHub {
       }
       let snapshot = previous.snapshot;
       try {
-        snapshot = await pullRequestSnapshot(githubToken, targetRepository, number);
+        snapshot = await pullRequestSnapshot(githubToken, targetRepository, number, previous.snapshot);
       } catch (error) {
         if (isGithubAuthorizationError(error)) {
           invalidSessionTokens.add(sessionToken);
@@ -2282,7 +2263,7 @@ export class WatchPrHub {
     const parsed = parseWatchKey(key);
     let snapshot;
     try {
-      snapshot = await pullRequestSnapshot(githubToken, parsed.repository, parsed.number);
+      snapshot = await pullRequestSnapshot(githubToken, parsed.repository, parsed.number, initialState.snapshot);
     } catch (error) {
       if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken, githubToken);
       return;

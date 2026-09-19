@@ -554,16 +554,16 @@ describe("watch-pr event contracts", () => {
     const before = snapshot({ comments: [comment], reviewComments: [reviewComment] });
     const after = snapshot({
       bodyReactions: { "+1": 1, total_count: 1 },
-      bodyReactionDetails: [{ id: 900, content: "+1", author: "alice", createdAt: "2026-09-19T12:05:00.000Z" }],
+      bodyReactionDetails: [{ id: 900, content: "+1", author: "alice", authorId: 11, createdAt: "2026-09-19T12:05:00.000Z" }],
       comments: [{
         ...comment,
         reactions: { heart: 1, total_count: 1 },
-        reactionDetails: [{ id: 901, content: "heart", author: "alice", createdAt: "2026-09-19T12:06:00.000Z" }],
+        reactionDetails: [{ id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-19T12:06:00.000Z" }],
       }],
       reviewComments: [{
         ...reviewComment,
         reactions: { eyes: 1, total_count: 1 },
-        reactionDetails: [{ id: 902, content: "eyes", author: "dave", createdAt: "2026-09-19T12:07:00.000Z" }],
+        reactionDetails: [{ id: 902, content: "eyes", author: "dave", authorId: 12, createdAt: "2026-09-19T12:07:00.000Z" }],
       }],
     });
 
@@ -588,12 +588,12 @@ describe("watch-pr event contracts", () => {
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: { rocket: 1, total_count: 1 },
-      reactionDetails: [{ id: 903, content: "rocket", author: "alice", createdAt: "2026-09-19T12:08:00.000Z" }],
+      reactionDetails: [{ id: 903, content: "rocket", author: "alice", authorId: 11, createdAt: "2026-09-19T12:08:00.000Z" }],
       htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
     };
     const current = snapshot({
       bodyReactions: { hooray: 1, total_count: 1 },
-      bodyReactionDetails: [{ id: 904, content: "hooray", author: "alice", createdAt: "2026-09-19T12:09:00.000Z" }],
+      bodyReactionDetails: [{ id: 904, content: "hooray", author: "alice", authorId: 11, createdAt: "2026-09-19T12:09:00.000Z" }],
       comments: [reacted],
     });
 
@@ -613,20 +613,55 @@ describe("watch-pr event contracts", () => {
   });
 
   it("reports a reaction swap on one target as a removal and an addition", () => {
-    const laugh = { id: 905, content: "laugh", author: "alice", createdAt: "2026-09-19T12:10:00.000Z" };
+    const laugh = { id: 905, content: "laugh", author: "alice", authorId: 11, createdAt: "2026-09-19T12:10:00.000Z" };
     const before = snapshot({
       bodyReactions: { laugh: 1, total_count: 1 },
       bodyReactionDetails: [laugh],
     });
     const after = snapshot({
       bodyReactions: { confused: 1, total_count: 1 },
-      bodyReactionDetails: [{ id: 906, content: "confused", author: "erin", createdAt: "2026-09-19T12:11:00.000Z" }],
+      bodyReactionDetails: [{ id: 906, content: "confused", author: "erin", authorId: 13, createdAt: "2026-09-19T12:11:00.000Z" }],
     });
 
     expect(monitorEventDetails(before, after)).toEqual([
       "reaction created: @erin CONFUSED on PR #7 @author https://github.com/owner/repo/pull/7",
       "reaction deleted: @alice LAUGH from PR #7 @author https://github.com/owner/repo/pull/7",
     ]);
+  });
+
+  it("treats unknown reactions as a baseline and diffs the target from then on", () => {
+    const reaction = { id: 907, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-19T12:12:00.000Z" };
+    const counts = { heart: 1, total_count: 1 };
+    // A snapshot persisted before individual reactions existed: counted, never enumerated.
+    const legacy = snapshot({ bodyReactions: counts, bodyReactionDetails: undefined });
+    const enriched = snapshot({ bodyReactions: counts, bodyReactionDetails: [reaction] });
+    const added = snapshot({
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      bodyReactionDetails: [reaction, { id: 908, content: "rocket", author: "dave", authorId: 12, createdAt: "2026-09-19T12:13:00.000Z" }],
+    });
+
+    // Learning the baseline is neither a reaction change nor reportable activity.
+    expect(monitorEventDetails(legacy, enriched)).toEqual([]);
+    expect(snapshotChanges(legacy, enriched)).toEqual([]);
+    expect(monitorEventDetails(enriched, added)).toEqual([
+      "reaction created: @dave ROCKET on PR #7 @author https://github.com/owner/repo/pull/7",
+    ]);
+    // A read that failed leaves the target unknown again; that is not a deletion.
+    const unread = snapshot({ bodyReactions: { heart: 1, rocket: 1, total_count: 2 }, bodyReactionDetails: undefined });
+    expect(monitorEventDetails(added, unread)).toEqual([]);
+  });
+
+  it("identifies a reaction actor by GitHub ID, so a rename is not a swap", () => {
+    const before = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [{ id: 909, content: "heart", author: "Alice", authorId: 11, createdAt: "2026-09-19T12:14:00.000Z" }],
+    });
+    const renamed = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [{ id: 909, content: "heart", author: "alice-codes", authorId: 11, createdAt: "2026-09-19T12:14:00.000Z" }],
+    });
+
+    expect(monitorEventDetails(before, renamed)).toEqual([]);
   });
 
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {

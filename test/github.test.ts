@@ -1,5 +1,42 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { monitorEventDetails } from "../src/events";
 import { githubUser, pullRequestSnapshot } from "../src/github";
+
+/** A PR with no comments, reviews, or checks, so only its body carries reactions. */
+function stubPullRequest(options: {
+  title: string;
+  bodyReactions: Record<string, number>;
+  reactions: (url: string) => Response;
+  requested: string[];
+}): void {
+  globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    options.requested.push(url);
+    if (url.includes("/reactions")) return options.reactions(url);
+    if (url.endsWith("/pulls/7")) {
+      return Response.json({
+        number: 7,
+        html_url: "https://github.com/owner/repo/pull/7",
+        title: options.title,
+        state: "open",
+        user: { login: "author" },
+        head: { ref: "feature", sha: null },
+        base: { ref: "main" },
+      });
+    }
+    if (url.endsWith("/issues/7")) return Response.json({ reactions: options.bodyReactions });
+    if (url.endsWith("/issues/7/comments?per_page=100")) return Response.json([]);
+    if (url.endsWith("/pulls/7/comments?per_page=100")) return Response.json([]);
+    if (url.endsWith("/pulls/7/reviews?per_page=100")) return Response.json([]);
+    if (url.endsWith("/graphql")) {
+      return Response.json({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } });
+    }
+    throw new Error(`unexpected GitHub URL ${url}`);
+  });
+}
+
+const HEART = { id: 901, content: "heart", user: { login: "alice", id: 11 }, created_at: "2026-09-19T12:00:00.000Z" };
+const ROCKET = { id: 902, content: "rocket", user: { login: "dave", id: 12 }, created_at: "2026-09-19T12:05:00.000Z" };
 
 const originalFetch = globalThis.fetch;
 
@@ -40,10 +77,10 @@ describe("GitHub API adapter", () => {
         ]);
       }
       if (url.endsWith("/issues/7/reactions?per_page=100")) {
-        return Response.json([{ id: 900, content: "eyes", user: { login: "alice" }, created_at: "2026-09-19T12:00:00.000Z" }]);
+        return Response.json([{ id: 900, content: "eyes", user: { login: "alice", id: 11 }, created_at: "2026-09-19T12:00:00.000Z" }]);
       }
       if (url.endsWith("/issues/comments/1/reactions?per_page=100")) {
-        return Response.json([{ id: 901, content: "+1", user: { login: "bob" }, created_at: "2026-09-19T12:01:00.000Z" }]);
+        return Response.json([{ id: 901, content: "+1", user: { login: "bob", id: 12 }, created_at: "2026-09-19T12:01:00.000Z" }]);
       }
       if (url.endsWith("/pulls/comments/3/reactions?per_page=100")) {
         return Response.json([{ id: 902, content: "heart", user: { login: "carol" }, created_at: "2026-09-19T12:02:00.000Z" }]);
@@ -81,11 +118,11 @@ describe("GitHub API adapter", () => {
     expect(result.headRepository).toBe("fork/repo");
     expect(result.bodyReactions).toEqual({ eyes: 2, total_count: 2 });
     expect(result.bodyReactionDetails).toEqual([
-      { id: 900, content: "eyes", author: "alice", createdAt: "2026-09-19T12:00:00.000Z" },
+      { id: 900, content: "eyes", author: "alice", authorId: 11, createdAt: "2026-09-19T12:00:00.000Z" },
     ]);
     expect(result.comments[0]).toMatchObject({ id: 1, author: "reviewer", reactions: { "+1": 1 } });
     expect(result.comments[0].reactionDetails).toEqual([
-      { id: 901, content: "+1", author: "bob", createdAt: "2026-09-19T12:01:00.000Z" },
+      { id: 901, content: "+1", author: "bob", authorId: 12, createdAt: "2026-09-19T12:01:00.000Z" },
     ]);
     // A target whose summary count is zero is never read individually.
     expect(result.comments[1].reactionDetails).toEqual([]);
@@ -93,7 +130,8 @@ describe("GitHub API adapter", () => {
     expect(result.reviews[0]).toMatchObject({ state: "APPROVED", author: "reviewer" });
     expect(result.reviewComments[0]).toMatchObject({ path: "src/index.ts", reactions: { heart: 1 } });
     expect(result.reviewComments[0].reactionDetails).toEqual([
-      { id: 902, content: "heart", author: "carol", createdAt: "2026-09-19T12:02:00.000Z" },
+      // GitHub omitted the actor ID here, so only the login is known.
+      { id: 902, content: "heart", author: "carol", authorId: null, createdAt: "2026-09-19T12:02:00.000Z" },
     ]);
     expect(result.checks[0]).toMatchObject({ name: "CI", conclusion: "failure", kind: "check_run" });
     expect(result.checks.filter((check) => check.kind === "commit_status")).toEqual([
@@ -174,8 +212,75 @@ describe("GitHub API adapter", () => {
     expect(reactionRequests).toBe(19);
     expect(peakInFlight).toBe(8);
     expect(result.bodyReactionDetails).toHaveLength(1);
-    expect(result.comments.every((entry) => entry.reactionDetails.length === 1)).toBe(true);
-    expect(result.reviewComments.every((entry) => entry.reactionDetails.length === 1)).toBe(true);
+    expect(result.comments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
+    expect(result.reviewComments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
+  });
+
+  it("reuses stored reaction details while the summary counts are unchanged", async () => {
+    const requested: string[] = [];
+    stubPullRequest({ title: "first", bodyReactions: { heart: 1, total_count: 1 }, reactions: () => Response.json([HEART]), requested });
+    const first = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+
+    requested.length = 0;
+    stubPullRequest({
+      title: "second",
+      bodyReactions: { heart: 1, total_count: 1 },
+      reactions: () => Response.json([HEART]),
+      requested,
+    });
+    const second = await pullRequestSnapshot("token", "owner/repo", 7, first);
+    // The minute poll costs nothing for a target GitHub still summarises the same way.
+    expect(requested.some((url) => url.includes("/reactions"))).toBe(false);
+    expect(second.bodyReactionDetails).toEqual(first.bodyReactionDetails);
+    expect(second.title).toBe("second");
+
+    requested.length = 0;
+    stubPullRequest({
+      title: "third",
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      reactions: () => Response.json([HEART, ROCKET]),
+      requested,
+    });
+    const third = await pullRequestSnapshot("token", "owner/repo", 7, second);
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(third.bodyReactionDetails).toHaveLength(2);
+  });
+
+  it("rolls a failed reaction read back to its stored counts so the next refresh retries", async () => {
+    const requested: string[] = [];
+    stubPullRequest({ title: "seed", bodyReactions: { heart: 1, total_count: 1 }, reactions: () => Response.json([HEART]), requested });
+    const stored = await pullRequestSnapshot("token", "owner/repo", 7);
+
+    requested.length = 0;
+    stubPullRequest({
+      title: "upstream moved",
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      reactions: () => new Response("Not Found", { status: 404 }),
+      requested,
+    });
+    const failed = await pullRequestSnapshot("token", "owner/repo", 7, stored);
+    // The target keeps its whole stored state; everything else this refresh read advances.
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(failed.bodyReactions).toEqual({ heart: 1, total_count: 1 });
+    expect(failed.bodyReactionDetails).toEqual(stored.bodyReactionDetails);
+    expect(failed.title).toBe("upstream moved");
+    expect(monitorEventDetails(stored, failed)).toEqual([]);
+
+    requested.length = 0;
+    stubPullRequest({
+      title: "upstream moved",
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      reactions: () => Response.json([HEART, ROCKET]),
+      requested,
+    });
+    // The same upstream summary is still a delta against the rolled-back counts, so it retries.
+    const recovered = await pullRequestSnapshot("token", "owner/repo", 7, failed);
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(recovered.bodyReactions).toEqual({ heart: 1, rocket: 1, total_count: 2 });
+    expect(monitorEventDetails(failed, recovered)).toEqual([
+      "reaction created: @dave ROCKET on PR #7 @author https://github.com/owner/repo/pull/7",
+    ]);
   });
 
   it("reads the authenticated GitHub user profile", async () => {

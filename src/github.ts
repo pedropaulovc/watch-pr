@@ -147,13 +147,29 @@ function reactionTotal(counts: ReactionCounts): number {
   return sum;
 }
 
+function userId(record: GithubRecord, key = "user"): number | null {
+  const user = record[key];
+  if (!user || typeof user !== "object") return null;
+  const id = (user as GithubRecord).id;
+  return typeof id === "number" ? id : null;
+}
+
 function normalizeReaction(record: GithubRecord): PullRequestReaction {
   return {
     id: numberValue(record, "id"),
     content: stringValue(record, "content") ?? "",
     author: userLogin(record),
+    authorId: userId(record),
     createdAt: stringValue(record, "created_at"),
   };
+}
+
+function sameReactionCounts(previous: ReactionCounts, current: ReactionCounts): boolean {
+  const keys = new Set([...Object.keys(previous), ...Object.keys(current)]);
+  for (const key of keys) {
+    if (previous[key] !== current[key]) return false;
+  }
+  return true;
 }
 
 async function mapBounded<T, R>(
@@ -181,16 +197,41 @@ async function reactionRecords(token: string, path: string): Promise<PullRequest
     .filter((reaction) => reaction.id > 0 && reaction.content !== "");
 }
 
+interface ReactionState {
+  reactions: ReactionCounts;
+  reactionDetails?: PullRequestReaction[];
+}
+
+interface ReactionTargetRead {
+  /** Index of the target slot this read fills. */
+  slot: number;
+  path: string;
+  /** Last stored state of this target, kept whole when the read fails. */
+  fallback: ReactionState | undefined;
+}
+
 interface SnapshotReactions {
-  bodyReactionDetails: PullRequestReaction[];
+  bodyReactions: ReactionCounts;
+  bodyReactionDetails: PullRequestReaction[] | undefined;
   comments: PullRequestComment[];
   reviewComments: PullRequestComment[];
 }
 
 /**
- * One wave for the whole snapshot: every reacted target across the PR body, top-level
- * comments, and inline review comments shares a single `REACTION_CONCURRENCY` budget.
- * Targets whose summary count is zero never enter the wave, so they cost no request.
+ * One wave for the whole snapshot: every target that still needs a read, across the PR body,
+ * top-level comments, and inline review comments, shares a single `REACTION_CONCURRENCY`
+ * budget. Two kinds of target never spend a request: a zero summary count is authoritative
+ * for "no reactions", and an unchanged summary count over known details means the stored
+ * details still describe the target. The residual blind spot is a swap that leaves every
+ * count identical - one `heart` replaced by another actor's `heart` between two refreshes -
+ * which the summary cannot express and only a per-target read would reveal.
+ *
+ * A failed read is isolated to its own target, and the target keeps its whole previous
+ * reaction state, counts included: the counts are what the next refresh compares against, so
+ * rolling them back with the details is what makes the next refresh notice the same delta
+ * and read the target again instead of trusting stale details forever. A target with no
+ * stored details stays unknown, which also forces a retry. Every other snapshot field still
+ * advances.
  */
 async function snapshotReactions(
   token: string,
@@ -199,24 +240,57 @@ async function snapshotReactions(
   bodyReactions: ReactionCounts,
   comments: PullRequestComment[],
   reviewComments: PullRequestComment[],
+  previous: PullRequestSnapshot | null,
 ): Promise<SnapshotReactions> {
-  const paths: string[] = [];
-  const requestIndex = (counts: ReactionCounts, path: string): number =>
-    (reactionTotal(counts) > 0 ? paths.push(path) - 1 : -1);
-  const bodyIndex = requestIndex(bodyReactions, `/repos/${repository}/issues/${number}/reactions`);
-  const commentIndexes = comments.map((comment) =>
-    requestIndex(comment.reactions, `/repos/${repository}/issues/comments/${comment.id}/reactions`));
-  const reviewCommentIndexes = reviewComments.map((comment) =>
-    requestIndex(comment.reactions, `/repos/${repository}/pulls/comments/${comment.id}/reactions`));
-  if (paths.length === 0) return { bodyReactionDetails: [], comments, reviewComments };
+  // One slot per reaction target, seeded with what this refresh already knows: the summary
+  // counts GitHub returned, and details only once they are known.
+  const slots: ReactionState[] = [];
+  const reads: ReactionTargetRead[] = [];
+  const plan = (reactions: ReactionCounts, path: string, prior: ReactionState | undefined): number => {
+    const slot = slots.push({ reactions }) - 1;
+    if (reactionTotal(reactions) === 0) slots[slot].reactionDetails = [];
+    else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) slots[slot].reactionDetails = prior.reactionDetails;
+    else reads.push({ slot, path, fallback: prior?.reactionDetails ? prior : undefined });
+    return slot;
+  };
 
-  const details = await mapBounded(paths, REACTION_CONCURRENCY, (path) => reactionRecords(token, path));
-  const attach = (comment: PullRequestComment, index: number): PullRequestComment =>
-    (index < 0 ? comment : { ...comment, reactionDetails: details[index] });
+  const previousComments = new Map(previous?.comments.map((comment) => [comment.id, comment] as const));
+  const previousReviewComments = new Map(previous?.reviewComments.map((comment) => [comment.id, comment] as const));
+  const bodySlot = plan(
+    bodyReactions,
+    `/repos/${repository}/issues/${number}/reactions`,
+    previous ? { reactions: previous.bodyReactions, reactionDetails: previous.bodyReactionDetails } : undefined,
+  );
+  const commentSlots = comments.map((comment) => plan(
+    comment.reactions,
+    `/repos/${repository}/issues/comments/${comment.id}/reactions`,
+    previousComments.get(comment.id),
+  ));
+  const reviewCommentSlots = reviewComments.map((comment) => plan(
+    comment.reactions,
+    `/repos/${repository}/pulls/comments/${comment.id}/reactions`,
+    previousReviewComments.get(comment.id),
+  ));
+
+  const states = await mapBounded(reads, REACTION_CONCURRENCY, async (read): Promise<ReactionState> => {
+    try {
+      return { reactions: slots[read.slot].reactions, reactionDetails: await reactionRecords(token, read.path) };
+    } catch {
+      return read.fallback ?? slots[read.slot];
+    }
+  });
+  for (const [position, read] of reads.entries()) slots[read.slot] = states[position];
+
+  const attach = (comment: PullRequestComment, slot: number): PullRequestComment => {
+    const { reactions, reactionDetails } = slots[slot];
+    if (reactionDetails === undefined) return reactions === comment.reactions ? comment : { ...comment, reactions };
+    return { ...comment, reactions, reactionDetails };
+  };
   return {
-    bodyReactionDetails: bodyIndex < 0 ? [] : details[bodyIndex],
-    comments: comments.map((comment, position) => attach(comment, commentIndexes[position])),
-    reviewComments: reviewComments.map((comment, position) => attach(comment, reviewCommentIndexes[position])),
+    bodyReactions: slots[bodySlot].reactions,
+    bodyReactionDetails: slots[bodySlot].reactionDetails,
+    comments: comments.map((comment, position) => attach(comment, commentSlots[position])),
+    reviewComments: reviewComments.map((comment, position) => attach(comment, reviewCommentSlots[position])),
   };
 }
 
@@ -228,7 +302,6 @@ function normalizeComment(record: GithubRecord): PullRequestComment {
     createdAt: stringValue(record, "created_at"),
     updatedAt: stringValue(record, "updated_at"),
     reactions: reactionCounts(record.reactions),
-    reactionDetails: [],
     path: stringValue(record, "path") ?? undefined,
     line: typeof record.line === "number" ? record.line : null,
     startLine: typeof record.start_line === "number" ? record.start_line : null,
@@ -420,10 +493,16 @@ export async function refreshGithubToken(
   };
 }
 
+/**
+ * `previous` is the caller's last stored snapshot for this PR, and it only saves requests:
+ * a reaction target whose aggregate counts are unchanged keeps the details already stored
+ * instead of being read again every minute.
+ */
 export async function pullRequestSnapshot(
   token: string,
   repository: string,
   number: number,
+  previous: PullRequestSnapshot | null = null,
 ): Promise<PullRequestSnapshot> {
   const [pull, issue] = await Promise.all([
     githubJson<GithubRecord>(token, `/repos/${repository}/pulls/${number}`),
@@ -441,7 +520,8 @@ export async function pullRequestSnapshot(
     reviewThreads(token, repository, number),
   ]);
 
-  // Individual reactions need the comment IDs from the first wave.
+  // Individual reactions need the comment IDs from the first wave. A target whose read fails
+  // keeps its previous counts too, so the next refresh sees the same delta and retries.
   const bodyReactions = reactionCounts(issue.reactions);
   const reactions = await snapshotReactions(
     token,
@@ -450,6 +530,7 @@ export async function pullRequestSnapshot(
     bodyReactions,
     comments.map(normalizeComment),
     reviewComments.map(normalizeComment),
+    previous,
   );
 
   return {
@@ -470,7 +551,7 @@ export async function pullRequestSnapshot(
     headSha,
     author: userLogin(pull, "user"),
     fetchedAt: new Date().toISOString(),
-    bodyReactions,
+    bodyReactions: reactions.bodyReactions,
     bodyReactionDetails: reactions.bodyReactionDetails,
     comments: reactions.comments,
     reviews: reviews.map(normalizeReview),
