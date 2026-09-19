@@ -10,7 +10,7 @@ import {
   snapshotReactions,
   watchKey,
 } from "./events";
-import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestComment, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
+import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestComment, PullRequestReaction, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
 
 export type McpOutputMode = "brief" | "full";
 
@@ -111,6 +111,48 @@ function feedbackLines(threads: PullRequestThread[], comments: PullRequestCommen
     });
 }
 
+function aggregateReactionSummary(counts: PullRequestSnapshot["bodyReactions"]): string {
+  return Object.entries(counts)
+    .filter((entry): entry is [string, number] =>
+      entry[0] !== "total_count" && typeof entry[1] === "number" && entry[1] > 0)
+    .map(([content, count]) => `${content.toUpperCase()}×${count}`)
+    .sort()
+    .join(", ");
+}
+
+function unknownReactionLines(snapshot: PullRequestSnapshot): string[] {
+  const lines: string[] = [];
+  const add = (
+    counts: PullRequestSnapshot["bodyReactions"],
+    details: PullRequestReaction[] | undefined,
+    target: string,
+  ): void => {
+    if (details !== undefined) return;
+    const summary = aggregateReactionSummary(counts);
+    if (summary) lines.push(`reactions: attribution unavailable for ${summary} on ${target}`);
+  };
+  add(
+    snapshot.bodyReactions,
+    snapshot.bodyReactionDetails,
+    `PR #${snapshot.number} @${snapshot.author ?? "unknown"} ${snapshot.url}`,
+  );
+  for (const comment of snapshot.comments) {
+    add(
+      comment.reactions,
+      comment.reactionDetails,
+      `comment #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}`,
+    );
+  }
+  for (const comment of snapshot.reviewComments) {
+    add(
+      comment.reactions,
+      comment.reactionDetails,
+      `feedback #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}`,
+    );
+  }
+  return lines;
+}
+
 /**
  * A brief listing summarises many PRs at once, so the attributed reaction lines of one
  * snapshot are bounded; the overflow is reported as a count rather than dropped silently.
@@ -120,12 +162,14 @@ function briefReactionLines(snapshot: PullRequestSnapshot, user: GithubUser): st
   // The actor's numeric ID is the identity: a renamed or recased login must still be theirs.
   // Records persisted before actor IDs were stored have none - null or absent - and fall
   // back to the login, compared normalized so at least a recase is still recognised.
-  const lines = snapshotReactions(snapshot)
-    .filter((entry) => (entry.reaction.authorId == null
-      ? normalizedLogin(entry.reaction.author) !== normalizedLogin(user.login)
-      : entry.reaction.authorId !== user.id))
-    .map(reactionStateLine)
-    .sort();
+  const lines = [
+    ...snapshotReactions(snapshot)
+      .filter((entry) => (entry.reaction.authorId == null
+        ? normalizedLogin(entry.reaction.author) !== normalizedLogin(user.login)
+        : entry.reaction.authorId !== user.id))
+      .map(reactionStateLine),
+    ...unknownReactionLines(snapshot),
+  ].sort();
   const kept: string[] = [];
   let length = 0;
   for (const line of lines) {

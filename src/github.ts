@@ -3,6 +3,7 @@ import type {
   PullRequestCheck,
   PullRequestComment,
   PullRequestReaction,
+  ReactionReadProgress,
   PullRequestReview,
   PullRequestSnapshot,
   PullRequestThread,
@@ -66,20 +67,11 @@ export async function githubJson<T>(
   return JSON.parse(text) as T;
 }
 
-async function githubPaginated<T>(
-  token: string,
-  path: string,
-  field?: string,
-  budget?: RequestBudget,
-): Promise<T[]> {
+async function githubPaginated<T>(token: string, path: string, field?: string): Promise<T[]> {
   const values: T[] = [];
   let nextUrl: string | null = `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
 
   while (nextUrl) {
-    if (budget) {
-      if (budget.remaining === 0) throw new Error("GitHub reaction request budget exhausted");
-      budget.remaining -= 1;
-    }
     const response = await githubResponse(token, nextUrl);
     const text = await response.text();
     if (!response.ok) throw new GithubApiError(response.status, text, path);
@@ -225,21 +217,43 @@ async function mapBounded<T, R>(
   return results;
 }
 
+interface ReactionPageResult {
+  reactionDetails?: PullRequestReaction[];
+  reactionProgress?: ReactionReadProgress;
+}
+
 async function reactionRecords(
   token: string,
   path: string,
   budget: RequestBudget,
-): Promise<PullRequestReaction[]> {
-  const records = await githubPaginated<unknown>(token, path, undefined, budget);
-  return records
-    .filter((record): record is GithubRecord => Boolean(record && typeof record === "object"))
-    .map(normalizeReaction)
-    .filter((reaction) => reaction.id > 0 && reaction.content !== "");
+  progress?: ReactionReadProgress,
+): Promise<ReactionPageResult> {
+  const records = progress ? [...progress.records] : [];
+  let nextUrl: string | null = progress?.nextUrl ??
+    `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
+  while (nextUrl) {
+    if (budget.remaining === 0) {
+      return { reactionProgress: { records, nextUrl } };
+    }
+    budget.remaining -= 1;
+    const response = await githubResponse(token, nextUrl);
+    const text = await response.text();
+    if (!response.ok) throw new GithubApiError(response.status, text, path);
+    const payload: unknown = text ? JSON.parse(text) : [];
+    if (!Array.isArray(payload)) throw new Error(`GitHub returned a non-array page for ${path}`);
+    records.push(...payload
+      .filter((record): record is GithubRecord => Boolean(record && typeof record === "object"))
+      .map(normalizeReaction)
+      .filter((reaction) => reaction.id > 0 && reaction.content !== ""));
+    nextUrl = nextLink(response.headers.get("link"));
+  }
+  return { reactionDetails: records };
 }
 
 interface ReactionState {
   reactions: ReactionCounts;
   reactionDetails?: PullRequestReaction[];
+  reactionProgress?: ReactionReadProgress;
 }
 
 interface ReactionTargetRead {
@@ -251,6 +265,7 @@ interface ReactionTargetRead {
 interface SnapshotReactions {
   bodyReactions: ReactionCounts;
   bodyReactionDetails: PullRequestReaction[] | undefined;
+  bodyReactionProgress: ReactionReadProgress | undefined;
   comments: PullRequestComment[];
   reviewComments: PullRequestComment[];
 }
@@ -286,7 +301,12 @@ async function snapshotReactions(
     const slot = slots.push({ reactions }) - 1;
     if (reactionTotal(reactions) === 0) slots[slot].reactionDetails = [];
     else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) slots[slot].reactionDetails = prior.reactionDetails;
-    else reads.push({ slot, path });
+    else {
+      if (prior?.reactionProgress && sameReactionCounts(prior.reactions, reactions)) {
+        slots[slot].reactionProgress = prior.reactionProgress;
+      }
+      reads.push({ slot, path });
+    }
     return slot;
   };
 
@@ -295,7 +315,11 @@ async function snapshotReactions(
   const bodySlot = plan(
     bodyReactions,
     `/repos/${repository}/issues/${number}/reactions`,
-    previous ? { reactions: previous.bodyReactions, reactionDetails: previous.bodyReactionDetails } : undefined,
+    previous ? {
+      reactions: previous.bodyReactions,
+      reactionDetails: previous.bodyReactionDetails,
+      reactionProgress: previous.bodyReactionProgress,
+    } : undefined,
   );
   const commentSlots = comments.map((comment) => plan(
     comment.reactions,
@@ -312,11 +336,16 @@ async function snapshotReactions(
   const states = await mapBounded(reads, REACTION_CONCURRENCY, async (read): Promise<ReactionState> => {
     try {
       const reactions = slots[read.slot].reactions;
-      const reactionDetails = await reactionRecords(token, read.path, budget);
-      if (!reactionDetailsMatchCounts(reactionDetails, reactions)) {
+      const page = await reactionRecords(
+        token,
+        read.path,
+        budget,
+        slots[read.slot].reactionProgress,
+      );
+      if (page.reactionDetails && !reactionDetailsMatchCounts(page.reactionDetails, reactions)) {
         throw new Error(`GitHub returned reaction details inconsistent with ${read.path}`);
       }
-      return { reactions, reactionDetails };
+      return { reactions, ...page };
     } catch {
       return slots[read.slot];
     }
@@ -324,13 +353,15 @@ async function snapshotReactions(
   for (const [position, read] of reads.entries()) slots[read.slot] = states[position];
 
   const attach = (comment: PullRequestComment, slot: number): PullRequestComment => {
-    const { reactions, reactionDetails } = slots[slot];
-    if (reactionDetails === undefined) return reactions === comment.reactions ? comment : { ...comment, reactions };
-    return { ...comment, reactions, reactionDetails };
+    const { reactions, reactionDetails, reactionProgress } = slots[slot];
+    if (reactionDetails !== undefined) return { ...comment, reactions, reactionDetails };
+    if (reactionProgress !== undefined) return { ...comment, reactions, reactionProgress };
+    return reactions === comment.reactions ? comment : { ...comment, reactions };
   };
   return {
     bodyReactions: slots[bodySlot].reactions,
     bodyReactionDetails: slots[bodySlot].reactionDetails,
+    bodyReactionProgress: slots[bodySlot].reactionProgress,
     comments: comments.map((comment, position) => attach(comment, commentSlots[position])),
     reviewComments: reviewComments.map((comment, position) => attach(comment, reviewCommentSlots[position])),
   };
@@ -595,6 +626,7 @@ export async function pullRequestSnapshot(
     fetchedAt: new Date().toISOString(),
     bodyReactions: reactions.bodyReactions,
     bodyReactionDetails: reactions.bodyReactionDetails,
+    bodyReactionProgress: reactions.bodyReactionProgress,
     comments: reactions.comments,
     reviews: reviews.map(normalizeReview),
     reviewComments: reactions.reviewComments,

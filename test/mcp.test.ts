@@ -327,6 +327,15 @@ describe("MCP output modes", () => {
       { ...context(), readWatch: async () => readStoredWatchState(storage, storageKey) },
     );
     expect(brief).not.toContain("reaction @");
+    expect(brief).toContain(
+      "reactions: attribution unavailable for EYES×2 on PR #7 @author https://github.com/owner/repo/pull/7",
+    );
+    expect(brief).toContain(
+      "reactions: attribution unavailable for +1×1 on comment #1 @reviewer",
+    );
+    expect(brief).toContain(
+      "reactions: attribution unavailable for HEART×1 on feedback #3 @reviewer",
+    );
   });
 
   it("bounds the attributed reaction lines one snapshot contributes to a brief listing", async () => {

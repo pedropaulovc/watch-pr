@@ -1638,6 +1638,42 @@ describe("native monitor feed", () => {
     expect(stored.events.map((storedEvent) => storedEvent.changes)).toEqual([[], []]);
   });
 
+  it("drops a reaction event emptied by transactional fallback", async () => {
+    const { hub, storage } = hubFixture();
+    const storedSnapshot = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [{
+        id: 901,
+        content: "heart",
+        author: "alice",
+        authorId: 11,
+        createdAt: "2026-09-10T12:00:00.000Z",
+      }],
+    });
+    await storeMonitor(storage, { snapshot: storedSnapshot, events: [] });
+    const unknownIncoming = snapshot({
+      fetchedAt: "2026-09-10T12:05:00.000Z",
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      bodyReactionDetails: undefined,
+    });
+    const internals = hub as unknown as HubInternals;
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-reaction-fallback", unknownIncoming, {
+        deliveryId: "delivery-reaction-fallback",
+        changes: ["reactions"],
+      }),
+      { snapshot: unknownIncoming },
+    );
+    const stored = await readStoredWatchState(
+      storage as unknown as DurableObjectStorage,
+      watchStorageKey(userId, repository, number),
+    );
+    expect(stored.events).toEqual([]);
+    expect(stored.snapshot?.bodyReactionDetails).toEqual(storedSnapshot.bodyReactionDetails);
+  });
+
   it("writes nothing when a polled refresh finds no snapshot change", async () => {
     const { hub, pending, storage } = hubFixture();
     const unchanged = snapshot({ headSha: "reopened" });

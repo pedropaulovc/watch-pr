@@ -237,6 +237,45 @@ describe("GitHub API adapter", () => {
     expect(resumed.reviewComments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
   });
 
+  it("resumes a single reaction collection across request budgets", async () => {
+    const requested: string[] = [];
+    let page = 0;
+    const reactions = () => {
+      page += 1;
+      const records = Array.from({ length: 100 }, (_, index) => ({
+        id: page * 100 + index,
+        content: "heart",
+        user: { login: `user-${page}-${index}`, id: page * 100 + index },
+        created_at: "now",
+      }));
+      const headers = page < 65
+        ? { link: `<https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=${page + 1}>; rel="next"` }
+        : undefined;
+      return Response.json(records, { headers });
+    };
+    stubPullRequest({
+      title: "large",
+      bodyReactions: { heart: 6_500, total_count: 6_500 },
+      reactions,
+      requested,
+    });
+    const partial = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(page).toBe(64);
+    expect(partial.bodyReactionDetails).toBeUndefined();
+    expect(partial.bodyReactionProgress?.records).toHaveLength(6_400);
+
+    stubPullRequest({
+      title: "large",
+      bodyReactions: { heart: 6_500, total_count: 6_500 },
+      reactions,
+      requested,
+    });
+    const complete = await pullRequestSnapshot("token", "owner/repo", 7, partial);
+    expect(page).toBe(65);
+    expect(complete.bodyReactionProgress).toBeUndefined();
+    expect(complete.bodyReactionDetails).toHaveLength(6_500);
+  });
+
   it("reuses stored reaction details while the summary counts are unchanged", async () => {
     const requested: string[] = [];
     stubPullRequest({ title: "first", bodyReactions: { heart: 1, total_count: 1 }, reactions: () => Response.json([HEART]), requested });

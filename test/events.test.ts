@@ -3,6 +3,7 @@ import { hmacSha256Hex, verifyGithubSignature } from "../src/crypto";
 import {
   eventPullRequestNumbers,
   mergeReactionKnowledge,
+  reactionKnowledgeAdvanced,
   monitorEventDetails,
   monitorReconciliationDetails,
   parseResourceUri,
@@ -727,6 +728,33 @@ describe("watch-pr event contracts", () => {
     // Known details are never replaced, and a snapshot that learns nothing is untouched.
     expect(mergeReactionKnowledge(source, base)).toBe(source);
     expect(mergeReactionKnowledge(merged, source)).toBe(merged);
+  });
+
+  it("merges and persists resumable reaction pagination progress", () => {
+    const unknown = snapshot({
+      bodyReactions: { heart: 6_500, total_count: 6_500 },
+      bodyReactionDetails: undefined,
+    });
+    const firstPage = {
+      records: [{ id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "now" }],
+      nextUrl: "https://api.github.com/reactions?page=2",
+    };
+    const partial = snapshot({
+      bodyReactions: unknown.bodyReactions,
+      bodyReactionDetails: undefined,
+      bodyReactionProgress: firstPage,
+    });
+    expect(reactionKnowledgeAdvanced(unknown, partial)).toBe(true);
+    expect(mergeReactionKnowledge(unknown, partial).bodyReactionProgress).toEqual(firstPage);
+
+    const complete = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: firstPage.records,
+    });
+    const completed = mergeReactionKnowledge(partial, complete);
+    expect(reactionKnowledgeAdvanced(partial, complete)).toBe(true);
+    expect(completed.bodyReactionDetails).toEqual(firstPage.records);
+    expect(completed.bodyReactionProgress).toBeUndefined();
   });
 
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {

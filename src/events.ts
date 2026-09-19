@@ -253,7 +253,11 @@ function isPullRequestIssue(value: unknown): boolean {
  * are compared as reactions so an unknown-to-known reaction read is not read as an edit.
  */
 function commentsKey(comments: PullRequestComment[]): string {
-  return JSON.stringify(comments, (key, value: unknown) => (key === "reactionDetails" ? undefined : value));
+  return JSON.stringify(
+    comments,
+    (key, value: unknown) =>
+      key === "reactionDetails" || key === "reactionProgress" ? undefined : value,
+  );
 }
 
 function reactionDetailsChanged(
@@ -287,13 +291,31 @@ export function reactionKnowledgeAdvanced(
   const learned = (
     prior: PullRequestReaction[] | undefined,
     next: PullRequestReaction[] | undefined,
-  ): boolean => prior === undefined && next !== undefined;
-  if (learned(previous.bodyReactionDetails, current.bodyReactionDetails)) return true;
+    priorProgress: { records: PullRequestReaction[]; nextUrl: string } | undefined,
+    nextProgress: { records: PullRequestReaction[]; nextUrl: string } | undefined,
+  ): boolean => {
+    if (prior === undefined && next !== undefined) return true;
+    if (prior !== undefined || next !== undefined || !nextProgress) return false;
+    if (!priorProgress) return true;
+    return nextProgress.records.length > priorProgress.records.length ||
+      nextProgress.nextUrl !== priorProgress.nextUrl;
+  };
+  if (learned(
+    previous.bodyReactionDetails,
+    current.bodyReactionDetails,
+    previous.bodyReactionProgress,
+    current.bodyReactionProgress,
+  )) return true;
   const learnedComment = (prior: PullRequestComment[], next: PullRequestComment[]): boolean => {
     const priorById = new Map(prior.map((comment) => [comment.id, comment] as const));
     return next.some((comment) => {
       const before = priorById.get(comment.id);
-      return before !== undefined && learned(before.reactionDetails, comment.reactionDetails);
+      return before !== undefined && learned(
+        before.reactionDetails,
+        comment.reactionDetails,
+        before.reactionProgress,
+        comment.reactionProgress,
+      );
     });
   };
   return learnedComment(previous.comments, current.comments) ||
@@ -324,9 +346,20 @@ export function mergeReactionKnowledge(
   let merged = false;
   let bodyReactions = base.bodyReactions;
   let bodyReactionDetails = base.bodyReactionDetails;
+  let bodyReactionProgress = base.bodyReactionProgress;
   if (bodyReactionDetails === undefined && source.bodyReactionDetails !== undefined) {
     bodyReactions = source.bodyReactions;
     bodyReactionDetails = source.bodyReactionDetails;
+    bodyReactionProgress = undefined;
+    merged = true;
+  } else if (
+    bodyReactionDetails === undefined &&
+    source.bodyReactionProgress &&
+    (!bodyReactionProgress ||
+      source.bodyReactionProgress.records.length > bodyReactionProgress.records.length)
+  ) {
+    bodyReactions = source.bodyReactions;
+    bodyReactionProgress = source.bodyReactionProgress;
     merged = true;
   }
   const fill = (targets: PullRequestComment[], known: PullRequestComment[]): PullRequestComment[] => {
@@ -334,15 +367,41 @@ export function mergeReactionKnowledge(
     return targets.map((comment) => {
       if (comment.reactionDetails !== undefined) return comment;
       const learned = knownById.get(comment.id);
-      if (learned?.reactionDetails === undefined) return comment;
-      merged = true;
-      return { ...comment, reactions: learned.reactions, reactionDetails: learned.reactionDetails };
+      if (learned?.reactionDetails !== undefined) {
+        merged = true;
+        return {
+          ...comment,
+          reactions: learned.reactions,
+          reactionDetails: learned.reactionDetails,
+          reactionProgress: undefined,
+        };
+      }
+      if (
+        learned?.reactionProgress &&
+        (!comment.reactionProgress ||
+          learned.reactionProgress.records.length > comment.reactionProgress.records.length)
+      ) {
+        merged = true;
+        return {
+          ...comment,
+          reactions: learned.reactions,
+          reactionProgress: learned.reactionProgress,
+        };
+      }
+      return comment;
     });
   };
   const comments = fill(base.comments, source.comments);
   const reviewComments = fill(base.reviewComments, source.reviewComments);
   if (!merged) return base;
-  return { ...base, bodyReactions, bodyReactionDetails, comments, reviewComments };
+  return {
+    ...base,
+    bodyReactions,
+    bodyReactionDetails,
+    bodyReactionProgress,
+    comments,
+    reviewComments,
+  };
 }
 
 /** Logins are renameable and recasable, so they are only ever compared normalized. */

@@ -98,6 +98,11 @@ export interface PullRequestReaction {
   createdAt: string | null;
 }
 
+export interface ReactionReadProgress {
+  records: PullRequestReaction[];
+  nextUrl: string;
+}
+
 export interface PullRequestComment {
   id: number;
   author: string | null;
@@ -107,6 +112,8 @@ export interface PullRequestComment {
   reactions: ReactionCounts;
   /** Undefined is unknown, not empty: persisted before individual reactions, or unread. */
   reactionDetails?: PullRequestReaction[];
+  /** Partial pages retained when one refresh exhausts its reaction request budget. */
+  reactionProgress?: ReactionReadProgress;
   path?: string;
   line?: number | null;
   startLine?: number | null;
@@ -162,6 +169,8 @@ export interface PullRequestSnapshot {
   bodyReactions: ReactionCounts;
   /** Undefined is unknown, not empty: persisted before individual reactions, or unread. */
   bodyReactionDetails?: PullRequestReaction[];
+  /** Partial pages retained when one refresh exhausts its reaction request budget. */
+  bodyReactionProgress?: ReactionReadProgress;
   comments: PullRequestComment[];
   reviews: PullRequestReview[];
   reviewComments: PullRequestComment[];

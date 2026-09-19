@@ -2495,6 +2495,7 @@ export class WatchPrHub {
         if (currentTerminalState === "merged") return;
         let snapshot = state.snapshot;
         let changes = event.changes;
+        let recomputedChanges = false;
         if (!snapshot) {
           snapshot = current.snapshot;
           changes = [];
@@ -2510,8 +2511,10 @@ export class WatchPrHub {
             // already have been stored by another refresh in flight.
             snapshot = mergeReactionKnowledge(snapshot, current.snapshot);
             changes = snapshotChanges(current.snapshot, snapshot);
+            recomputedChanges = true;
           }
         }
+        if (recomputedChanges && event.changes.includes("reactions") && changes.length === 0) return;
         if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
         const details = snapshot
           ? monitorEventDetails(current.snapshot, snapshot, event)
