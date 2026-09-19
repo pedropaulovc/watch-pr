@@ -257,23 +257,36 @@ async function reactionRecords(
       return { reactionProgress: { records, nextUrl }, reactionDetailsReadAt: readAt };
     }
     budget.remaining -= 1;
-    const response = await githubResponse(token, nextUrl);
-    const text = await response.text();
-    if (!response.ok) throw new GithubApiError(response.status, text, path);
-    const payload: unknown = text ? JSON.parse(text) : [];
-    if (!Array.isArray(payload)) throw new Error(`GitHub returned a non-array page for ${path}`);
-    records.push(...payload
-      .filter((record): record is GithubRecord => Boolean(record && typeof record === "object"))
-      .map(normalizeReaction)
-      .filter((reaction) => reaction.id > 0 && reaction.content !== ""));
-    readAt = new Date().toISOString();
-    nextUrl = nextLink(response.headers.get("link"));
+    const pageUrl: string = nextUrl;
+    try {
+      const response = await githubResponse(token, pageUrl);
+      const text = await response.text();
+      if (!response.ok) throw new GithubApiError(response.status, text, path);
+      const payload: unknown = text ? JSON.parse(text) : [];
+      if (!Array.isArray(payload)) throw new Error(`GitHub returned a non-array page for ${path}`);
+      records.push(...payload
+        .filter((record): record is GithubRecord => Boolean(record && typeof record === "object"))
+        .map(normalizeReaction)
+        .filter((reaction) => reaction.id > 0 && reaction.content !== ""));
+      readAt = new Date().toISOString();
+      nextUrl = nextLink(response.headers.get("link"));
+    } catch (error) {
+      // Only the page that failed is unknown: the pages already in hand were read
+      // successfully, so the target resumes from the failed page instead of paying for the
+      // whole prefix again on every refresh, which a persistent failure would repeat
+      // forever. With nothing collected there is no progress worth keeping and the failure
+      // stands, leaving the target unknown.
+      if (records.length === 0) throw error;
+      return { reactionProgress: { records, nextUrl: pageUrl }, reactionDetailsReadAt: readAt };
+    }
   }
   return { reactionDetails: records, reactionDetailsReadAt: readAt };
 }
 
 interface ReactionState {
   reactions: ReactionCounts;
+  /** When the response carrying `reactions` arrived, which ages apart from any read. */
+  reactionsObservedAt: string;
   reactionDetails?: PullRequestReaction[];
   /** `borrowed` when details were reused from `previous` on unchanged counts, never read. */
   reactionDetailsState?: ReactionDetailsState;
@@ -290,6 +303,7 @@ interface ReactionTargetRead {
 
 interface SnapshotReactions {
   bodyReactions: ReactionCounts;
+  bodyReactionsObservedAt: string;
   bodyReactionDetails: PullRequestReaction[] | undefined;
   bodyReactionDetailsState: ReactionDetailsState | undefined;
   bodyReactionDetailsReadAt: string | undefined;
@@ -344,10 +358,13 @@ async function snapshotReactions(
   const plan = (
     summary: Observed<ReactionCounts>,
     path: string,
-    prior: ReactionState | undefined,
+    prior: Pick<
+      PullRequestComment,
+      "reactions" | "reactionDetails" | "reactionDetailsReadAt" | "reactionProgress"
+    > | undefined,
   ): number => {
     const reactions = summary.value;
-    const slot = slots.push({ reactions }) - 1;
+    const slot = slots.push({ reactions, reactionsObservedAt: summary.observedAt }) - 1;
     if (reactionTotal(reactions) === 0) {
       slots[slot].reactionDetails = [];
       slots[slot].reactionDetailsReadAt = summary.observedAt;
@@ -390,7 +407,7 @@ async function snapshotReactions(
 
   const budget: RequestBudget = { remaining: REACTION_REQUEST_BUDGET };
   const states = await mapBounded(reads, REACTION_CONCURRENCY, async (read): Promise<ReactionState> => {
-    const reactions = slots[read.slot].reactions;
+    const { reactions, reactionsObservedAt } = slots[read.slot];
     try {
       const page = await reactionRecords(
         token,
@@ -404,10 +421,11 @@ async function snapshotReactions(
         // records duplicated or short. Resuming the same cursor would replay the same
         // incoherent prefix forever, so the target keeps only its counts and the next
         // refresh starts again at page one.
-        return { reactions };
+        return { reactions, reactionsObservedAt };
       }
       return {
         reactions,
+        reactionsObservedAt,
         ...page,
         // A resumed read that never got a page back keeps the time of the pages it inherited.
         reactionDetailsReadAt: page.reactionDetailsReadAt ?? slots[read.slot].reactionDetailsReadAt,
@@ -421,17 +439,27 @@ async function snapshotReactions(
   for (const [position, read] of reads.entries()) slots[read.slot] = states[position];
 
   const attach = (comment: PullRequestComment, slot: number): PullRequestComment => {
-    const { reactions, reactionDetails, reactionDetailsState, reactionDetailsReadAt, reactionProgress } = slots[slot];
+    const {
+      reactions,
+      reactionsObservedAt,
+      reactionDetails,
+      reactionDetailsState,
+      reactionDetailsReadAt,
+      reactionProgress,
+    } = slots[slot];
     if (reactionDetails !== undefined) {
       return reactionDetailsState
-        ? { ...comment, reactions, reactionDetails, reactionDetailsState, reactionDetailsReadAt }
-        : { ...comment, reactions, reactionDetails, reactionDetailsReadAt };
+        ? { ...comment, reactions, reactionsObservedAt, reactionDetails, reactionDetailsState, reactionDetailsReadAt }
+        : { ...comment, reactions, reactionsObservedAt, reactionDetails, reactionDetailsReadAt };
     }
-    if (reactionProgress !== undefined) return { ...comment, reactions, reactionProgress, reactionDetailsReadAt };
-    return reactions === comment.reactions ? comment : { ...comment, reactions };
+    if (reactionProgress !== undefined) {
+      return { ...comment, reactions, reactionsObservedAt, reactionProgress, reactionDetailsReadAt };
+    }
+    return { ...comment, reactions, reactionsObservedAt };
   };
   return {
     bodyReactions: slots[bodySlot].reactions,
+    bodyReactionsObservedAt: slots[bodySlot].reactionsObservedAt,
     bodyReactionDetails: slots[bodySlot].reactionDetails,
     bodyReactionDetailsState: slots[bodySlot].reactionDetailsState,
     bodyReactionDetailsReadAt: slots[bodySlot].reactionDetailsReadAt,
@@ -707,6 +735,7 @@ export async function pullRequestSnapshot(
     author: userLogin(pull, "user"),
     fetchedAt: new Date().toISOString(),
     bodyReactions: reactions.bodyReactions,
+    bodyReactionsObservedAt: reactions.bodyReactionsObservedAt,
     bodyReactionDetails: reactions.bodyReactionDetails,
     bodyReactionDetailsState: reactions.bodyReactionDetailsState,
     bodyReactionDetailsReadAt: reactions.bodyReactionDetailsReadAt,

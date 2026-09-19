@@ -580,6 +580,59 @@ describe("native monitor feed", () => {
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-closed"]);
   });
 
+  it("keeps the counts a merge observed last when its borrowed details descend from a concurrent state", async () => {
+    const { hub, storage } = hubFixture();
+    const alice = { id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-10T11:30:00.000Z" };
+    const bob = { id: 902, content: "heart", author: "bob", authorId: 12, createdAt: "2026-09-10T12:00:30.000Z" };
+    // A concurrent refresh read and committed the moment bob's reaction existed.
+    const committed = snapshot({
+      fetchedAt: "2026-09-10T12:01:00.000Z",
+      bodyReactions: { heart: 2, total_count: 2 },
+      bodyReactionsObservedAt: "2026-09-10T12:01:00.000Z",
+      bodyReactionDetails: [alice, bob],
+      bodyReactionDetailsReadAt: "2026-09-10T12:01:00.000Z",
+    });
+    await storeMonitor(storage, { snapshot: committed, events: [event("event-1", committed)] });
+    const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}?cursor=event-1`));
+    const feed = feedReader(response);
+
+    // The merging refresh saw bob's reaction gone: its counts match the single-heart
+    // snapshot it started from, so it borrowed those details instead of reading again.
+    const mergedSnapshot = snapshot({
+      state: "closed",
+      merged: true,
+      mergedAt: "2026-09-10T12:02:00.000Z",
+      fetchedAt: "2026-09-10T12:02:00.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionsObservedAt: "2026-09-10T12:02:00.000Z",
+      bodyReactionDetails: [alice],
+      bodyReactionDetailsState: "borrowed",
+      bodyReactionDetailsReadAt: "2026-09-10T11:31:00.000Z",
+    });
+    const internals = hub as unknown as HubInternals;
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-merged", mergedSnapshot, { action: "closed", changes: ["lifecycle", "reactions"] }),
+      { snapshot: mergedSnapshot },
+    );
+
+    const delivered = await nextMonitorEvent(feed);
+    expect(delivered).toMatchObject({ id: "event-merged", terminalState: "merged" });
+    // The borrow is not a read, so it cannot pass for the deletion's attribution; the counts
+    // this refresh observed last are reported instead, once.
+    expect(delivered.details.filter((line) => line.startsWith("reaction"))).toEqual([
+      "reaction counts: HEART 2 -> 1 on PR #7 @author https://github.com/owner/repo/pull/7 (attribution unavailable)",
+    ]);
+    await expect(feed.reader.read()).resolves.toMatchObject({ done: true });
+
+    const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
+    expect(stored.snapshot).toMatchObject({ merged: true, bodyReactions: { heart: 1, total_count: 1 } });
+    expect(stored.snapshot?.bodyReactionDetails).toBeUndefined();
+    expect(stored.snapshot?.bodyReactionDetailsState).toBeUndefined();
+    expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-merged"]);
+  });
+
   it("deduplicates an already-persisted delivery inside the state transaction", async () => {
     const { hub, storage } = hubFixture();
     const incoming = event("event-duplicate", snapshot());

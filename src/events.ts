@@ -255,9 +255,12 @@ function isPullRequestIssue(value: unknown): boolean {
 /**
  * Comment content, without the reaction bookkeeping that rides along on the same record:
  * details are compared as reactions so an unknown-to-known reaction read is not read as an
- * edit, and their provenance and read time describe the read rather than the comment.
+ * edit, and their provenance and read time describe the read rather than the comment. The
+ * aggregate observation time goes the same way - it moves on every refresh that reads the
+ * comment list, while the counts beside it decide whether anything actually changed.
  */
 const REACTION_BOOKKEEPING = new Set([
+  "reactionsObservedAt",
   "reactionDetails",
   "reactionDetailsState",
   "reactionDetailsReadAt",
@@ -348,6 +351,8 @@ export function sameReactionCounts(previous: ReactionCounts, current: ReactionCo
  */
 interface ReactionKnowledge {
   reactions: ReactionCounts;
+  /** When the response carrying `reactions` arrived; it ages apart from the details. */
+  reactionsObservedAt?: string;
   reactionDetails?: PullRequestReaction[];
   reactionDetailsState?: ReactionDetailsState;
   reactionDetailsReadAt?: string;
@@ -355,18 +360,26 @@ interface ReactionKnowledge {
 }
 
 /**
+ * Whether `candidate` returned after `incumbent`, for two stamps of the same kind. A value
+ * persisted before that kind of stamp existed carries none, and loses to any timestamped
+ * one, because an observation whose age cannot be established must not outrank one whose
+ * age can.
+ */
+function observedLater(candidate: string | undefined, incumbent: string | undefined): boolean {
+  const candidateTime = Date.parse(candidate ?? "");
+  if (!Number.isFinite(candidateTime)) return false;
+  const incumbentTime = Date.parse(incumbent ?? "");
+  return !Number.isFinite(incumbentTime) || candidateTime > incumbentTime;
+}
+
+/**
  * Whether `candidate`'s read of this target returned after `incumbent`'s. Overlapping
  * refreshes read one target at a time, so neither snapshot is wholly newer than the other
  * and `fetchedAt` cannot decide this: the refresh that commits second may well hold the
- * older read of this particular target. Knowledge persisted before per-target read times
- * carries none, and loses to any timestamped read, because a copy whose age cannot be
- * established must not outrank one whose age can.
+ * older read of this particular target.
  */
 function readIsNewer(candidate: ReactionKnowledge, incumbent: ReactionKnowledge): boolean {
-  const candidateTime = Date.parse(candidate.reactionDetailsReadAt ?? "");
-  if (!Number.isFinite(candidateTime)) return false;
-  const incumbentTime = Date.parse(incumbent.reactionDetailsReadAt ?? "");
-  return !Number.isFinite(incumbentTime) || candidateTime > incumbentTime;
+  return observedLater(candidate.reactionDetailsReadAt, incumbent.reactionDetailsReadAt);
 }
 
 /**
@@ -384,8 +397,8 @@ function readIsNewer(candidate: ReactionKnowledge, incumbent: ReactionKnowledge)
  * Details `base` only borrowed - reused unread because the summary counts had not moved -
  * are not a read at all. Anything the committed state read outranks them, and counts the
  * committed state disagrees with mean the borrow describes a reaction state this write never
- * observed, so the committed pair stands and the next refresh reads the target again rather
- * than the borrow overwriting it or passing as current.
+ * observed, so while the watch continues the committed pair stands and the next refresh
+ * reads the target again rather than the borrow overwriting it or passing as current.
  *
  * Between a cursor and complete details the later read wins. Pairing details with counts a
  * later read contradicts strands the target - the next refresh drops the mismatched
@@ -394,11 +407,17 @@ function readIsNewer(candidate: ReactionKnowledge, incumbent: ReactionKnowledge)
  * details predate.
  *
  * All three rules lean on a next refresh that a merge or closure never grants. Once `base`
- * is terminal, counts it observed and could not attribute are the last word on that target:
- * taking back details the committed state read against counts this snapshot has already
- * left would restore a reaction state the pull request is no longer in and hide the
- * movement behind it, and a cursor nothing will resume is no better. The counts stand alone
- * instead, and the event announces them as unattributed.
+ * is terminal, the counts it observed are the last word on that target unless the committed
+ * state can show an aggregate observation of its own that arrived later - and that is an
+ * ordering of the two count responses, not of the reads behind them, because the whole
+ * difficulty is a snapshot holding the newest counts behind details it never re-read.
+ * Taking back details committed against counts this snapshot has already left would restore
+ * a reaction state the pull request is no longer in and hide the movement away from it -
+ * a reaction added and removed again while the merge landed would end up stored as present
+ * forever - and a cursor nothing will resume is no better. The terminal counts stand alone
+ * instead, unresolved, and the event announces them as unattributed. Borrowed details take
+ * the same route: a borrow is not a read, so it cannot buy the older counts authority they
+ * would not otherwise have.
  */
 function resolveReactionKnowledge(
   base: ReactionKnowledge,
@@ -407,6 +426,9 @@ function resolveReactionKnowledge(
   baseIsTerminal: boolean,
 ): ReactionKnowledge | undefined {
   const agrees = source !== undefined && sameReactionCounts(base.reactions, source.reactions);
+  // Terminal disagreement: `base` saw these counts last, and nothing will look again.
+  const terminalCountsStand = baseIsTerminal && !agrees && source !== undefined &&
+    !observedLater(source.reactionsObservedAt, base.reactionsObservedAt);
   if (base.reactionDetails !== undefined) {
     if (base.reactionDetailsState !== "borrowed") {
       if (
@@ -417,6 +439,7 @@ function resolveReactionKnowledge(
       ) {
         return {
           reactions: source.reactions,
+          reactionsObservedAt: source.reactionsObservedAt,
           reactionDetails: source.reactionDetails,
           reactionDetailsReadAt: source.reactionDetailsReadAt,
         };
@@ -424,6 +447,7 @@ function resolveReactionKnowledge(
       return undefined;
     }
     if (source !== undefined) {
+      if (terminalCountsStand) return { reactions: base.reactions, reactionsObservedAt: base.reactionsObservedAt };
       const outranks = agrees
         ? source.reactionDetails !== undefined &&
           source.reactionDetailsState !== "borrowed" &&
@@ -432,6 +456,7 @@ function resolveReactionKnowledge(
       if (outranks) {
         return {
           reactions: source.reactions,
+          reactionsObservedAt: source.reactionsObservedAt,
           reactionDetails: source.reactionDetails,
           reactionDetailsReadAt: source.reactionDetailsReadAt,
           reactionProgress: source.reactionProgress,
@@ -439,21 +464,24 @@ function resolveReactionKnowledge(
       }
       // Counts disagree and the committed state has nothing to keep: unread stays unknown,
       // so the next refresh reads the target instead of inheriting the borrow again.
-      if (!agrees) return { reactions: base.reactions };
+      if (!agrees) return { reactions: base.reactions, reactionsObservedAt: base.reactionsObservedAt };
     }
     // Nothing committed contradicts the borrow: keep it as the baseline, still dated by the
     // read it descends from rather than by the refresh that reused it.
     return {
       reactions: base.reactions,
+      reactionsObservedAt: base.reactionsObservedAt,
       reactionDetails: base.reactionDetails,
       reactionDetailsReadAt: base.reactionDetailsReadAt,
     };
   }
   if (source === undefined) return undefined;
-  if (baseIsTerminal && !agrees) {
+  if (terminalCountsStand) {
     // Nothing will read this target again, so a cursor here is dead weight; dropping it
     // leaves the counts as the only claim the terminal snapshot makes about it.
-    return base.reactionProgress === undefined ? undefined : { reactions: base.reactions };
+    return base.reactionProgress === undefined
+      ? undefined
+      : { reactions: base.reactions, reactionsObservedAt: base.reactionsObservedAt };
   }
   const supersedes = agrees || readIsNewer(source, base);
   if (
@@ -463,6 +491,7 @@ function resolveReactionKnowledge(
   ) {
     return {
       reactions: source.reactions,
+      reactionsObservedAt: source.reactionsObservedAt,
       reactionDetails: source.reactionDetails,
       reactionDetailsReadAt: source.reactionDetailsReadAt,
     };
@@ -474,6 +503,7 @@ function resolveReactionKnowledge(
   ) {
     return {
       reactions: source.reactions,
+      reactionsObservedAt: source.reactionsObservedAt,
       reactionDetailsReadAt: source.reactionDetailsReadAt,
       reactionProgress: source.reactionProgress,
     };
@@ -518,6 +548,7 @@ export function mergeReactionKnowledge(
   const body = resolveReactionKnowledge(
     {
       reactions: base.bodyReactions,
+      reactionsObservedAt: base.bodyReactionsObservedAt,
       reactionDetails: base.bodyReactionDetails,
       reactionDetailsState: base.bodyReactionDetailsState,
       reactionDetailsReadAt: base.bodyReactionDetailsReadAt,
@@ -525,6 +556,7 @@ export function mergeReactionKnowledge(
     },
     {
       reactions: source.bodyReactions,
+      reactionsObservedAt: source.bodyReactionsObservedAt,
       reactionDetails: source.bodyReactionDetails,
       reactionDetailsState: source.bodyReactionDetailsState,
       reactionDetailsReadAt: source.bodyReactionDetailsReadAt,
@@ -548,6 +580,7 @@ export function mergeReactionKnowledge(
       return {
         ...comment,
         reactions: resolved.reactions,
+        reactionsObservedAt: resolved.reactionsObservedAt,
         reactionDetails: resolved.reactionDetails,
         reactionDetailsState: undefined,
         reactionDetailsReadAt: resolved.reactionDetailsReadAt,
@@ -561,6 +594,7 @@ export function mergeReactionKnowledge(
   return {
     ...base,
     bodyReactions: body ? body.reactions : base.bodyReactions,
+    bodyReactionsObservedAt: body ? body.reactionsObservedAt : base.bodyReactionsObservedAt,
     bodyReactionDetails: body ? body.reactionDetails : base.bodyReactionDetails,
     bodyReactionDetailsState: undefined,
     bodyReactionDetailsReadAt: body ? body.reactionDetailsReadAt : base.bodyReactionDetailsReadAt,

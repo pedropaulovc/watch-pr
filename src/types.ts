@@ -119,6 +119,13 @@ export interface PullRequestComment {
   createdAt: string | null;
   updatedAt: string | null;
   reactions: ReactionCounts;
+  /**
+   * When the response carrying `reactions` arrived. Aggregate counts and individual details
+   * come from different requests, so they age separately: a refresh can hold the newest
+   * counts behind the oldest details, which is exactly the case a merge or a closure has to
+   * settle. Absent on targets persisted before aggregate observation times were recorded.
+   */
+  reactionsObservedAt?: string;
   /** Undefined is unknown, not empty: persisted before individual reactions, or unread. */
   reactionDetails?: PullRequestReaction[];
   /** Provenance of `reactionDetails`; absent once the transactional merge has resolved it. */
@@ -187,6 +194,8 @@ export interface PullRequestSnapshot {
   author: string | null;
   fetchedAt: string;
   bodyReactions: ReactionCounts;
+  /** Body counterpart of `PullRequestComment.reactionsObservedAt`. */
+  bodyReactionsObservedAt?: string;
   /** Undefined is unknown, not empty: persisted before individual reactions, or unread. */
   bodyReactionDetails?: PullRequestReaction[];
   /** Body counterpart of `PullRequestComment.reactionDetailsState`. */

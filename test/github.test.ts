@@ -289,6 +289,49 @@ describe("GitHub API adapter", () => {
     expect(complete.bodyReactionDetails).toHaveLength(6_500);
   });
 
+  it("resumes at the page whose request failed instead of re-reading the pages it already had", async () => {
+    const requested: string[] = [];
+    const record = (id: number) => ({ id, content: "heart", user: { login: `user-${id}`, id }, created_at: "now" });
+    const stored = (id: number) => ({ id, content: "heart", author: `user-${id}`, authorId: id, createdAt: "now" });
+    const counts = { heart: 2, total_count: 2 };
+    const secondPage = "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2";
+    let secondPageFails = true;
+    const reactions = (url: string) => {
+      if (!url.includes("page=2")) {
+        return Response.json([record(1)], { headers: { link: `<${secondPage}>; rel="next"` } });
+      }
+      return secondPageFails
+        ? new Response("upstream failure", { status: 502 })
+        : Response.json([record(2)]);
+    };
+    const reactionRequests = () => requested.filter((url) => url.includes("/reactions"));
+
+    stubPullRequest({ title: "flaky page", bodyReactions: counts, reactions, requested });
+    const interrupted = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(reactionRequests()).toEqual([
+      "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100",
+      secondPage,
+    ]);
+    // The page that failed says nothing about the page that succeeded, so the read resumes
+    // from the failure rather than paying for the first page again.
+    expect(interrupted.bodyReactionDetails).toBeUndefined();
+    expect(interrupted.bodyReactionProgress).toEqual({ records: [stored(1)], nextUrl: secondPage });
+
+    requested.length = 0;
+    stubPullRequest({ title: "flaky page", bodyReactions: counts, reactions, requested });
+    const stillFailing = await pullRequestSnapshot("token", "owner/repo", 7, interrupted);
+    expect(reactionRequests()).toEqual([secondPage]);
+    expect(stillFailing.bodyReactionProgress).toEqual({ records: [stored(1)], nextUrl: secondPage });
+
+    secondPageFails = false;
+    requested.length = 0;
+    stubPullRequest({ title: "flaky page", bodyReactions: counts, reactions, requested });
+    const complete = await pullRequestSnapshot("token", "owner/repo", 7, stillFailing);
+    expect(reactionRequests()).toEqual([secondPage]);
+    expect(complete.bodyReactionProgress).toBeUndefined();
+    expect(complete.bodyReactionDetails).toEqual([stored(1), stored(2)]);
+  });
+
   it("restarts a resumed reaction read whose stored prefix a mutation between waves invalidated", async () => {
     const requested: string[] = [];
     const record = (id: number) => ({ id, content: "heart", user: { login: `user-${id}`, id }, created_at: "now" });
@@ -474,6 +517,14 @@ describe("GitHub API adapter", () => {
       [22, "2026-09-03T00:08:00.000Z"],
     ]);
     expect(stale.reviewComments[0].reactionDetailsReadAt).toBe("2026-09-03T00:04:00.000Z");
+    // The aggregates are dated the same way and separately from the reads, because a merge
+    // has to order counts against counts when no read stands behind them.
+    expect(stale.bodyReactionsObservedAt).toBe("2026-09-03T00:01:00.000Z");
+    expect(stale.comments.map((comment) => comment.reactionsObservedAt)).toEqual([
+      "2026-09-03T00:02:00.000Z",
+      "2026-09-03T00:08:00.000Z",
+    ]);
+    expect(stale.reviewComments[0].reactionsObservedAt).toBe("2026-09-03T00:04:00.000Z");
 
     // A concurrent refresh read the body at 00:03 and committed the heart added at 00:02:30.
     const heart = { id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:02:30.000Z" };

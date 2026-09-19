@@ -940,6 +940,53 @@ describe("watch-pr event contracts", () => {
     expect(monitorEventDetails(contradicting, unresolved).some((line) => line.startsWith("reaction"))).toBe(false);
   });
 
+  it("orders a terminal disagreement by when each side observed the counts", () => {
+    const alice = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:01:00.000Z" };
+    const bob = { id: 2, content: "heart", author: "bob", authorId: 12, createdAt: "2026-09-03T00:02:00.000Z" };
+    // A merge whose counts matched its starting snapshot, so its details were never re-read.
+    const merged = snapshot({
+      state: "closed",
+      merged: true,
+      mergedAt: "2026-09-03T00:04:00.000Z",
+      fetchedAt: "2026-09-03T00:04:00.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionsObservedAt: "2026-09-03T00:04:00.000Z",
+      bodyReactionDetails: [alice],
+      bodyReactionDetailsState: "borrowed",
+      bodyReactionDetailsReadAt: "2026-09-03T00:01:30.000Z",
+    });
+
+    // The committed pair was observed before the merge's counts: no refresh will ever look
+    // again, so the last observation stands and the reactions behind it stay unattributed.
+    const older = snapshot({
+      fetchedAt: "2026-09-03T00:03:00.000Z",
+      bodyReactions: { heart: 2, total_count: 2 },
+      bodyReactionsObservedAt: "2026-09-03T00:03:00.000Z",
+      bodyReactionDetails: [alice, bob],
+      bodyReactionDetailsReadAt: "2026-09-03T00:03:00.000Z",
+    });
+    const settled = mergeReactionKnowledge(merged, older);
+    expect(settled.bodyReactions).toEqual({ heart: 1, total_count: 1 });
+    expect(settled.bodyReactionDetails).toBeUndefined();
+    expect(settled.bodyReactionDetailsState).toBeUndefined();
+    expect(monitorEventDetails(older, settled).filter((line) => line.startsWith("reaction"))).toEqual([
+      "reaction counts: HEART 2 -> 1 on PR #7 @author https://github.com/owner/repo/pull/7 (attribution unavailable)",
+    ]);
+
+    // A committed observation that arrived after the merge's own is the later word on the
+    // target, and it comes with details: terminal or not, that pair wins.
+    const newer = snapshot({
+      fetchedAt: "2026-09-03T00:03:00.000Z",
+      bodyReactions: { heart: 2, total_count: 2 },
+      bodyReactionsObservedAt: "2026-09-03T00:05:00.000Z",
+      bodyReactionDetails: [alice, bob],
+      bodyReactionDetailsReadAt: "2026-09-03T00:05:00.000Z",
+    });
+    const adopted = mergeReactionKnowledge(merged, newer);
+    expect(adopted.bodyReactions).toEqual({ heart: 2, total_count: 2 });
+    expect(adopted.bodyReactionDetails).toEqual([alice, bob]);
+  });
+
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {
     const body = JSON.stringify({ action: "opened" });
     const signature = `sha256=${await hmacSha256Hex("secret", body)}`;
