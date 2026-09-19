@@ -41,7 +41,13 @@ describe("GitHub API adapter", () => {
         );
       }
       if (url.includes("/commits/abc/check-runs?page=2")) return Response.json({ check_runs: [{ id: 5, name: "Lint", status: "completed", conclusion: "success", completed_at: "now", started_at: "then", html_url: "https://github.com/lint" }] });
-      if (url.endsWith("/commits/abc/statuses?per_page=100")) return Response.json([]);
+      if (url.endsWith("/commits/abc/statuses?per_page=100")) {
+        return Response.json([
+          { id: 9, context: "Buildkite/Build", state: "pending", created_at: "2026-09-19T12:00:00.000Z", updated_at: "2026-09-19T12:00:00.000Z", target_url: "https://buildkite.com/build/9" },
+          { id: 11, context: "coverage", state: "failure", created_at: "2026-09-19T12:02:00.000Z", updated_at: "2026-09-19T12:02:00.000Z", target_url: "https://example.test/coverage" },
+          { id: 10, context: "buildkite/build", state: "success", created_at: "2026-09-19T12:01:00.000Z", updated_at: "2026-09-19T12:01:00.000Z", target_url: "https://buildkite.com/build/10" },
+        ]);
+      }
       if (url.endsWith("/graphql")) {
         graphqlCalls += 1;
         if (graphqlCalls === 1) {
@@ -62,6 +68,10 @@ describe("GitHub API adapter", () => {
     expect(result.reviews[0]).toMatchObject({ state: "APPROVED", author: "reviewer" });
     expect(result.reviewComments[0]).toMatchObject({ path: "src/index.ts", reactions: { heart: 1 } });
     expect(result.checks[0]).toMatchObject({ name: "CI", conclusion: "failure", kind: "check_run" });
+    expect(result.checks.filter((check) => check.kind === "commit_status")).toEqual([
+      expect.objectContaining({ id: 10, name: "buildkite/build", conclusion: "success" }),
+      expect.objectContaining({ id: 11, name: "coverage", conclusion: "failure" }),
+    ]);
     expect(result.threads).toEqual([
       { id: "thread-1", isResolved: false, commentIds: [8] },
       { id: "thread-2", isResolved: true, commentIds: [9] },

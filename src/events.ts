@@ -1,4 +1,10 @@
-import type { PullRequestSnapshot, WatchEvent } from "./types";
+import type {
+  PullRequestCheck,
+  PullRequestComment,
+  PullRequestReview,
+  PullRequestSnapshot,
+  WatchEvent,
+} from "./types";
 
 export const SUPPORTED_GITHUB_EVENTS = [
   "check_run",
@@ -17,6 +23,64 @@ export const SUPPORTED_GITHUB_EVENTS = [
 ] as const;
 
 const supportedEvents = new Set<string>(SUPPORTED_GITHUB_EVENTS);
+
+const MAX_MONITOR_DETAIL_LINES = 24;
+const MAX_MONITOR_DETAIL_LENGTH = 500;
+const MAX_MONITOR_DETAILS_LENGTH = 3_900;
+const MAX_MONITOR_BODY_LENGTH = 240;
+const ANSI_ESCAPE_SEQUENCE_RE = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~])/gu;
+
+function truncate(value: string, maximumLength: number): string {
+  if (value.length <= maximumLength) return value;
+  let prefix = value.slice(0, maximumLength - 1);
+  const lastCodeUnit = prefix.charCodeAt(prefix.length - 1);
+  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) prefix = prefix.slice(0, -1);
+  return `${prefix}…`;
+}
+
+function sanitizeDetail(value: string): string {
+  return value
+    .replace(ANSI_ESCAPE_SEQUENCE_RE, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, "")
+    .trim();
+}
+
+function boundedDetails(lines: string[]): string[] {
+  const candidates = [...new Set(
+    lines
+      .map(sanitizeDetail)
+      .filter(Boolean)
+      .map((line) => truncate(line, MAX_MONITOR_DETAIL_LENGTH)),
+  )];
+  const details: string[] = [];
+  let length = 0;
+  let index = 0;
+  while (index < candidates.length && details.length < MAX_MONITOR_DETAIL_LINES) {
+    const line = candidates[index];
+    if (length + line.length > MAX_MONITOR_DETAILS_LENGTH) break;
+    details.push(line);
+    length += line.length;
+    index += 1;
+  }
+  if (index === candidates.length) return details;
+
+  let omitted = candidates.length - index;
+  let marker = `+${omitted} more changes`;
+  if (details.length >= MAX_MONITOR_DETAIL_LINES) {
+    const removed = details.pop()!;
+    length -= removed.length;
+    omitted += 1;
+    marker = `+${omitted} more changes`;
+  }
+  while (details.length > 0 && length + marker.length > MAX_MONITOR_DETAILS_LENGTH) {
+    const removed = details.pop()!;
+    length -= removed.length;
+    omitted += 1;
+    marker = `+${omitted} more changes`;
+  }
+  if (details.length < MAX_MONITOR_DETAIL_LINES) details.push(marker);
+  return details;
+}
 
 export function isSupportedGithubEvent(eventName: string): boolean {
   return supportedEvents.has(eventName);
@@ -210,6 +274,307 @@ export function snapshotChanges(
   if (JSON.stringify(previous.bodyReactions) !== JSON.stringify(current.bodyReactions)) changes.push("reactions");
   if (JSON.stringify(previous.threads) !== JSON.stringify(current.threads)) changes.push("review_threads");
   return changes;
+}
+
+function checkBucket(check: PullRequestCheck): "pending" | "pass" | "fail" | "skipping" | "cancel" {
+  if (check.status?.toLowerCase() !== "completed") return "pending";
+  switch (check.conclusion?.toLowerCase()) {
+    case "success":
+    case "neutral":
+      return "pass";
+    case "pending":
+      return "pending";
+    case "skipped":
+      return "skipping";
+    case "cancelled":
+    case "canceled":
+      return "cancel";
+    default:
+      return check.conclusion ? "fail" : "pending";
+  }
+}
+
+function checkKey(check: PullRequestCheck): string {
+  return check.kind === "commit_status"
+    ? `${check.kind}:${check.name.toLowerCase()}`
+    : `${check.kind}:${check.id}`;
+}
+
+function checkSummary(checks: PullRequestCheck[]): string {
+  const details = [...checks]
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((check) => {
+      const bucket = checkBucket(check);
+      const url = (bucket === "fail" || bucket === "cancel") && check.url ? ` ${check.url}` : "";
+      return `${check.name} -> ${bucket}${url}`;
+    });
+  return `checks: ${details.join(", ")}`;
+}
+
+function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[]): string[] {
+  const previousByKey = new Map(previous.map((check) => [checkKey(check), check]));
+  const previousPending = new Set(
+    previous.filter((check) => checkBucket(check) === "pending").map(checkKey),
+  );
+  const currentPending = new Set(
+    current.filter((check) => checkBucket(check) === "pending").map(checkKey),
+  );
+  const selected = new Map<string, PullRequestCheck>();
+  for (const check of current) {
+    const bucket = checkBucket(check);
+    if (bucket !== "fail" && bucket !== "cancel") continue;
+    const prior = previousByKey.get(checkKey(check));
+    if (!prior || checkBucket(prior) !== bucket || prior.completedAt !== check.completedAt) {
+      selected.set(checkKey(check), check);
+    }
+  }
+
+  if (previousPending.size === 0 && currentPending.size > 0) {
+    for (const check of current) {
+      if (currentPending.has(checkKey(check))) selected.set(checkKey(check), check);
+    }
+  }
+  if (
+    previousPending.size > 0 &&
+    currentPending.size === 0 &&
+    [...previousPending].every((key) => current.some((check) => checkKey(check) === key))
+  ) {
+    return current.length > 0 ? [checkSummary(current)] : [];
+  }
+  return selected.size > 0 ? [checkSummary([...selected.values()])] : [];
+}
+
+function reconciliationCheckDetails(checks: PullRequestCheck[]): string[] {
+  return checks.length > 0 ? [checkSummary(checks)] : [];
+}
+
+function compactBody(value: string): string {
+  return truncate(
+    value
+      .replace(ANSI_ESCAPE_SEQUENCE_RE, "")
+      .replace(/<!--[\s\S]*?-->/gu, "")
+      .replace(/\s+/gu, " ")
+      .replace(/[\u0000-\u001f\u007f-\u009f]/gu, "")
+      .trim(),
+    MAX_MONITOR_BODY_LENGTH,
+  );
+}
+
+function commentLocation(comment: PullRequestComment): string {
+  if (!comment.path) return "";
+  const start = comment.startLine ?? comment.line;
+  const end = comment.line ?? start;
+  if (!start) return comment.path;
+  return `${comment.path}:${start}${end && end !== start ? `-${end}` : ""}`;
+}
+
+function commentContentKey(comment: PullRequestComment): string {
+  return JSON.stringify([
+    comment.author,
+    comment.body,
+    comment.updatedAt,
+    comment.path,
+    comment.line,
+    comment.startLine,
+    comment.inReplyToId,
+  ]);
+}
+
+function reviewContentKey(review: PullRequestReview): string {
+  return JSON.stringify([review.author, review.state, review.body, review.submittedAt]);
+}
+
+function changedComments(
+  previous: PullRequestComment[],
+  current: PullRequestComment[],
+): PullRequestComment[] {
+  const previousById = new Map(previous.map((comment) => [comment.id, comment]));
+  return current.filter((comment) => {
+    const prior = previousById.get(comment.id);
+    return !prior || commentContentKey(prior) !== commentContentKey(comment);
+  });
+}
+
+function changedReviews(
+  previous: PullRequestReview[],
+  current: PullRequestReview[],
+): PullRequestReview[] {
+  const previousById = new Map(previous.map((review) => [review.id, review]));
+  return current.filter((review) => {
+    const prior = previousById.get(review.id);
+    return !prior || reviewContentKey(prior) !== reviewContentKey(review);
+  });
+}
+
+function removedComments(
+  previous: PullRequestComment[],
+  current: PullRequestComment[],
+): PullRequestComment[] {
+  const currentIds = new Set(current.map((comment) => comment.id));
+  return previous.filter((comment) => !currentIds.has(comment.id));
+}
+
+function removedReviews(
+  previous: PullRequestReview[],
+  current: PullRequestReview[],
+): PullRequestReview[] {
+  const currentIds = new Set(current.map((review) => review.id));
+  return previous.filter((review) => !currentIds.has(review.id));
+}
+
+function commentDetail(comment: PullRequestComment): string {
+  const body = compactBody(comment.body);
+  return `comment #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+}
+
+function reviewDetail(review: PullRequestReview): string {
+  const body = compactBody(review.body);
+  return `review #${review.id} @${review.author ?? "unknown"} ${review.state}${review.htmlUrl ? ` ${review.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+}
+
+function reviewCommentDetail(comment: PullRequestComment, snapshot: PullRequestSnapshot): string {
+  const thread = snapshot.threads.find((candidate) => candidate.commentIds.includes(comment.id));
+  const location = commentLocation(comment);
+  const body = compactBody(comment.body);
+  return `feedback [${thread?.id ?? "-"}] #${comment.id}${location ? ` ${location}` : ""} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+}
+
+function mergeabilityDetails(
+  previous: PullRequestSnapshot | null,
+  current: PullRequestSnapshot,
+): string[] {
+  const details: string[] = [];
+  if (
+    (!previous || previous.headRefName !== current.headRefName || previous.headSha !== current.headSha) &&
+    current.headRefName &&
+    current.headSha
+  ) {
+    details.push(`head -> ${current.headRefName}@${current.headSha}`);
+  }
+  if (previous && previous.baseRefName !== current.baseRefName) {
+    details.push(`base ${previous.baseRefName ?? "<unknown>"} -> ${current.baseRefName ?? "<unknown>"}`);
+  }
+  const previousState = previous?.mergeableState?.toUpperCase();
+  const currentState = current.mergeableState?.toUpperCase();
+  const previousNeedsRebase = previousState === "BEHIND" || previousState === "DIRTY";
+  const currentNeedsRebase = currentState === "BEHIND" || currentState === "DIRTY";
+  if (currentNeedsRebase && previousState !== currentState) {
+    details.push(`state -> ${currentState}`);
+  } else if (
+    previous &&
+    previousNeedsRebase &&
+    currentState !== undefined &&
+    currentState !== "UNKNOWN" &&
+    previousState !== currentState
+  ) {
+    details.push(`state -> ${currentState}`);
+  }
+  return details.length > 0 ? [`mergeability: ${details.join(", ")}`] : [];
+}
+
+function threadDetails(previous: PullRequestSnapshot, current: PullRequestSnapshot): string[] {
+  const previousById = new Map(previous.threads.map((thread) => [thread.id, thread]));
+  return current.threads.flatMap((thread) => {
+    const prior = previousById.get(thread.id);
+    if (!prior || prior.isResolved === thread.isResolved) return [];
+    return [`thread ${thread.id}: ${thread.isResolved ? "resolved" : "reopened"}`];
+  });
+}
+
+function activeReviewComments(snapshot: PullRequestSnapshot): PullRequestComment[] {
+  if (snapshot.threads.length === 0) return snapshot.reviewComments;
+  const knownThreadCommentIds = new Set(
+    snapshot.threads.flatMap((thread) => thread.commentIds),
+  );
+  const unresolvedCommentIds = new Set(
+    snapshot.threads
+      .filter((thread) => !thread.isResolved)
+      .flatMap((thread) => thread.commentIds),
+  );
+  return snapshot.reviewComments.filter((comment) =>
+    unresolvedCommentIds.has(comment.id) || !knownThreadCommentIds.has(comment.id));
+}
+
+function activeCommentDetails(
+  previous: PullRequestSnapshot,
+  current: PullRequestSnapshot,
+): string[] {
+  const previousCount = activeReviewComments(previous).length;
+  const currentCount = activeReviewComments(current).length;
+  if (previousCount === currentCount) return [];
+  const delta = currentCount - previousCount;
+  return [`active comments: ${delta > 0 ? "+" : ""}${delta}, now ${currentCount}`];
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function stringProperty(value: Record<string, unknown> | null, key: string): string | null {
+  const property = value?.[key];
+  return typeof property === "string" && property.trim() ? property.trim() : null;
+}
+
+function deploymentDetails(
+  event: Pick<WatchEvent, "githubEvent" | "action" | "payload"> | null,
+): string[] {
+  if (!event || (event.githubEvent !== "deployment" && event.githubEvent !== "deployment_status")) {
+    return [];
+  }
+  const payload = recordValue(event.payload);
+  const deployment = recordValue(payload?.deployment);
+  const status = recordValue(payload?.deployment_status);
+  const environment = stringProperty(status, "environment") ??
+    stringProperty(deployment, "environment") ??
+    "unknown";
+  const state = stringProperty(status, "state") ?? event.action ?? "updated";
+  const ref = stringProperty(deployment, "ref");
+  const url = stringProperty(status, "environment_url") ?? stringProperty(status, "target_url");
+  return [
+    `deployment: ${environment}${ref ? ` (${ref})` : ""} -> ${state}${url ? ` ${url}` : ""}`,
+  ];
+}
+
+export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): string[] {
+  const reviewComments = activeReviewComments(snapshot);
+  return boundedDetails([
+    ...mergeabilityDetails(null, snapshot),
+    ...reconciliationCheckDetails(snapshot.checks),
+    ...(reviewComments.length > 0 ? [`active comments: now ${reviewComments.length}`] : []),
+    ...reviewComments.map((comment) => reviewCommentDetail(comment, snapshot)),
+  ]);
+}
+
+export function monitorEventDetails(
+  previous: PullRequestSnapshot | null,
+  current: PullRequestSnapshot,
+  event: Pick<WatchEvent, "githubEvent" | "action" | "payload"> | null = null,
+): string[] {
+  if (!previous) return monitorReconciliationDetails(current);
+  const lines = [
+    ...mergeabilityDetails(previous, current),
+    ...checkDetails(previous.checks, current.checks),
+    ...deploymentDetails(event),
+    ...activeCommentDetails(previous, current),
+    ...changedComments(previous.comments, current.comments).map(commentDetail),
+    ...removedComments(previous.comments, current.comments)
+      .map((comment) => `comment #${comment.id} deleted`),
+    ...changedReviews(previous.reviews, current.reviews).map(reviewDetail),
+    ...removedReviews(previous.reviews, current.reviews)
+      .map((review) => `review #${review.id} deleted`),
+    ...changedComments(previous.reviewComments, current.reviewComments)
+      .map((comment) => reviewCommentDetail(comment, current)),
+    ...removedComments(previous.reviewComments, current.reviewComments)
+      .map((comment) => {
+        const thread = previous.threads.find((candidate) => candidate.commentIds.includes(comment.id));
+        return `feedback [${thread?.id ?? "-"}] #${comment.id} deleted`;
+      }),
+    ...threadDetails(previous, current),
+  ];
+  if (previous.state !== current.state || previous.draft !== current.draft) {
+    lines.unshift(`PR state: ${current.state.toUpperCase()}${current.draft ? " DRAFT" : ""}`);
+  }
+  return boundedDetails(lines);
 }
 
 export function createWatchEvent(input: {

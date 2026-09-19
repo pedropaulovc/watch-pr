@@ -184,6 +184,28 @@ function normalizeCommitStatus(record: GithubRecord, index: number): PullRequest
   };
 }
 
+function latestCommitStatuses(records: GithubRecord[]): PullRequestCheck[] {
+  const latestByContext = new Map<string, PullRequestCheck>();
+  for (const [index, record] of records.entries()) {
+    const candidate = normalizeCommitStatus(record, index);
+    const contextKey = candidate.name.toLowerCase();
+    const previous = latestByContext.get(contextKey);
+    if (!previous) {
+      latestByContext.set(contextKey, candidate);
+      continue;
+    }
+    const candidateTime = Date.parse(candidate.completedAt ?? candidate.startedAt ?? "");
+    const previousTime = Date.parse(previous.completedAt ?? previous.startedAt ?? "");
+    const candidateTimestamp = Number.isNaN(candidateTime) ? Number.NEGATIVE_INFINITY : candidateTime;
+    const previousTimestamp = Number.isNaN(previousTime) ? Number.NEGATIVE_INFINITY : previousTime;
+    if (candidateTimestamp > previousTimestamp ||
+      (candidateTimestamp === previousTimestamp && candidate.id > previous.id)) {
+      latestByContext.set(contextKey, candidate);
+    }
+  }
+  return [...latestByContext.values()];
+}
+
 async function reviewThreads(
   token: string,
   repository: string,
@@ -354,9 +376,9 @@ export async function pullRequestSnapshot(
       ...checkRuns
         .filter((check): check is GithubRecord => Boolean(check && typeof check === "object"))
         .map(normalizeCheckRun),
-      ...statuses
-        .filter((status): status is GithubRecord => Boolean(status && typeof status === "object"))
-        .map(normalizeCommitStatus),
+      ...latestCommitStatuses(
+        statuses.filter((status): status is GithubRecord => Boolean(status && typeof status === "object")),
+      ),
     ],
     threads,
   };

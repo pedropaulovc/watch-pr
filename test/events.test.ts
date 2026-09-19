@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { hmacSha256Hex, verifyGithubSignature } from "../src/crypto";
-import { eventPullRequestNumbers, parseResourceUri, resourceUri, snapshotChanges, watchKey } from "../src/events";
+import {
+  eventPullRequestNumbers,
+  monitorEventDetails,
+  monitorReconciliationDetails,
+  parseResourceUri,
+  resourceUri,
+  snapshotChanges,
+  watchKey,
+} from "../src/events";
 import type { PullRequestSnapshot } from "../src/types";
 
 const snapshot = (overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnapshot => ({
@@ -204,6 +212,316 @@ describe("watch-pr event contracts", () => {
 
   it("detects merged timestamp changes as lifecycle changes", () => {
     expect(snapshotChanges(snapshot(), snapshot({ merged: true, mergedAt: "2026-09-03T01:00:00.000Z" }))).toEqual(["lifecycle"]);
+  });
+
+  it("coalesces a check rerun into one start and one terminal summary", () => {
+    const pending = (id: number, name: string) => ({
+      id,
+      name,
+      status: "in_progress",
+      conclusion: null,
+      completedAt: null,
+      startedAt: "2026-09-19T12:00:00.000Z",
+      url: `https://github.com/owner/repo/actions/runs/${id}`,
+      kind: "check_run" as const,
+    });
+    const completed = (id: number, name: string) => ({
+      ...pending(id, name),
+      status: "completed",
+      conclusion: "success",
+      completedAt: "2026-09-19T12:01:00.000Z",
+    });
+    const before = snapshot();
+    const started = snapshot({ checks: [pending(1, "CI"), pending(2, "Lint")] });
+    const partial = snapshot({ checks: [completed(1, "CI"), pending(2, "Lint")] });
+    const finished = snapshot({ checks: [completed(1, "CI"), completed(2, "Lint")] });
+
+    expect(monitorEventDetails(before, started)).toEqual([
+      "checks: CI -> pending, Lint -> pending",
+    ]);
+    expect(monitorEventDetails(started, partial)).toEqual([]);
+    expect(monitorEventDetails(partial, finished)).toEqual([
+      "checks: CI -> pass, Lint -> pass",
+    ]);
+  });
+
+  it("tracks commit status waves by context when GitHub assigns a new status ID", () => {
+    const pendingStatus = {
+      id: 9,
+      name: "Buildkite/Build",
+      status: "completed",
+      conclusion: "pending",
+      completedAt: "2026-09-19T12:00:00.000Z",
+      startedAt: null,
+      url: "https://buildkite.com/build/9",
+      kind: "commit_status" as const,
+    };
+    const completedStatus = {
+      ...pendingStatus,
+      id: 10,
+      name: "buildkite/build",
+      conclusion: "success",
+      completedAt: "2026-09-19T12:01:00.000Z",
+      url: "https://buildkite.com/build/10",
+    };
+
+    expect(monitorEventDetails(snapshot(), snapshot({ checks: [pendingStatus] }))).toEqual([
+      "checks: Buildkite/Build -> pending",
+    ]);
+    expect(monitorEventDetails(
+      snapshot({ checks: [pendingStatus] }),
+      snapshot({ checks: [completedStatus] }),
+    )).toEqual([
+      "checks: buildkite/build -> pass",
+    ]);
+  });
+
+  it("renders current check state and review feedback during reconciliation", () => {
+    const pending = {
+      id: 1,
+      name: "CI",
+      status: "in_progress",
+      conclusion: null,
+      completedAt: null,
+      startedAt: "2026-09-19T12:00:00.000Z",
+      url: null,
+      kind: "check_run" as const,
+    };
+    const feedback = {
+      id: 22,
+      author: "reviewer",
+      body: "Please keep this visible.",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      path: "src/retry.ts",
+      line: 9,
+    };
+    const resolvedFeedback = { ...feedback, id: 23, body: "Already resolved." };
+    const unknownThreadFeedback = { ...feedback, id: 24, body: "Membership was truncated." };
+
+    expect(monitorReconciliationDetails(snapshot({
+      checks: [pending],
+      reviewComments: [feedback, resolvedFeedback, unknownThreadFeedback],
+      threads: [
+        { id: "thread-open", isResolved: false, commentIds: [22] },
+        { id: "thread-resolved", isResolved: true, commentIds: [23] },
+      ],
+    }))).toEqual([
+      "mergeability: head -> feature@abc",
+      "checks: CI -> pending",
+      "active comments: now 2",
+      "feedback [thread-open] #22 src/retry.ts:9 @reviewer: Please keep this visible.",
+      "feedback [-] #24 src/retry.ts:9 @reviewer: Membership was truncated.",
+    ]);
+    expect(monitorReconciliationDetails(snapshot({
+      checks: [{ ...pending, status: "completed", conclusion: "success" }],
+    }))).toEqual([
+      "mergeability: head -> feature@abc",
+      "checks: CI -> pass",
+    ]);
+  });
+
+  it("reports retargets, cleared conflicts, reopened threads, and deleted feedback", () => {
+    const comment = {
+      id: 21,
+      author: "reviewer",
+      body: "Old feedback",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+    };
+    const review = {
+      id: 31,
+      author: "reviewer",
+      body: "Old review",
+      state: "CHANGES_REQUESTED",
+      submittedAt: "2026-09-19T12:00:00.000Z",
+    };
+    const reviewComment = { ...comment, id: 41, path: "src/retry.ts", line: 12 };
+    const before = snapshot({
+      mergeableState: "dirty",
+      comments: [comment],
+      reviews: [review],
+      reviewComments: [reviewComment],
+      threads: [{ id: "PRRT_thread", isResolved: true, commentIds: [41] }],
+    });
+    const after = snapshot({
+      baseRefName: "release/2",
+      mergeableState: "clean",
+      threads: [{ id: "PRRT_thread", isResolved: false, commentIds: [41] }],
+    });
+
+    expect(monitorEventDetails(before, after)).toEqual([
+      "mergeability: base main -> release/2, state -> CLEAN",
+      "comment #21 deleted",
+      "review #31 deleted",
+      "feedback [PRRT_thread] #41 deleted",
+      "thread PRRT_thread: reopened",
+    ]);
+    expect(monitorEventDetails(
+      snapshot({ mergeableState: "dirty" }),
+      snapshot({ mergeableState: "unknown" }),
+    )).toEqual([]);
+  });
+
+  it("reports active review-comment deltas for reopened and resolved threads", () => {
+    const reviewComments = [1, 2, 3, 4].map((id) => ({
+      id,
+      author: "reviewer",
+      body: `Feedback ${id}`,
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      path: "src/retry.ts",
+      line: id,
+    }));
+    const partlyResolved = snapshot({
+      reviewComments,
+      threads: [
+        { id: "thread-one", isResolved: false, commentIds: [1, 2] },
+        { id: "thread-two", isResolved: true, commentIds: [3, 4] },
+      ],
+    });
+    const allOpen = snapshot({
+      reviewComments,
+      threads: [
+        { id: "thread-one", isResolved: false, commentIds: [1, 2] },
+        { id: "thread-two", isResolved: false, commentIds: [3, 4] },
+      ],
+    });
+    const allResolved = snapshot({
+      reviewComments,
+      threads: [
+        { id: "thread-one", isResolved: true, commentIds: [1, 2] },
+        { id: "thread-two", isResolved: true, commentIds: [3, 4] },
+      ],
+    });
+
+    expect(monitorEventDetails(partlyResolved, allOpen)).toEqual([
+      "active comments: +2, now 4",
+      "thread thread-two: reopened",
+    ]);
+    expect(monitorEventDetails(allOpen, allResolved)).toEqual([
+      "active comments: -4, now 0",
+      "thread thread-one: resolved",
+      "thread thread-two: resolved",
+    ]);
+  });
+
+  it("reports deployment status in one detailed line", () => {
+    const unchanged = snapshot();
+    expect(monitorEventDetails(unchanged, unchanged, {
+      githubEvent: "deployment_status",
+      action: "created",
+      payload: {
+        deployment: { environment: "production", ref: "feature" },
+        deployment_status: {
+          state: "success",
+          environment_url: "https://example.test/deployments/1",
+        },
+      },
+    })).toEqual([
+      "deployment: production (feature) -> success https://example.test/deployments/1",
+    ]);
+  });
+
+  it("omits unavailable head references and bounds persisted monitor details", () => {
+    expect(monitorReconciliationDetails(snapshot({ headRefName: null, headSha: null }))).toEqual([]);
+    const comments = Array.from({ length: 30 }, (_, index) => ({
+      id: index + 1,
+      author: "reviewer",
+      body: `feedback ${index} ${"x".repeat(1_000)}`,
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+    }));
+    const details = monitorEventDetails(snapshot(), snapshot({ comments }));
+
+    expect(details.length).toBeLessThanOrEqual(24);
+    expect(details.join("").length).toBeLessThanOrEqual(3_900);
+    expect(details.at(-1)).toMatch(/^\+\d+ more changes$/u);
+    const unicodeDetails = monitorEventDetails(snapshot(), snapshot({
+      comments: [{ ...comments[0], id: 99, body: `${"x".repeat(238)}😀z` }],
+    }));
+    expect([...unicodeDetails.join("")].some((character) => {
+      const code = character.charCodeAt(0);
+      return character.length === 1 && code >= 0xd800 && code <= 0xdfff;
+    })).toBe(false);
+    const failedCheck = (id: number, name: string) => ({
+      id,
+      name,
+      status: "completed",
+      conclusion: "failure",
+      completedAt: "2026-09-19T12:01:00.000Z",
+      startedAt: "2026-09-19T12:00:00.000Z",
+      url: null,
+      kind: "check_run" as const,
+    });
+    expect(monitorEventDetails(
+      snapshot(),
+      snapshot({ checks: [failedCheck(1, "\u001b[31mCI\u001b[0m\nspoof")] }),
+    )).toEqual(["checks: CIspoof -> fail"]);
+    const sharedPrefix = "x".repeat(600);
+    const duplicateAfterTruncation = monitorEventDetails(snapshot(), snapshot({
+      checks: [
+        failedCheck(2, `${sharedPrefix}A`),
+        failedCheck(3, `${sharedPrefix}B`),
+      ],
+    }));
+    expect(duplicateAfterTruncation).toHaveLength(1);
+  });
+
+  it("emits only the changed comment body after a PR accumulates many comments", () => {
+    const existing = Array.from({ length: 20 }, (_, index) => ({
+      id: index + 1,
+      author: "reviewer",
+      body: `old comment ${index + 1}`,
+      createdAt: "2026-09-18T12:00:00.000Z",
+      updatedAt: "2026-09-18T12:00:00.000Z",
+      reactions: {},
+      htmlUrl: `https://github.com/owner/repo/pull/7#issuecomment-${index + 1}`,
+    }));
+    const newComment = {
+      id: 21,
+      author: "reviewer",
+      body: "<!-- hidden -->Please \u001b[2Kcover the retry race\nbefore merging.",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
+    };
+
+    expect(monitorEventDetails(
+      snapshot({ comments: existing }),
+      snapshot({ comments: [...existing, newComment] }),
+    )).toEqual([
+      "comment #21 @reviewer https://github.com/owner/repo/pull/7#issuecomment-21: Please cover the retry race before merging.",
+    ]);
+  });
+
+  it("includes the changed review comment body, comment ID, and thread ID inline", () => {
+    const reviewComment = {
+      id: 21,
+      author: "reviewer",
+      body: "This retry can race the cancellation path.",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      path: "src/retry.ts",
+      line: 44,
+      startLine: 42,
+      htmlUrl: "https://github.com/owner/repo/pull/7#discussion_r21",
+    };
+    const after = snapshot({
+      reviewComments: [reviewComment],
+      threads: [{ id: "PRRT_thread", isResolved: false, commentIds: [21] }],
+    });
+
+    expect(monitorEventDetails(snapshot(), after)).toEqual([
+      "active comments: +1, now 1",
+      "feedback [PRRT_thread] #21 src/retry.ts:42-44 @reviewer https://github.com/owner/repo/pull/7#discussion_r21: This retry can race the cancellation path.",
+    ]);
   });
 
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {
