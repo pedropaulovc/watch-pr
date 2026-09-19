@@ -172,6 +172,27 @@ function sameReactionCounts(previous: ReactionCounts, current: ReactionCounts): 
   return true;
 }
 
+function reactionDetailsMatchCounts(
+  details: readonly PullRequestReaction[],
+  counts: ReactionCounts,
+): boolean {
+  if (details.length !== reactionTotal(counts)) return false;
+  const ids = new Set<number>();
+  const byContent = new Map<string, number>();
+  for (const detail of details) {
+    if (ids.has(detail.id)) return false;
+    ids.add(detail.id);
+    byContent.set(detail.content, (byContent.get(detail.content) ?? 0) + 1);
+  }
+  for (const [content, count] of Object.entries(counts)) {
+    if (content === "total_count") continue;
+    if ((byContent.get(content) ?? 0) !== count) return false;
+    byContent.delete(content);
+  }
+  return byContent.size === 0;
+}
+
+
 async function mapBounded<T, R>(
   values: readonly T[],
   limit: number,
@@ -274,7 +295,12 @@ async function snapshotReactions(
 
   const states = await mapBounded(reads, REACTION_CONCURRENCY, async (read): Promise<ReactionState> => {
     try {
-      return { reactions: slots[read.slot].reactions, reactionDetails: await reactionRecords(token, read.path) };
+      const reactions = slots[read.slot].reactions;
+      const reactionDetails = await reactionRecords(token, read.path);
+      if (!reactionDetailsMatchCounts(reactionDetails, reactions)) {
+        throw new Error(`GitHub returned reaction details inconsistent with ${read.path}`);
+      }
+      return { reactions, reactionDetails };
     } catch {
       return read.fallback ?? slots[read.slot];
     }

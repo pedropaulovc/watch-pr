@@ -69,7 +69,7 @@ describe("GitHub API adapter", () => {
           base: { ref: "main" },
         });
       }
-      if (url.endsWith("/issues/7") && !url.includes("comments")) return Response.json({ reactions: { eyes: 2, total_count: 2 } });
+      if (url.endsWith("/issues/7") && !url.includes("comments")) return Response.json({ reactions: { eyes: 1, total_count: 1 } });
       if (url.endsWith("/issues/7/comments?per_page=100")) {
         return Response.json([
           { id: 1, user: { login: "reviewer" }, body: "top-level", reactions: { "+1": 1 }, created_at: "now", updated_at: "now" },
@@ -116,7 +116,7 @@ describe("GitHub API adapter", () => {
     expect(result.checks[1]).toMatchObject({ name: "Lint", conclusion: "success", kind: "check_run" });
     expect(result.mergeableState).toBe("dirty");
     expect(result.headRepository).toBe("fork/repo");
-    expect(result.bodyReactions).toEqual({ eyes: 2, total_count: 2 });
+    expect(result.bodyReactions).toEqual({ eyes: 1, total_count: 1 });
     expect(result.bodyReactionDetails).toEqual([
       { id: 900, content: "eyes", author: "alice", authorId: 11, createdAt: "2026-09-19T12:00:00.000Z" },
     ]);
@@ -172,7 +172,7 @@ describe("GitHub API adapter", () => {
             base: { ref: "main" },
           });
         }
-        if (url.endsWith("/issues/7")) return Response.json({ reactions: { eyes: 3, total_count: 3 } });
+        if (url.endsWith("/issues/7")) return Response.json({ reactions: { heart: 1, total_count: 1 } });
         if (url.endsWith("/issues/7/comments?per_page=100")) {
           return Response.json(Array.from({ length: 9 }, (_, index) => comment(index + 1)));
         }
@@ -245,6 +245,36 @@ describe("GitHub API adapter", () => {
     const third = await pullRequestSnapshot("token", "owner/repo", 7, second);
     expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
     expect(third.bodyReactionDetails).toHaveLength(2);
+  });
+
+  it("retries reaction details that disagree with their aggregate counts", async () => {
+    const requested: string[] = [];
+    stubPullRequest({
+      title: "raced",
+      bodyReactions: { heart: 1, total_count: 1 },
+      reactions: () => Response.json([]),
+      requested,
+    });
+    const raced = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(raced.bodyReactions).toEqual({ heart: 1, total_count: 1 });
+    expect(raced.bodyReactionDetails).toBeUndefined();
+
+    requested.length = 0;
+    stubPullRequest({
+      title: "settled",
+      bodyReactions: { heart: 1, total_count: 1 },
+      reactions: () => Response.json([HEART]),
+      requested,
+    });
+    const settled = await pullRequestSnapshot("token", "owner/repo", 7, raced);
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(settled.bodyReactionDetails).toEqual([{
+      id: 901,
+      content: "heart",
+      author: "alice",
+      authorId: 11,
+      createdAt: "2026-09-19T12:00:00.000Z",
+    }]);
   });
 
   it("rolls a failed reaction read back to its stored counts so the next refresh retries", async () => {
