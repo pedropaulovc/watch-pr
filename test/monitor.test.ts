@@ -372,7 +372,7 @@ describe("native monitor feed", () => {
       pullRequestNumber: number,
       githubEvent: "pull_request",
       terminalState: "watching",
-      details: ["head: feature@def"],
+      details: ["mergeability: head -> feature@def"],
     });
     await feed.reader.cancel();
   });
@@ -429,7 +429,7 @@ describe("native monitor feed", () => {
       action: "cursor_miss",
       receivedAt: current.fetchedAt,
       changes: ["reconciled"],
-      details: ["head: feature@current"],
+      details: ["mergeability: head -> feature@current"],
       terminalState: "watching",
     });
     await feed.reader.cancel();
@@ -1376,7 +1376,7 @@ describe("native monitor feed", () => {
     // newest event carries the snapshot, exactly as the single-record layout did.
     expect(state.events).toEqual([
       { ...legacy, snapshot: null },
-      { ...appended, details: ["head: feature@appended"] },
+      { ...appended, details: ["mergeability: head -> feature@appended"] },
     ]);
   });
 
@@ -1404,6 +1404,14 @@ describe("native monitor feed", () => {
 
       const registration = await internals.openMonitor(active, repository, number);
       expect(registration.cursor).toBe("event-appended");
+      storage.getKeys.length = 0;
+      const idleFeed = feedReader(await hub.fetch(new Request(
+        `https://watch-pr.test/monitor/${capability}?cursor=event-appended`,
+      )));
+      await idleFeed.reader.cancel();
+      expect(storage.getKeys).not.toContain(watchSidecarEventKey(storageKey, 0));
+      expect(storage.getKeys).not.toContain(storageKey);
+      storage.getKeys.length = 0;
       const feed = feedReader(await hub.fetch(new Request(
         `https://watch-pr.test/monitor/${capability}?cursor=event-seeded`,
       )));

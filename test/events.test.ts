@@ -237,11 +237,11 @@ describe("watch-pr event contracts", () => {
     const finished = snapshot({ checks: [completed(1, "CI"), completed(2, "Lint")] });
 
     expect(monitorEventDetails(before, started)).toEqual([
-      "checks: rerun started (pending: CI, Lint)",
+      "checks: CI -> pending, Lint -> pending",
     ]);
     expect(monitorEventDetails(started, partial)).toEqual([]);
     expect(monitorEventDetails(partial, finished)).toEqual([
-      "checks: all terminal (pass: 2, fail: 0, skipping: 0, cancel: 0)",
+      "checks: CI -> pass, Lint -> pass",
     ]);
   });
 
@@ -265,13 +265,13 @@ describe("watch-pr event contracts", () => {
     };
 
     expect(monitorEventDetails(snapshot(), snapshot({ checks: [pendingStatus] }))).toEqual([
-      "checks: rerun started (pending: buildkite/build)",
+      "checks: buildkite/build -> pending",
     ]);
     expect(monitorEventDetails(
       snapshot({ checks: [pendingStatus] }),
       snapshot({ checks: [completedStatus] }),
     )).toEqual([
-      "checks: all terminal (pass: 1, fail: 0, skipping: 0, cancel: 0)",
+      "checks: buildkite/build -> pass",
     ]);
   });
 
@@ -307,16 +307,17 @@ describe("watch-pr event contracts", () => {
         { id: "thread-resolved", isResolved: true, commentIds: [23] },
       ],
     }))).toEqual([
-      "head: feature@abc",
-      "checks: pending (CI)",
+      "mergeability: head -> feature@abc",
+      "checks: CI -> pending",
+      "active comments: now 2",
       "feedback [thread-open] #22 src/retry.ts:9 @reviewer: Please keep this visible.",
       "feedback [-] #24 src/retry.ts:9 @reviewer: Membership was truncated.",
     ]);
     expect(monitorReconciliationDetails(snapshot({
       checks: [{ ...pending, status: "completed", conclusion: "success" }],
     }))).toEqual([
-      "head: feature@abc",
-      "checks: all terminal (pass: 1, fail: 0, skipping: 0, cancel: 0)",
+      "mergeability: head -> feature@abc",
+      "checks: CI -> pass",
     ]);
   });
 
@@ -351,8 +352,7 @@ describe("watch-pr event contracts", () => {
     });
 
     expect(monitorEventDetails(before, after)).toEqual([
-      "base: main -> release/2",
-      "rebase: CLEAN",
+      "mergeability: base main -> release/2, state -> CLEAN",
       "comment #21 deleted",
       "review #31 deleted",
       "feedback [PRRT_thread] #41 deleted",
@@ -362,6 +362,67 @@ describe("watch-pr event contracts", () => {
       snapshot({ mergeableState: "dirty" }),
       snapshot({ mergeableState: "unknown" }),
     )).toEqual([]);
+  });
+
+  it("reports active review-comment deltas for reopened and resolved threads", () => {
+    const reviewComments = [1, 2, 3, 4].map((id) => ({
+      id,
+      author: "reviewer",
+      body: `Feedback ${id}`,
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      path: "src/retry.ts",
+      line: id,
+    }));
+    const partlyResolved = snapshot({
+      reviewComments,
+      threads: [
+        { id: "thread-one", isResolved: false, commentIds: [1, 2] },
+        { id: "thread-two", isResolved: true, commentIds: [3, 4] },
+      ],
+    });
+    const allOpen = snapshot({
+      reviewComments,
+      threads: [
+        { id: "thread-one", isResolved: false, commentIds: [1, 2] },
+        { id: "thread-two", isResolved: false, commentIds: [3, 4] },
+      ],
+    });
+    const allResolved = snapshot({
+      reviewComments,
+      threads: [
+        { id: "thread-one", isResolved: true, commentIds: [1, 2] },
+        { id: "thread-two", isResolved: true, commentIds: [3, 4] },
+      ],
+    });
+
+    expect(monitorEventDetails(partlyResolved, allOpen)).toEqual([
+      "active comments: +2, now 4",
+      "thread thread-two: reopened",
+    ]);
+    expect(monitorEventDetails(allOpen, allResolved)).toEqual([
+      "active comments: -4, now 0",
+      "thread thread-one: resolved",
+      "thread thread-two: resolved",
+    ]);
+  });
+
+  it("reports deployment status in one detailed line", () => {
+    const unchanged = snapshot();
+    expect(monitorEventDetails(unchanged, unchanged, {
+      githubEvent: "deployment_status",
+      action: "created",
+      payload: {
+        deployment: { environment: "production", ref: "feature" },
+        deployment_status: {
+          state: "success",
+          environment_url: "https://example.test/deployments/1",
+        },
+      },
+    })).toEqual([
+      "deployment: production (feature) -> success https://example.test/deployments/1",
+    ]);
   });
 
   it("omits unavailable head references and bounds persisted monitor details", () => {
@@ -399,7 +460,7 @@ describe("watch-pr event contracts", () => {
     expect(monitorEventDetails(
       snapshot(),
       snapshot({ checks: [failedCheck(1, "\u001b[31mCI\u001b[0m\nspoof")] }),
-    )).toEqual(["check CIspoof: fail"]);
+    )).toEqual(["checks: CIspoof -> fail"]);
     const sharedPrefix = "x".repeat(600);
     const duplicateAfterTruncation = monitorEventDetails(snapshot(), snapshot({
       checks: [
@@ -457,6 +518,7 @@ describe("watch-pr event contracts", () => {
     });
 
     expect(monitorEventDetails(snapshot(), after)).toEqual([
+      "active comments: +1, now 1",
       "feedback [PRRT_thread] #21 src/retry.ts:42-44 @reviewer https://github.com/owner/repo/pull/7#discussion_r21: This retry can race the cancellation path.",
     ]);
   });

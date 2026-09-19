@@ -298,13 +298,15 @@ function checkKey(check: PullRequestCheck): string {
   return check.kind === "commit_status" ? `${check.kind}:${check.name}` : `${check.kind}:${check.id}`;
 }
 
-function checkTerminalSummary(checks: PullRequestCheck[]): string {
-  const counts = { pass: 0, fail: 0, skipping: 0, cancel: 0 };
-  for (const check of checks) {
-    const bucket = checkBucket(check);
-    if (bucket !== "pending") counts[bucket] += 1;
-  }
-  return `checks: all terminal (pass: ${counts.pass}, fail: ${counts.fail}, skipping: ${counts.skipping}, cancel: ${counts.cancel})`;
+function checkSummary(checks: PullRequestCheck[]): string {
+  const details = [...checks]
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .map((check) => {
+      const bucket = checkBucket(check);
+      const url = (bucket === "fail" || bucket === "cancel") && check.url ? ` ${check.url}` : "";
+      return `${check.name} -> ${bucket}${url}`;
+    });
+  return `checks: ${details.join(", ")}`;
 }
 
 function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[]): string[] {
@@ -315,44 +317,33 @@ function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[])
   const currentPending = new Set(
     current.filter((check) => checkBucket(check) === "pending").map(checkKey),
   );
-  const lines = current
-    .filter((check) => {
-      const bucket = checkBucket(check);
-      if (bucket !== "fail" && bucket !== "cancel") return false;
-      const prior = previousByKey.get(checkKey(check));
-      return !prior || checkBucket(prior) !== bucket || prior.completedAt !== check.completedAt;
-    })
-    .map((check) => `check ${check.name}: ${checkBucket(check)}${check.url ? ` ${check.url}` : ""}`);
+  const selected = new Map<string, PullRequestCheck>();
+  for (const check of current) {
+    const bucket = checkBucket(check);
+    if (bucket !== "fail" && bucket !== "cancel") continue;
+    const prior = previousByKey.get(checkKey(check));
+    if (!prior || checkBucket(prior) !== bucket || prior.completedAt !== check.completedAt) {
+      selected.set(checkKey(check), check);
+    }
+  }
 
   if (previousPending.size === 0 && currentPending.size > 0) {
-    const names = [...new Set(
-      current.filter((check) => currentPending.has(checkKey(check))).map((check) => check.name),
-    )].sort();
-    lines.push(`checks: rerun started (pending: ${names.join(", ")})`);
+    for (const check of current) {
+      if (currentPending.has(checkKey(check))) selected.set(checkKey(check), check);
+    }
   }
   if (
     previousPending.size > 0 &&
     currentPending.size === 0 &&
     [...previousPending].every((key) => current.some((check) => checkKey(check) === key))
   ) {
-    lines.push(checkTerminalSummary(current));
+    return current.length > 0 ? [checkSummary(current)] : [];
   }
-  return lines;
+  return selected.size > 0 ? [checkSummary([...selected.values()])] : [];
 }
 
 function reconciliationCheckDetails(checks: PullRequestCheck[]): string[] {
-  const lines = checks
-    .filter((check) => checkBucket(check) === "fail" || checkBucket(check) === "cancel")
-    .map((check) => `check ${check.name}: ${checkBucket(check)}${check.url ? ` ${check.url}` : ""}`);
-  const pendingNames = [...new Set(
-    checks.filter((check) => checkBucket(check) === "pending").map((check) => check.name),
-  )].sort();
-  if (pendingNames.length > 0) {
-    lines.push(`checks: pending (${pendingNames.join(", ")})`);
-  } else if (checks.length > 0) {
-    lines.push(checkTerminalSummary(checks));
-  }
-  return lines;
+  return checks.length > 0 ? [checkSummary(checks)] : [];
 }
 
 function compactBody(value: string): string {
@@ -450,23 +441,23 @@ function mergeabilityDetails(
   previous: PullRequestSnapshot | null,
   current: PullRequestSnapshot,
 ): string[] {
-  const lines: string[] = [];
+  const details: string[] = [];
   if (
     (!previous || previous.headRefName !== current.headRefName || previous.headSha !== current.headSha) &&
     current.headRefName &&
     current.headSha
   ) {
-    lines.push(`head: ${current.headRefName}@${current.headSha}`);
+    details.push(`head -> ${current.headRefName}@${current.headSha}`);
   }
   if (previous && previous.baseRefName !== current.baseRefName) {
-    lines.push(`base: ${previous.baseRefName ?? "<unknown>"} -> ${current.baseRefName ?? "<unknown>"}`);
+    details.push(`base ${previous.baseRefName ?? "<unknown>"} -> ${current.baseRefName ?? "<unknown>"}`);
   }
   const previousState = previous?.mergeableState?.toUpperCase();
   const currentState = current.mergeableState?.toUpperCase();
   const previousNeedsRebase = previousState === "BEHIND" || previousState === "DIRTY";
   const currentNeedsRebase = currentState === "BEHIND" || currentState === "DIRTY";
   if (currentNeedsRebase && previousState !== currentState) {
-    lines.push(`rebase: ${currentState}`);
+    details.push(`state -> ${currentState}`);
   } else if (
     previous &&
     previousNeedsRebase &&
@@ -474,9 +465,9 @@ function mergeabilityDetails(
     currentState !== "UNKNOWN" &&
     previousState !== currentState
   ) {
-    lines.push(`rebase: ${currentState}`);
+    details.push(`state -> ${currentState}`);
   }
-  return lines;
+  return details.length > 0 ? [`mergeability: ${details.join(", ")}`] : [];
 }
 
 function threadDetails(previous: PullRequestSnapshot, current: PullRequestSnapshot): string[] {
@@ -488,7 +479,8 @@ function threadDetails(previous: PullRequestSnapshot, current: PullRequestSnapsh
   });
 }
 
-export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): string[] {
+function activeReviewComments(snapshot: PullRequestSnapshot): PullRequestComment[] {
+  if (snapshot.threads.length === 0) return snapshot.reviewComments;
   const knownThreadCommentIds = new Set(
     snapshot.threads.flatMap((thread) => thread.commentIds),
   );
@@ -497,13 +489,56 @@ export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): str
       .filter((thread) => !thread.isResolved)
       .flatMap((thread) => thread.commentIds),
   );
-  const reviewComments = snapshot.threads.length === 0
-    ? snapshot.reviewComments
-    : snapshot.reviewComments.filter((comment) =>
-      unresolvedCommentIds.has(comment.id) || !knownThreadCommentIds.has(comment.id));
+  return snapshot.reviewComments.filter((comment) =>
+    unresolvedCommentIds.has(comment.id) || !knownThreadCommentIds.has(comment.id));
+}
+
+function activeCommentDetails(
+  previous: PullRequestSnapshot,
+  current: PullRequestSnapshot,
+): string[] {
+  const previousCount = activeReviewComments(previous).length;
+  const currentCount = activeReviewComments(current).length;
+  if (previousCount === currentCount) return [];
+  const delta = currentCount - previousCount;
+  return [`active comments: ${delta > 0 ? "+" : ""}${delta}, now ${currentCount}`];
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function stringProperty(value: Record<string, unknown> | null, key: string): string | null {
+  const property = value?.[key];
+  return typeof property === "string" && property.trim() ? property.trim() : null;
+}
+
+function deploymentDetails(
+  event: Pick<WatchEvent, "githubEvent" | "action" | "payload"> | null,
+): string[] {
+  if (!event || (event.githubEvent !== "deployment" && event.githubEvent !== "deployment_status")) {
+    return [];
+  }
+  const payload = recordValue(event.payload);
+  const deployment = recordValue(payload?.deployment);
+  const status = recordValue(payload?.deployment_status);
+  const environment = stringProperty(status, "environment") ??
+    stringProperty(deployment, "environment") ??
+    "unknown";
+  const state = stringProperty(status, "state") ?? event.action ?? "updated";
+  const ref = stringProperty(deployment, "ref");
+  const url = stringProperty(status, "environment_url") ?? stringProperty(status, "target_url");
+  return [
+    `deployment: ${environment}${ref ? ` (${ref})` : ""} -> ${state}${url ? ` ${url}` : ""}`,
+  ];
+}
+
+export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): string[] {
+  const reviewComments = activeReviewComments(snapshot);
   return boundedDetails([
     ...mergeabilityDetails(null, snapshot),
     ...reconciliationCheckDetails(snapshot.checks),
+    ...(reviewComments.length > 0 ? [`active comments: now ${reviewComments.length}`] : []),
     ...reviewComments.map((comment) => reviewCommentDetail(comment, snapshot)),
   ]);
 }
@@ -511,11 +546,14 @@ export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): str
 export function monitorEventDetails(
   previous: PullRequestSnapshot | null,
   current: PullRequestSnapshot,
+  event: Pick<WatchEvent, "githubEvent" | "action" | "payload"> | null = null,
 ): string[] {
   if (!previous) return monitorReconciliationDetails(current);
   const lines = [
     ...mergeabilityDetails(previous, current),
     ...checkDetails(previous.checks, current.checks),
+    ...deploymentDetails(event),
+    ...activeCommentDetails(previous, current),
     ...changedComments(previous.comments, current.comments).map(commentDetail),
     ...removedComments(previous.comments, current.comments)
       .map((comment) => `comment #${comment.id} deleted`),
