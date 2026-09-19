@@ -1093,6 +1093,46 @@ describe("watch-pr event contracts", () => {
     ]);
   });
 
+  it("keeps terminal counts ahead of a stored cursor whose last page returned later", () => {
+    const alice = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:01:00.000Z" };
+    const bob = { id: 2, content: "heart", author: "bob", authorId: 12, createdAt: "2026-09-03T00:02:00.000Z" };
+    // The merge read this target itself: one heart, seen after every other observation here.
+    const merged = snapshot({
+      state: "closed",
+      merged: true,
+      mergedAt: "2026-09-03T00:04:00.000Z",
+      fetchedAt: "2026-09-03T00:04:00.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionsObservedAt: "2026-09-03T00:04:00.000Z",
+      bodyReactionDetails: [alice],
+      bodyReactionDetailsReadAt: "2026-09-03T00:04:00.000Z",
+    });
+    // Committed in the meantime: an unfinished read of the counts the merge has already left
+    // behind, whose last page happened to come back after the merge's read did.
+    const partial = snapshot({
+      fetchedAt: "2026-09-03T00:03:00.000Z",
+      bodyReactions: { heart: 2, total_count: 2 },
+      bodyReactionsObservedAt: "2026-09-03T00:03:00.000Z",
+      bodyReactionDetails: undefined,
+      bodyReactionDetailsReadAt: "2026-09-03T00:05:00.000Z",
+      bodyReactionProgress: {
+        records: [alice, bob],
+        nextUrl: "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2",
+      },
+    });
+    const settled = mergeReactionKnowledge(merged, partial);
+    // Nothing will resume that cursor, and the aggregate behind it is the older one: taking
+    // either would leave the watch permanently stating a reaction state it has moved past.
+    expect(settled.bodyReactions).toEqual({ heart: 1, total_count: 1 });
+    expect(settled.bodyReactionProgress).toBeUndefined();
+    expect(settled.bodyReactionDetails).toEqual([alice]);
+    // Who holds the remaining heart is known; who removed the other one never will be, and
+    // this is the last event on the pull request, so the movement is stated unattributed.
+    expect(monitorEventDetails(partial, settled).filter((line) => line.startsWith("reaction"))).toEqual([
+      "reaction counts: HEART 2 -> 1 on PR #7 @author https://github.com/owner/repo/pull/7 (attribution unavailable)",
+    ]);
+  });
+
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {
     const body = JSON.stringify({ action: "opened" });
     const signature = `sha256=${await hmacSha256Hex("secret", body)}`;

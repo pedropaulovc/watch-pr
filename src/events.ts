@@ -428,10 +428,12 @@ function readIsNewer(candidate: ReactionKnowledge, incumbent: ReactionKnowledge)
  * Taking back details committed against counts this snapshot has already left would restore
  * a reaction state the pull request is no longer in and hide the movement away from it -
  * a reaction added and removed again while the merge landed would end up stored as present
- * forever - and a cursor nothing will resume is no better. The terminal counts stand alone
- * instead, unresolved, and the event announces them as unattributed. Borrowed details take
- * the same route: a borrow is not a read, so it cannot buy the older counts authority they
- * would not otherwise have.
+ * forever - and a cursor nothing will resume is no better. Read times do not enter into it:
+ * a page request that returned after this snapshot's read can carry an aggregate observed
+ * long before it, so ordering by read would hand the target back to the older counts. Where
+ * `base` has nothing better of its own the terminal counts stand alone, unresolved, and the
+ * event announces them as unattributed. Borrowed details take the same route: a borrow is
+ * not a read, so it cannot buy the older counts authority they would not otherwise have.
  *
  * A target either side marks `invalidated` is settled before any of that. The read behind it
  * ran to completion and came back with records its own counts contradict, which condemns
@@ -488,7 +490,16 @@ function resolveReactionKnowledge(
       const sourceProgressSupersedes = source?.reactionProgress !== undefined &&
         !agrees &&
         readIsNewer(source, base);
-      if (basePublishes && (sourceCompleteSupersedes || sourceProgressSupersedes)) {
+      // Neither shape outranks counts a terminal snapshot observed later. A read - finished
+      // or still paginating - that happened to return after this one does not make the older
+      // aggregate behind it the newer word on the target, and past a merge or closure nothing
+      // would ever correct the swap: the stale counts, and a cursor no refresh will resume,
+      // would stay committed for good.
+      if (
+        basePublishes &&
+        !terminalCountsStand &&
+        (sourceCompleteSupersedes || sourceProgressSupersedes)
+      ) {
         return {
           reactions: source.reactions,
           reactionsObservedAt: source.reactionsObservedAt,
@@ -1063,8 +1074,11 @@ function reactionCountMovement(previous: ReactionCounts, current: ReactionCounts
  * An unknown target is normally silent too, because the next refresh reads it and reports
  * what it finds. A merge or a closure is the one event with no next refresh: the counts it
  * saw move are all anyone will ever get, so they are reported as an aggregate the event
- * states it could not attribute, rather than being dropped for want of the actors. These
- * lines are ordinary details, so `boundedDetails` caps them with everything else.
+ * states it could not attribute, rather than being dropped for want of the actors. A baseline
+ * learned on that same event is reported the same way - knowing who holds the reactions now
+ * says nothing about who added or removed the ones that moved, and no later refresh will say
+ * it either. These lines are ordinary details, so `boundedDetails` caps them with everything
+ * else.
  */
 function reactionDetails(previous: PullRequestSnapshot, current: PullRequestSnapshot): string[] {
   const previousGroups = reactionGroups(previous);
@@ -1072,7 +1086,7 @@ function reactionDetails(previous: PullRequestSnapshot, current: PullRequestSnap
   const lines: string[] = [];
   for (const [label, group] of reactionGroups(current)) {
     const prior = previousGroups.get(label);
-    if (group.reactions === undefined) {
+    if (group.reactions === undefined || (prior !== undefined && prior.reactions === undefined)) {
       if (!unresolvedIsFinal) continue;
       const movement = reactionCountMovement(prior?.counts ?? {}, group.counts);
       if (movement.length === 0) continue;
@@ -1081,7 +1095,6 @@ function reactionDetails(previous: PullRequestSnapshot, current: PullRequestSnap
       );
       continue;
     }
-    if (prior && prior.reactions === undefined) continue;
     lines.push(...reactionTargetDetails(prior?.reactions ?? [], group.reactions, group.target));
   }
   return lines;
