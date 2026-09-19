@@ -300,6 +300,45 @@ export function reactionKnowledgeAdvanced(
     learnedComment(previous.reviewComments, current.reviewComments);
 }
 
+/**
+ * Carries reaction knowledge forward from the snapshot already stored into the one about to
+ * replace it. Two refreshes can be in flight over the same watch and each can learn a
+ * different subset of targets - one reads the body while the other's body read fails and it
+ * reads a comment instead - so the later writer must not publish its own gaps over what the
+ * earlier writer proved. Only targets the incoming snapshot does not know are filled, and a
+ * filled target also takes the stored aggregate counts, because the counts are what the next
+ * refresh compares against: details from one refresh beside counts from another would either
+ * hide a real change or force a pointless re-read. Never overwrites known details, so the
+ * merge only ever adds knowledge.
+ */
+export function mergeReactionKnowledge(
+  current: PullRequestSnapshot,
+  incoming: PullRequestSnapshot,
+): PullRequestSnapshot {
+  let merged = false;
+  let bodyReactions = incoming.bodyReactions;
+  let bodyReactionDetails = incoming.bodyReactionDetails;
+  if (bodyReactionDetails === undefined && current.bodyReactionDetails !== undefined) {
+    bodyReactions = current.bodyReactions;
+    bodyReactionDetails = current.bodyReactionDetails;
+    merged = true;
+  }
+  const mergeComments = (stored: PullRequestComment[], next: PullRequestComment[]): PullRequestComment[] => {
+    const storedById = new Map(stored.map((comment) => [comment.id, comment] as const));
+    return next.map((comment) => {
+      if (comment.reactionDetails !== undefined) return comment;
+      const known = storedById.get(comment.id);
+      if (!known?.reactionDetails) return comment;
+      merged = true;
+      return { ...comment, reactions: known.reactions, reactionDetails: known.reactionDetails };
+    });
+  };
+  const comments = mergeComments(current.comments, incoming.comments);
+  const reviewComments = mergeComments(current.reviewComments, incoming.reviewComments);
+  if (!merged) return incoming;
+  return { ...incoming, bodyReactions, bodyReactionDetails, comments, reviewComments };
+}
+
 export function snapshotChanges(
   previous: PullRequestSnapshot | null,
   current: PullRequestSnapshot,

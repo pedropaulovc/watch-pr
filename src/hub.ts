@@ -5,6 +5,7 @@ import {
   createWatchEvent,
   eventPullRequestNumbers,
   isSupportedGithubEvent,
+  mergeReactionKnowledge,
   monitorEventDetails,
   monitorReconciliationDetails,
   parseWatchKey,
@@ -1208,27 +1209,40 @@ export async function openWatchStateMutation(
         chunkCount: snapshotWrite.chunkCount,
       };
 
-      // The old snapshot record is retired before the index is written: a deferred retirement
-      // moves the queue's `next`, and only the index write persists that pointer. Enqueueing
-      // after the write would leave the job rows unreachable and their chunks unreclaimable.
-      let nextCleanup = cleanup;
+      // Retirements are settled before the index is written: a deferred retirement moves the
+      // queue's `next`, and only the index write persists that pointer. Enqueueing after the
+      // write would leave the job rows unreachable and their chunks unreclaimable.
+      const rootReferences = refs.filter((ref) => ref.payload.source === "root").length;
+      const nextRoot = rootReferences > 0 ? root : null;
+      const retirements: SidecarCleanupJob[] = [];
       if (snapshotRef) {
-        const retirement = retireRecord(
+        retirements.push(retireRecord(
           watchSidecarSnapshotKey(storageKey, snapshotRef.sequence),
           snapshotRef.chunkCount,
-        );
-        if (retirement.chunkCount > 0) {
-          const enqueued = await enqueueDeferredCleanup(storage, storageKey, nextCleanup, [retirement]);
-          nextCleanup = enqueued.cleanup;
-          puts += enqueued.puts;
-        } else {
-          if (protectedCleanupRecordKeys(storageKey, nextSnapshotRef, refs, root).has(retirement.recordKey)) {
-            throw sidecarCorruption();
-          }
-          await deleteStorageKeys(storage, [retirement.recordKey]);
-          deletes += 1;
-        }
+        ));
       }
+      // A predecessor record with no events leaves nothing pointing at it once its snapshot
+      // moves into the sidecar, so keeping it in the index would claim a root nobody reads.
+      if (root && nextRoot === null) retirements.push(retireRecord(storageKey, root.chunkCount));
+
+      let nextCleanup = cleanup;
+      const protectedRecordKeys = protectedCleanupRecordKeys(storageKey, nextSnapshotRef, refs, nextRoot);
+      const immediateRetirementKeys = retirements
+        .filter((retirement) => retirement.chunkCount === 0)
+        .map((retirement) => retirement.recordKey);
+      if (immediateRetirementKeys.some((key) => protectedRecordKeys.has(key))) throw sidecarCorruption();
+      if (immediateRetirementKeys.length > 0) {
+        await deleteStorageKeys(storage, immediateRetirementKeys);
+        deletes += immediateRetirementKeys.length;
+      }
+      const enqueued = await enqueueDeferredCleanup(
+        storage,
+        storageKey,
+        nextCleanup,
+        retirements.filter((retirement) => retirement.chunkCount > 0),
+      );
+      nextCleanup = enqueued.cleanup;
+      puts += enqueued.puts;
 
       // The events stay exactly where they are; only the snapshot record is replaced.
       const nextIndex: WatchSidecarIndex = {
@@ -1236,7 +1250,7 @@ export async function openWatchStateMutation(
         nextSequence,
         nextSnapshotSequence: snapshotSequence + 1,
         snapshot: nextSnapshotRef,
-        root,
+        root: nextRoot,
         cleanup: nextCleanup,
         events: [...refs],
       };
@@ -1253,6 +1267,7 @@ export async function openWatchStateMutation(
       snapshotRef = nextSnapshotRef;
       nextSnapshotSequence = snapshotSequence + 1;
       cleanup = nextCleanup;
+      root = nextRoot;
       hasSidecar = true;
       snapshot = nextSnapshot;
       metadata = { snapshot, events: sidecarEventMetadata(refs, snapshot) };
@@ -2428,9 +2443,11 @@ export class WatchPrHub {
       const currentTime = Date.parse(current.fetchedAt);
       const incomingTime = Date.parse(snapshot.fetchedAt);
       if (Number.isFinite(currentTime) && Number.isFinite(incomingTime) && currentTime > incomingTime) return;
-      // Re-checked under the transaction: another writer may already have learned these.
-      if (!reactionKnowledgeAdvanced(current, snapshot)) return;
-      await mutation.replaceSnapshot(snapshot);
+      // Both checked against what is stored right now, and merged first so a partial
+      // enrichment written while this refresh was in flight is carried forward, not erased.
+      const next = mergeReactionKnowledge(current, snapshot);
+      if (!reactionKnowledgeAdvanced(current, next)) return;
+      await mutation.replaceSnapshot(next);
       stored = true;
     });
     return stored;
@@ -2470,6 +2487,9 @@ export class WatchPrHub {
             snapshot = current.snapshot;
             changes = [];
           } else {
+            // An ordinary event must not regress reaction knowledge either: this refresh may
+            // have failed a read another in-flight refresh already stored.
+            snapshot = mergeReactionKnowledge(current.snapshot, snapshot);
             changes = snapshotChanges(current.snapshot, snapshot);
           }
         }

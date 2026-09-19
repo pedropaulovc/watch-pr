@@ -1753,4 +1753,165 @@ describe("native monitor feed", () => {
     const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
     expect(stored.snapshot?.fetchedAt).toBe("2099-01-01T00:00:00.000Z");
   });
+
+  // Two refreshes overlap: one learns the PR body while the other's comment read fails, and
+  // the comment the second one learned is already stored by the time the first one writes.
+  function partialEnrichmentFixture(storage: MemoryStorage, storageKey: string) {
+    const comment = (
+      reactionDetails?: { id: number; content: string; author: string; authorId: number; createdAt: string }[],
+    ) => {
+      const base = {
+        id: 11,
+        author: "bob",
+        body: "comment body",
+        createdAt: "2026-09-09T00:00:00.000Z",
+        updatedAt: "2026-09-09T00:00:00.000Z",
+        reactions: { "+1": 1, total_count: 1 },
+        path: undefined,
+        line: null,
+        startLine: null,
+        diffHunk: undefined,
+        inReplyToId: null,
+        htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-11",
+      };
+      return reactionDetails ? { ...base, reactionDetails } : base;
+    };
+    const commentReaction = {
+      id: 501,
+      content: "+1",
+      author: "carol",
+      authorId: 12,
+      createdAt: "2026-09-09T01:00:00.000Z",
+    };
+    const bodyReaction = {
+      id: 901,
+      content: "heart",
+      author: "alice",
+      authorId: 11,
+      createdAt: "2026-09-09T02:00:00.000Z",
+    };
+    const reads = { body: 0, comment: 0 };
+    let concurrentWrite: (() => Promise<void>) | null = null;
+    const base = openPullRequestFetch();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/issues/7")) return Response.json({ reactions: { heart: 1, total_count: 1 } });
+      if (url.endsWith("/issues/7/comments?per_page=100")) {
+        return Response.json([{
+          id: 11,
+          user: { login: "bob" },
+          body: "comment body",
+          created_at: "2026-09-09T00:00:00.000Z",
+          updated_at: "2026-09-09T00:00:00.000Z",
+          html_url: "https://github.com/owner/repo/pull/7#issuecomment-11",
+          reactions: { "+1": 1, total_count: 1 },
+        }]);
+      }
+      if (url.endsWith("/issues/7/reactions?per_page=100")) {
+        reads.body += 1;
+        return Response.json([{
+          id: 901,
+          content: "heart",
+          user: { login: "alice", id: 11 },
+          created_at: "2026-09-09T02:00:00.000Z",
+        }]);
+      }
+      if (url.endsWith("/issues/comments/11/reactions?per_page=100")) {
+        reads.comment += 1;
+        // The overlapping refresh stores the comment details this one is about to fail on.
+        const pendingWrite = concurrentWrite;
+        concurrentWrite = null;
+        await pendingWrite?.();
+        return new Response("boom", { status: 500 });
+      }
+      return base(input);
+    });
+    const storeConcurrentComment = (stored: PullRequestSnapshot) => {
+      concurrentWrite = async () => {
+        const mutation = await openWatchStateMutation(storage as unknown as DurableObjectStorage, storageKey);
+        await mutation.replaceSnapshot({ ...stored, comments: [comment([commentReaction])] } as PullRequestSnapshot);
+      };
+    };
+    return { comment, commentReaction, bodyReaction, reads, fetchMock, storeConcurrentComment };
+  }
+
+  it("merges a concurrently stored reaction read into a silent enrichment", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const storageKey = watchStorageKey(userId, repository, number);
+    const fixture = partialEnrichmentFixture(storage, storageKey);
+    const unknown = snapshot({
+      headSha: "reopened",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: undefined,
+      comments: [fixture.comment() as PullRequestSnapshot["comments"][number]],
+    });
+    await storeMonitor(storage, { snapshot: unknown, events: [event("event-1", unknown)] });
+    fixture.storeConcurrentComment(unknown);
+
+    vi.stubGlobal("fetch", fixture.fetchMock);
+    try {
+      const first = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(first.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      expect(fixture.reads).toEqual({ body: 1, comment: 1 });
+
+      // The failed comment read must not erase what the overlapping refresh proved.
+      const merged = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(merged.snapshot?.bodyReactionDetails).toEqual([fixture.bodyReaction]);
+      expect(merged.snapshot?.comments[0]?.reactionDetails).toEqual([fixture.commentReaction]);
+      expect(merged.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+
+      storage.putKeys.length = 0;
+      storage.deleteKeys.length = 0;
+      const second = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(second.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      // Both targets are known with unchanged counts, so neither costs a request.
+      expect(fixture.reads).toEqual({ body: 1, comment: 1 });
+      expect(storage.putKeys).toEqual([]);
+      expect(storage.deleteKeys).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("merges a concurrently stored reaction read into an ordinary published event", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const storageKey = watchStorageKey(userId, repository, number);
+    const fixture = partialEnrichmentFixture(storage, storageKey);
+    // headSha still "abc", so the refresh this webhook drives carries a real change.
+    const unknown = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: undefined,
+      comments: [fixture.comment() as PullRequestSnapshot["comments"][number]],
+    });
+    await storeMonitor(storage, { snapshot: unknown, events: [event("event-1", unknown)] });
+    fixture.storeConcurrentComment(unknown);
+    const internals = hub as unknown as HubInternals;
+
+    vi.stubGlobal("fetch", fixture.fetchMock);
+    try {
+      await internals.processWebhook("pull_request", "delivery-merge", {
+        action: "synchronize",
+        repository: { full_name: repository },
+        pull_request: { number },
+      });
+      await Promise.all(pending.splice(0));
+
+      const published = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(published.events.map((storedEvent) => storedEvent.id)).toHaveLength(2);
+      expect(published.snapshot?.headSha).toBe("reopened");
+      expect(published.snapshot?.bodyReactionDetails).toEqual([fixture.bodyReaction]);
+      expect(published.snapshot?.comments[0]?.reactionDetails).toEqual([fixture.commentReaction]);
+
+      storage.putKeys.length = 0;
+      const poll = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(poll.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      expect(fixture.reads).toEqual({ body: 1, comment: 1 });
+      expect(storage.putKeys).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

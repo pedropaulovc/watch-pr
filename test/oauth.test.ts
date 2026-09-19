@@ -909,6 +909,57 @@ describe("watch state sidecar storage", () => {
     await expect(storage.get(retiredKey)).resolves.toBeUndefined();
   });
 
+  it("retires an event-less predecessor record when a snapshot is replaced without an event", async () => {
+    const compactStorage = new MemoryStorage();
+    const legacy = pullRequestSnapshot("legacy", "2026-09-13T00:00:00.000Z");
+    const learned = pullRequestSnapshot("learned", "2026-09-13T00:01:00.000Z");
+    // A record written before individual reactions existed: a snapshot and nothing else.
+    await writeStoredWatchState(compactStorage as unknown as WatchStorage, storageKey, {
+      snapshot: legacy,
+      events: [],
+    });
+
+    const compact = await openWatchStateMutation(compactStorage as unknown as WatchStorage, storageKey);
+    await compact.replaceSnapshot(learned);
+
+    // Nothing references the predecessor once its snapshot moves into the sidecar.
+    await expect(compactStorage.get(watchSidecarIndexKey(storageKey))).resolves.toMatchObject({
+      root: null,
+      events: [],
+    });
+    await expect(compactStorage.get(storageKey)).resolves.toBeUndefined();
+    await expect(readWatchStateMetadata(compactStorage as unknown as WatchStorage, storageKey))
+      .resolves.toMatchObject({ snapshot: learned, events: [] });
+    await expect(readStoredWatchState(compactStorage as unknown as WatchStorage, storageKey))
+      .resolves.toMatchObject({ snapshot: learned, events: [] });
+
+    const chunkedStorage = new MemoryStorage();
+    await writeStoredWatchState(chunkedStorage as unknown as WatchStorage, storageKey, {
+      snapshot: pullRequestSnapshot("x".repeat(80_000), "2026-09-13T00:00:00.000Z"),
+      events: [],
+    });
+    const chunked = await openWatchStateMutation(chunkedStorage as unknown as WatchStorage, storageKey);
+    await chunked.replaceSnapshot(learned);
+
+    // A chunked predecessor goes through the deferred queue, with the pointer in the index.
+    await expect(chunkedStorage.get(watchSidecarCleanupKey(storageKey, 0))).resolves.toMatchObject({
+      recordKey: storageKey,
+    });
+    await expect(chunkedStorage.get(watchSidecarIndexKey(storageKey))).resolves.toMatchObject({
+      root: null,
+      cleanup: { cursor: 0, next: 1 },
+    });
+    await expect(readStoredWatchState(chunkedStorage as unknown as WatchStorage, storageKey))
+      .resolves.toMatchObject({ snapshot: learned, events: [] });
+
+    for (let index = 0; index < 4; index += 1) {
+      const mutation = await openWatchStateMutation(chunkedStorage as unknown as WatchStorage, storageKey);
+      await mutation.append(watchEvent(index, { stored: true }), learned);
+    }
+    await expect(chunkedStorage.list({ prefix: `${storageKey}:chunk:` })).resolves.toMatchObject({ size: 0 });
+    await expect(chunkedStorage.get(storageKey)).resolves.toBeUndefined();
+  });
+
   it("fails closed for a present but unreadable sidecar index", async () => {
     const storage = new MemoryStorage();
     const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
