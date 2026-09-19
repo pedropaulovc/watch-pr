@@ -5,11 +5,14 @@ import {
   createWatchEvent,
   eventPullRequestNumbers,
   isSupportedGithubEvent,
+  mergeReactionKnowledge,
   monitorEventDetails,
   monitorReconciliationDetails,
   parseWatchKey,
+  reactionKnowledgeAdvanced,
   resourceUri,
   snapshotChanges,
+  terminalState,
   watchKey,
 } from "./events";
 import { exchangeGithubCode, GithubApiError, githubUser, pullRequestSnapshot, refreshGithubToken } from "./github";
@@ -25,6 +28,7 @@ import type {
   PrMonitorRegistration,
   PullRequestCheck,
   PullRequestComment,
+  PullRequestReaction,
   PullRequestReview,
   PullRequestSnapshot,
   PullRequestThread,
@@ -254,13 +258,23 @@ function countWatchStorageWrites(storage: WatchStorage, writes: WatchStorageWrit
 export interface WatchStateMutation {
   metadata: WatchStateMetadata;
   append(event: WatchEvent, snapshot: PullRequestSnapshot | null): Promise<WatchAppendStats>;
+  /**
+   * Stores a newer snapshot without an event. Used only for refreshes that carry nothing
+   * reportable but do carry knowledge worth keeping, so the next refresh starts from it.
+   */
+  replaceSnapshot(snapshot: PullRequestSnapshot): Promise<WatchStateWriteStats>;
 }
 
 function emptyWatchState(): StoredWatchState {
   return { snapshot: null, events: [] };
 }
 
-/** Adds the fork-routing field introduced after predecessor records already existed. */
+/**
+ * The one read boundary that repairs persisted snapshots written before a field existed:
+ * fork routing. Reaction detail arrays are deliberately not repaired here - a snapshot that
+ * predates individual reactions has unknown reactions, not empty ones, and claiming empty
+ * would make every reaction already on the PR look newly created on the next refresh.
+ */
 function normalizePullRequestSnapshot(snapshot: PullRequestSnapshot | null): PullRequestSnapshot | null {
   if (snapshot === null || snapshot.headRepository !== undefined) return snapshot;
   return { ...snapshot, headRepository: null };
@@ -351,6 +365,20 @@ function isReactionCounts(value: unknown): value is ReactionCounts {
   return true;
 }
 
+function isPullRequestReaction(value: unknown): value is PullRequestReaction {
+  if (!isObjectRecord(value)) return false;
+  return Number.isSafeInteger(value.id) &&
+    typeof value.content === "string" &&
+    isNullableString(value.author) &&
+    isOptionalNullableSafeInteger(value, "authorId") &&
+    isNullableString(value.createdAt);
+}
+
+/** Undefined is the persisted form of unknown: stored before individual reactions, or unread. */
+function isOptionalReactionDetails(value: unknown): boolean {
+  return value === undefined || isArrayOf(value, isPullRequestReaction);
+}
+
 function isPullRequestComment(value: unknown): value is PullRequestComment {
   if (!isObjectRecord(value)) return false;
   return Number.isSafeInteger(value.id) &&
@@ -359,6 +387,7 @@ function isPullRequestComment(value: unknown): value is PullRequestComment {
     isNullableString(value.createdAt) &&
     isNullableString(value.updatedAt) &&
     isReactionCounts(value.reactions) &&
+    isOptionalReactionDetails(value.reactionDetails) &&
     isOptionalString(value, "path") &&
     isOptionalNullableSafeInteger(value, "line") &&
     isOptionalNullableSafeInteger(value, "startLine") &&
@@ -461,6 +490,7 @@ function isPullRequestSnapshot(value: unknown): value is PullRequestSnapshot {
     isNullableString(snapshot.author) &&
     typeof snapshot.fetchedAt === "string" &&
     isReactionCounts(snapshot.bodyReactions) &&
+    isOptionalReactionDetails(snapshot.bodyReactionDetails) &&
     isArrayOf(snapshot.comments, isPullRequestComment) &&
     isArrayOf(snapshot.reviews, isPullRequestReview) &&
     isArrayOf(snapshot.reviewComments, isPullRequestComment) &&
@@ -1165,6 +1195,109 @@ export async function openWatchStateMutation(
         rootReferences,
       };
     },
+    replaceSnapshot: async (nextSnapshot) => {
+      const snapshotSequence = nextSnapshotSequence;
+      const snapshotWrite = await writeChunkedRecord(
+        storage,
+        watchSidecarSnapshotKey(storageKey, snapshotSequence),
+        { snapshot: nextSnapshot } satisfies WatchSnapshotRecord,
+        0,
+      );
+      let puts = snapshotWrite.puts;
+      let deletes = snapshotWrite.deletes;
+      const nextSnapshotRef: SidecarSnapshotRef = {
+        sequence: snapshotSequence,
+        chunkCount: snapshotWrite.chunkCount,
+      };
+
+      // Retirements are settled before the index is written: a deferred retirement moves the
+      // queue's `next`, and only the index write persists that pointer. Enqueueing after the
+      // write would leave the job rows unreachable and their chunks unreclaimable.
+      const rootReferences = refs.filter((ref) => ref.payload.source === "root").length;
+      const nextRoot = rootReferences > 0 ? root : null;
+      const retirements: SidecarCleanupJob[] = [];
+      if (snapshotRef) {
+        retirements.push(retireRecord(
+          watchSidecarSnapshotKey(storageKey, snapshotRef.sequence),
+          snapshotRef.chunkCount,
+        ));
+      }
+      // A predecessor record with no events leaves nothing pointing at it once its snapshot
+      // moves into the sidecar, so keeping it in the index would claim a root nobody reads.
+      if (root && nextRoot === null) retirements.push(retireRecord(storageKey, root.chunkCount));
+
+      let nextCleanup = cleanup;
+      const protectedRecordKeys = protectedCleanupRecordKeys(storageKey, nextSnapshotRef, refs, nextRoot);
+      const immediateRetirementKeys = retirements
+        .filter((retirement) => retirement.chunkCount === 0)
+        .map((retirement) => retirement.recordKey);
+      if (immediateRetirementKeys.some((key) => protectedRecordKeys.has(key))) throw sidecarCorruption();
+      if (immediateRetirementKeys.length > 0) {
+        await deleteStorageKeys(storage, immediateRetirementKeys);
+        deletes += immediateRetirementKeys.length;
+      }
+      const deferredRetirements = retirements.filter((retirement) => retirement.chunkCount > 0);
+      const enqueued = await enqueueDeferredCleanup(storage, storageKey, nextCleanup, deferredRetirements);
+      nextCleanup = enqueued.cleanup;
+      puts += enqueued.puts;
+
+      // Drained at the same bounded rate an append uses, and over the work just enqueued as
+      // well, so a silent replacement pays for the record it retired instead of parking it
+      // until the watch happens to publish something.
+      let cleanupDataBudget = Math.max(MIN_DEFERRED_CLEANUP_ROWS, snapshotWrite.puts + deferredRetirements.length);
+      let jobsToAdvance = nextCleanup.next - nextCleanup.cursor;
+      while (cleanupDataBudget > 0 && jobsToAdvance > 0) {
+        const advance = await advanceDeferredCleanup(
+          storage,
+          storageKey,
+          protectedRecordKeys,
+          nextCleanup,
+          cleanupDataBudget,
+        );
+        if (advance.dataDeletes === 0) break;
+        nextCleanup = advance.cleanup;
+        puts += advance.puts;
+        deletes += advance.deletes;
+        cleanupDataBudget -= advance.dataDeletes;
+        jobsToAdvance -= 1;
+      }
+
+      // The events stay exactly where they are; only the snapshot record is replaced.
+      const nextIndex: WatchSidecarIndex = {
+        version: WATCH_SIDECAR_VERSION,
+        nextSequence,
+        nextSnapshotSequence: snapshotSequence + 1,
+        snapshot: nextSnapshotRef,
+        root: nextRoot,
+        cleanup: nextCleanup,
+        events: [...refs],
+      };
+      const indexWrite = await writeChunkedRecord(
+        storage,
+        watchSidecarIndexKey(storageKey),
+        nextIndex,
+        indexChunkCount,
+      );
+      puts += indexWrite.puts;
+      deletes += indexWrite.deletes;
+      indexChunkCount = indexWrite.chunkCount;
+
+      snapshotRef = nextSnapshotRef;
+      nextSnapshotSequence = snapshotSequence + 1;
+      cleanup = nextCleanup;
+      root = nextRoot;
+      hasSidecar = true;
+      snapshot = nextSnapshot;
+      metadata = { snapshot, events: sidecarEventMetadata(refs, snapshot) };
+      const chunkCount = Math.max(snapshotWrite.chunkCount, indexWrite.chunkCount);
+      return {
+        puts,
+        deletes,
+        encodedBytes: snapshotWrite.encodedBytes + indexWrite.encodedBytes,
+        chunkCount,
+        format: chunkCount > 0 ? "chunked" : "compact",
+      };
+    },
   };
 }
 
@@ -1244,11 +1377,6 @@ function logWebhookFanout(eventName: string, outcome: "completed" | "failed", st
 }
 
 const monitorEncoder = new TextEncoder();
-
-function terminalState(snapshot: PullRequestSnapshot | null): MonitorTerminalState {
-  if (snapshot?.merged) return "merged";
-  return snapshot?.state.toLowerCase() === "closed" ? "closed" : "watching";
-}
 
 function resumesClosedWatch(event: WatchEvent, snapshot: PullRequestSnapshot | null): boolean {
   if (terminalState(snapshot) !== "watching") return false;
@@ -2178,7 +2306,7 @@ export class WatchPrHub {
       }
       let snapshot = previous.snapshot;
       try {
-        snapshot = await pullRequestSnapshot(githubToken, targetRepository, number);
+        snapshot = await pullRequestSnapshot(githubToken, targetRepository, number, previous.snapshot);
       } catch (error) {
         if (isGithubAuthorizationError(error)) {
           invalidSessionTokens.add(sessionToken);
@@ -2241,7 +2369,7 @@ export class WatchPrHub {
     const parsed = parseWatchKey(key);
     let snapshot;
     try {
-      snapshot = await pullRequestSnapshot(githubToken, parsed.repository, parsed.number);
+      snapshot = await pullRequestSnapshot(githubToken, parsed.repository, parsed.number, initialState.snapshot);
     } catch (error) {
       if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken, githubToken);
       return;
@@ -2250,7 +2378,14 @@ export class WatchPrHub {
     const currentTerminalState = terminalState(current.snapshot);
     if (currentTerminalState === "merged" || (currentTerminalState === "closed" && reason !== "watch")) return;
     const changes = snapshotChanges(current.snapshot, snapshot);
-    if (current.snapshot && changes.length === 0) return;
+    if (current.snapshot && changes.length === 0) {
+      // Nothing to report, but a refresh that learned previously unknown reactions must still
+      // be stored, or every later refresh re-reads the same targets and learns them again.
+      if (reactionKnowledgeAdvanced(current.snapshot, snapshot)) {
+        await this.storeSnapshotOnly(userId, parsed.repository, parsed.number, snapshot);
+      }
+      return;
+    }
     const event = createWatchEvent({
       deliveryId: `snapshot-${randomToken(12)}`,
       githubEvent: "snapshot",
@@ -2301,6 +2436,42 @@ export class WatchPrHub {
     return this.accepted({ accepted: true, scheduled });
   }
 
+  /**
+   * Stores a refresh that has nothing to announce but does know more than the stored
+   * snapshot. No event is appended, so no monitor frame and no resource notification are
+   * produced; a concurrently stored newer snapshot wins exactly as it does in `publishEvent`.
+   */
+  private async storeSnapshotOnly(
+    userId: number,
+    repository: string,
+    pullRequestNumber: number,
+    snapshot: PullRequestSnapshot,
+  ): Promise<boolean> {
+    const storageKey = watchStorageKey(userId, repository, pullRequestNumber);
+    let stored = false;
+    await this.state.storage.transaction(async (storage) => {
+      const mutation = await openWatchStateMutation(storage, storageKey);
+      const current = mutation.metadata.snapshot;
+      if (!current || terminalState(current) === "merged") return;
+      const currentTime = Date.parse(current.fetchedAt);
+      const incomingTime = Date.parse(snapshot.fetchedAt);
+      if (Number.isFinite(currentTime) && Number.isFinite(incomingTime) && currentTime > incomingTime) return;
+      // The stored snapshot is the base: this write reports nothing, so it must add the
+      // reactions this refresh read and change nothing else. A title, head or check that
+      // landed while the refresh was in flight stays exactly as the writer that saw it left it.
+      // Advancement is asked of the refresh's own snapshot: the merge has already settled
+      // and consumed the in-flight markers by which a refresh states a transition - an
+      // invalidated cursor it needs removed from the committed state - so asking the merged
+      // result instead would find nothing to store and leave that cursor durable forever.
+      // The merge returning `current` itself means a concurrent write already got there.
+      const next = mergeReactionKnowledge(current, snapshot);
+      if (next === current || !reactionKnowledgeAdvanced(current, snapshot)) return;
+      await mutation.replaceSnapshot(next);
+      stored = true;
+    });
+    return stored;
+  }
+
   private async publishEvent(
     userId: number,
     key: string,
@@ -2325,6 +2496,7 @@ export class WatchPrHub {
         if (currentTerminalState === "merged") return;
         let snapshot = state.snapshot;
         let changes = event.changes;
+        let recomputedChanges = false;
         if (!snapshot) {
           snapshot = current.snapshot;
           changes = [];
@@ -2335,9 +2507,20 @@ export class WatchPrHub {
             snapshot = current.snapshot;
             changes = [];
           } else {
+            // This event's own snapshot is the base - reporting its change is the point of
+            // the write - but it must not regress reaction knowledge: a read it failed may
+            // already have been stored by another refresh in flight.
+            snapshot = mergeReactionKnowledge(snapshot, current.snapshot);
             changes = snapshotChanges(current.snapshot, snapshot);
+            recomputedChanges = true;
           }
         }
+        if (
+          event.githubEvent === "snapshot" &&
+          recomputedChanges &&
+          event.changes.length > 0 &&
+          changes.length === 0
+        ) return;
         if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
         const details = snapshot
           ? monitorEventDetails(current.snapshot, snapshot, event)

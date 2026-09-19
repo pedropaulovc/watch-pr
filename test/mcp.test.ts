@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "../src/mcp";
+import { snapshotReactions } from "../src/events";
 import {
   openWatchStateMutation,
   readStoredWatchState,
   writeStoredWatchState,
   type WatchStorage,
 } from "../src/hub";
-import type { PullRequestSnapshot, StoredWatchState, WatchEvent } from "../src/types";
+import type { PullRequestComment, PullRequestSnapshot, StoredWatchState, WatchEvent } from "../src/types";
 import { watchStorageKey } from "../src/types";
 
 function memoryStorage(): WatchStorage {
@@ -52,6 +53,7 @@ const snapshot: PullRequestSnapshot = {
   author: "author",
   fetchedAt: "2026-09-05T00:00:00.000Z",
   bodyReactions: { eyes: 2, total_count: 2 },
+  bodyReactionDetails: [{ id: 900, content: "eyes", author: "alice", authorId: 11, createdAt: "2026-09-05T00:00:00.000Z" }],
   comments: [{
     id: 1,
     author: "reviewer",
@@ -59,6 +61,11 @@ const snapshot: PullRequestSnapshot = {
     createdAt: "2026-09-05T00:00:00.000Z",
     updatedAt: "2026-09-05T00:00:00.000Z",
     reactions: { "+1": 1 },
+    reactionDetails: [
+      // Same account as the authenticated user (ID 42) under a login it no longer uses.
+      { id: 901, content: "+1", author: "PedroPauloVC-old", authorId: 42, createdAt: "2026-09-05T00:00:00.000Z" },
+      { id: 903, content: "rocket", author: "dave", authorId: 12, createdAt: "2026-09-05T00:01:00.000Z" },
+    ],
   }],
   reviews: [{
     id: 2,
@@ -74,6 +81,7 @@ const snapshot: PullRequestSnapshot = {
     createdAt: "2026-09-05T00:00:00.000Z",
     updatedAt: "2026-09-05T00:00:00.000Z",
     reactions: { heart: 1 },
+    reactionDetails: [{ id: 902, content: "heart", author: "carol", authorId: 13, createdAt: "2026-09-05T00:00:00.000Z" }],
     path: "src/index.ts",
     line: 4,
   }],
@@ -215,8 +223,13 @@ describe("MCP output modes", () => {
     expect(brief).toContain("review reviewer: APPROVED @2026-09-05T00:00:00.000Z");
     expect(brief).toContain("comments: 1");
     expect(brief).toContain("review-comments: 1");
-    expect(brief).toContain("reaction EYES: 2");
-    expect(brief).toContain("comment-reaction THUMBS_UP: 1");
+    expect(brief).toContain("reaction @alice EYES on PR #7 @author https://github.com/owner/repo/pull/7");
+    expect(brief).toContain("reaction @dave ROCKET on comment #1 @reviewer");
+    expect(brief).toContain("reaction @carol HEART on feedback #3 @reviewer");
+    // The authenticated account's own reaction is its own activity, even under an old login:
+    // the actor's GitHub ID is the identity, and the login is only ever display.
+    expect(brief).not.toContain("PedroPauloVC-old");
+    expect(brief).not.toContain("THUMBS_UP");
     expect(brief).toContain("feedback [thread-1] src/index.ts:4 @reviewer inline feedback");
     expect(brief).not.toContain('"snapshot"');
 
@@ -283,5 +296,102 @@ describe("MCP output modes", () => {
       number: 7,
       events: [{ ...predecessor, snapshot: null }, appended],
     });
+  });
+
+  it("keeps reactions unknown in snapshots persisted before they were attributed", async () => {
+    const storage = memoryStorage();
+    const storageKey = watchStorageKey(42, "owner/repo", 7);
+    // A predecessor record has no reaction-detail keys at all, not keys set to undefined.
+    const withoutDetails = ({ reactionDetails, ...comment }: PullRequestComment) => comment;
+    const { bodyReactionDetails, ...body } = snapshot;
+    const legacySnapshot = {
+      ...body,
+      comments: snapshot.comments.map(withoutDetails),
+      reviewComments: snapshot.reviewComments.map(withoutDetails),
+    } as unknown as PullRequestSnapshot;
+    const legacyEvent: WatchEvent = { ...event, snapshot: legacySnapshot };
+    await writeStoredWatchState(storage, storageKey, { snapshot: legacySnapshot, events: [legacyEvent] });
+
+    const stored = await readStoredWatchState(storage, storageKey);
+    // Unknown, never empty: claiming empty would make the PR's existing reactions look new.
+    expect(stored.snapshot?.bodyReactionDetails).toBeUndefined();
+    expect(stored.snapshot?.comments[0].reactionDetails).toBeUndefined();
+    expect(stored.snapshot?.reviewComments[0].reactionDetails).toBeUndefined();
+    expect(stored.events[0].snapshot?.bodyReactionDetails).toBeUndefined();
+    expect(snapshotReactions(stored.snapshot as PullRequestSnapshot)).toEqual([]);
+
+    const brief = await callTool(
+      "get_pr",
+      { repository: "owner/repo", number: 7 },
+      snapshot,
+      { ...context(), readWatch: async () => readStoredWatchState(storage, storageKey) },
+    );
+    expect(brief).not.toContain("reaction @");
+    expect(brief).toContain(
+      "reactions: attribution unavailable for EYES×2 on PR #7 @author https://github.com/owner/repo/pull/7",
+    );
+    expect(brief).toContain(
+      "reactions: attribution unavailable for +1×1 on comment #1 @reviewer",
+    );
+    expect(brief).toContain(
+      "reactions: attribution unavailable for HEART×1 on feedback #3 @reviewer",
+    );
+  });
+
+  it("bounds the attributed reaction lines one snapshot contributes to a brief listing", async () => {
+    const reaction = (index: number) => ({
+      id: 1_000 + index,
+      content: "heart",
+      author: `watcher-${String(index).padStart(2, "0")}`,
+      authorId: 100 + index,
+      createdAt: "2026-09-05T00:00:00.000Z",
+    });
+    const crowded: PullRequestSnapshot = {
+      ...snapshot,
+      bodyReactions: { heart: 20, total_count: 20 },
+      bodyReactionDetails: Array.from({ length: 20 }, (_, index) => reaction(index)),
+      comments: [],
+      reviewComments: [],
+      threads: [],
+    };
+
+    const brief = await callTool("get_pr", { repository: "owner/repo", number: 7 }, crowded);
+    const reactionLines = brief.split("\n").filter((line) => line.startsWith("reaction @"));
+    expect(reactionLines).toHaveLength(12);
+    // Bounded in sorted order, so the same twelve are kept from one refresh to the next.
+    expect(reactionLines[0]).toContain("@watcher-00");
+    expect(reactionLines[11]).toContain("@watcher-11");
+    expect(brief).toContain("+8 more reactions");
+
+    const exact: PullRequestSnapshot = {
+      ...crowded,
+      bodyReactions: { heart: 12, total_count: 12 },
+      bodyReactionDetails: crowded.bodyReactionDetails?.slice(0, 12),
+    };
+    const briefAtCap = await callTool("get_pr", { repository: "owner/repo", number: 7 }, exact);
+    expect(briefAtCap.split("\n").filter((line) => line.startsWith("reaction @"))).toHaveLength(12);
+    expect(briefAtCap).not.toContain("more reactions");
+  });
+
+  it("filters the watcher's own reactions from records that carry no actor ID", async () => {
+    // Persisted before actor IDs: one record omits the key, one stored it as null.
+    const legacy = [
+      { id: 1_100, content: "eyes", author: "PedroPauloVC", createdAt: "2026-09-05T00:00:00.000Z" },
+      { id: 1_101, content: "heart", author: "pedropaulovc", authorId: null, createdAt: "2026-09-05T00:01:00.000Z" },
+      { id: 1_102, content: "rocket", author: "dave", createdAt: "2026-09-05T00:02:00.000Z" },
+    ] as PullRequestSnapshot["bodyReactionDetails"];
+    const unattributed: PullRequestSnapshot = {
+      ...snapshot,
+      bodyReactions: { eyes: 1, heart: 1, rocket: 1, total_count: 3 },
+      bodyReactionDetails: legacy,
+      comments: [],
+      reviewComments: [],
+      threads: [],
+    };
+
+    const brief = await callTool("get_pr", { repository: "owner/repo", number: 7 }, unattributed);
+    expect(brief.split("\n").filter((line) => line.startsWith("reaction @"))).toEqual([
+      "reaction @dave ROCKET on PR #7 @author https://github.com/owner/repo/pull/7",
+    ]);
   });
 });

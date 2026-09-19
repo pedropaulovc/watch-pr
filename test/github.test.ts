@@ -1,18 +1,58 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { mergeReactionKnowledge, monitorEventDetails } from "../src/events";
 import { githubUser, pullRequestSnapshot } from "../src/github";
+
+/** A PR with no comments, reviews, or checks, so only its body carries reactions. */
+function stubPullRequest(options: {
+  title: string;
+  bodyReactions: Record<string, number>;
+  reactions: (url: string) => Response;
+  requested: string[];
+}): void {
+  globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input);
+    options.requested.push(url);
+    if (url.includes("/reactions")) return options.reactions(url);
+    if (url.endsWith("/pulls/7")) {
+      return Response.json({
+        number: 7,
+        html_url: "https://github.com/owner/repo/pull/7",
+        title: options.title,
+        state: "open",
+        user: { login: "author" },
+        head: { ref: "feature", sha: null },
+        base: { ref: "main" },
+      });
+    }
+    if (url.endsWith("/issues/7")) return Response.json({ reactions: options.bodyReactions });
+    if (url.endsWith("/issues/7/comments?per_page=100")) return Response.json([]);
+    if (url.endsWith("/pulls/7/comments?per_page=100")) return Response.json([]);
+    if (url.endsWith("/pulls/7/reviews?per_page=100")) return Response.json([]);
+    if (url.endsWith("/graphql")) {
+      return Response.json({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } });
+    }
+    throw new Error(`unexpected GitHub URL ${url}`);
+  });
+}
+
+const HEART = { id: 901, content: "heart", user: { login: "alice", id: 11 }, created_at: "2026-09-19T12:00:00.000Z" };
+const ROCKET = { id: 902, content: "rocket", user: { login: "dave", id: 12 }, created_at: "2026-09-19T12:05:00.000Z" };
 
 const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
 describe("GitHub API adapter", () => {
   it("normalizes pull state, comments, reviews, checks, reactions, and threads", async () => {
+    const requested: string[] = [];
     let graphqlCalls = 0;
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      requested.push(url);
       if (url.endsWith("/pulls/7")) {
         return Response.json({
           number: 7,
@@ -30,8 +70,22 @@ describe("GitHub API adapter", () => {
           base: { ref: "main" },
         });
       }
-      if (url.endsWith("/issues/7") && !url.includes("comments")) return Response.json({ reactions: { eyes: 2, total_count: 2 } });
-      if (url.endsWith("/issues/7/comments?per_page=100")) return Response.json([{ id: 1, user: { login: "reviewer" }, body: "top-level", reactions: { "+1": 1 }, created_at: "now", updated_at: "now" }]);
+      if (url.endsWith("/issues/7") && !url.includes("comments")) return Response.json({ reactions: { eyes: 1, total_count: 1 } });
+      if (url.endsWith("/issues/7/comments?per_page=100")) {
+        return Response.json([
+          { id: 1, user: { login: "reviewer" }, body: "top-level", reactions: { "+1": 1 }, created_at: "now", updated_at: "now" },
+          { id: 2, user: { login: "reviewer" }, body: "quiet", reactions: { total_count: 0 }, created_at: "now", updated_at: "now" },
+        ]);
+      }
+      if (url.endsWith("/issues/7/reactions?per_page=100")) {
+        return Response.json([{ id: 900, content: "eyes", user: { login: "alice", id: 11 }, created_at: "2026-09-19T12:00:00.000Z" }]);
+      }
+      if (url.endsWith("/issues/comments/1/reactions?per_page=100")) {
+        return Response.json([{ id: 901, content: "+1", user: { login: "bob", id: 12 }, created_at: "2026-09-19T12:01:00.000Z" }]);
+      }
+      if (url.endsWith("/pulls/comments/3/reactions?per_page=100")) {
+        return Response.json([{ id: 902, content: "heart", user: { login: "carol" }, created_at: "2026-09-19T12:02:00.000Z" }]);
+      }
       if (url.endsWith("/pulls/7/reviews?per_page=100")) return Response.json([{ id: 2, user: { login: "reviewer" }, state: "APPROVED", body: "looks good", submitted_at: "now" }]);
       if (url.endsWith("/pulls/7/comments?per_page=100")) return Response.json([{ id: 3, user: { login: "reviewer" }, body: "inline", path: "src/index.ts", line: 4, diff_hunk: "@@", reactions: { heart: 1 }, created_at: "now", updated_at: "now" }]);
       if (url.endsWith("/commits/abc/check-runs?per_page=100")) {
@@ -63,10 +117,23 @@ describe("GitHub API adapter", () => {
     expect(result.checks[1]).toMatchObject({ name: "Lint", conclusion: "success", kind: "check_run" });
     expect(result.mergeableState).toBe("dirty");
     expect(result.headRepository).toBe("fork/repo");
-    expect(result.bodyReactions).toEqual({ eyes: 2, total_count: 2 });
+    expect(result.bodyReactions).toEqual({ eyes: 1, total_count: 1 });
+    expect(result.bodyReactionDetails).toEqual([
+      { id: 900, content: "eyes", author: "alice", authorId: 11, createdAt: "2026-09-19T12:00:00.000Z" },
+    ]);
     expect(result.comments[0]).toMatchObject({ id: 1, author: "reviewer", reactions: { "+1": 1 } });
+    expect(result.comments[0].reactionDetails).toEqual([
+      { id: 901, content: "+1", author: "bob", authorId: 12, createdAt: "2026-09-19T12:01:00.000Z" },
+    ]);
+    // A target whose summary count is zero is never read individually.
+    expect(result.comments[1].reactionDetails).toEqual([]);
+    expect(requested.some((url) => url.includes("/issues/comments/2/reactions"))).toBe(false);
     expect(result.reviews[0]).toMatchObject({ state: "APPROVED", author: "reviewer" });
     expect(result.reviewComments[0]).toMatchObject({ path: "src/index.ts", reactions: { heart: 1 } });
+    expect(result.reviewComments[0].reactionDetails).toEqual([
+      // GitHub omitted the actor ID here, so only the login is known.
+      { id: 902, content: "heart", author: "carol", authorId: null, createdAt: "2026-09-19T12:02:00.000Z" },
+    ]);
     expect(result.checks[0]).toMatchObject({ name: "CI", conclusion: "failure", kind: "check_run" });
     expect(result.checks.filter((check) => check.kind === "commit_status")).toEqual([
       expect.objectContaining({ id: 10, name: "buildkite/build", conclusion: "success" }),
@@ -75,6 +142,484 @@ describe("GitHub API adapter", () => {
     expect(result.threads).toEqual([
       { id: "thread-1", isResolved: false, commentIds: [8] },
       { id: "thread-2", isResolved: true, commentIds: [9] },
+    ]);
+  });
+
+  it("caps concurrent and total reaction reads, then resumes unknown targets next refresh", async () => {
+    const comment = (id: number, path?: string) => ({
+      id,
+      user: { login: "reviewer" },
+      body: `comment ${id}`,
+      reactions: { heart: 1, total_count: 1 },
+      created_at: "now",
+      updated_at: "now",
+      ...(path ? { path, line: 1, diff_hunk: "@@" } : {}),
+    });
+    // Every reaction response is held open until the test releases it, so the peak is the
+    // real concurrency the adapter asked for rather than a timing artifact.
+    const pending: (() => void)[] = [];
+    let peakInFlight = 0;
+    let reactionRequests = 0;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (!url.includes("/reactions")) {
+        if (url.endsWith("/pulls/7")) {
+          return Response.json({
+            number: 7,
+            html_url: "https://github.com/owner/repo/pull/7",
+            state: "open",
+            user: { login: "author" },
+            head: { ref: "feature", sha: null },
+            base: { ref: "main" },
+          });
+        }
+        if (url.endsWith("/issues/7")) return Response.json({ reactions: { heart: 1, total_count: 1 } });
+        if (url.endsWith("/issues/7/comments?per_page=100")) {
+          return Response.json(Array.from({ length: 40 }, (_, index) => comment(index + 1)));
+        }
+        if (url.endsWith("/pulls/7/comments?per_page=100")) {
+          return Response.json(Array.from({ length: 40 }, (_, index) => comment(index + 100, "src/index.ts")));
+        }
+        if (url.endsWith("/pulls/7/reviews?per_page=100")) return Response.json([]);
+        if (url.endsWith("/graphql")) {
+          return Response.json({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } });
+        }
+        throw new Error(`unexpected GitHub URL ${url}`);
+      }
+
+      reactionRequests += 1;
+      const reactionId = 900 + reactionRequests;
+      // The project targets ES2022, which has no Promise.withResolvers.
+      let release = () => {};
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      pending.push(release);
+      await held;
+      return Response.json([{ id: reactionId, content: "heart", user: { login: "alice" }, created_at: "now" }]);
+    });
+
+    let settled = false;
+    const snapshot = pullRequestSnapshot("token", "owner/repo", 7)
+      .finally(() => { settled = true; });
+    for (let round = 0; !settled; round += 1) {
+      if (round > 100) throw new Error("snapshot never settled");
+      // Drain microtasks so every request this wave will start has registered.
+      for (let drain = 0; drain < 50; drain += 1) await Promise.resolve();
+      peakInFlight = Math.max(peakInFlight, pending.length);
+      for (const release of pending.splice(0, pending.length)) release();
+    }
+
+    const result = await snapshot;
+    // Eight requests may run together and at most sixty-four pages are read in this refresh.
+    expect(reactionRequests).toBe(64);
+    expect(peakInFlight).toBe(8);
+    const knownTargets = [
+      result.bodyReactionDetails,
+      ...result.comments.map((entry) => entry.reactionDetails),
+      ...result.reviewComments.map((entry) => entry.reactionDetails),
+    ];
+    expect(knownTargets.filter((details) => details !== undefined)).toHaveLength(64);
+
+    const secondWaveStart = Date.now();
+    reactionRequests = 0;
+    peakInFlight = 0;
+    settled = false;
+    const resumedSnapshot = pullRequestSnapshot("token", "owner/repo", 7, result)
+      .finally(() => { settled = true; });
+    for (let round = 0; !settled; round += 1) {
+      if (round > 100) throw new Error("resumed snapshot never settled");
+      for (let drain = 0; drain < 50; drain += 1) await Promise.resolve();
+      peakInFlight = Math.max(peakInFlight, pending.length);
+      for (const release of pending.splice(0, pending.length)) release();
+    }
+    const resumed = await resumedSnapshot;
+    expect(reactionRequests).toBe(17);
+    expect(peakInFlight).toBe(8);
+    expect(resumed.bodyReactionDetails).toHaveLength(1);
+    expect(resumed.comments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
+    expect(resumed.reviewComments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
+    // Details reused without a read carry that provenance; the seventeen targets this wave
+    // actually read do not.
+    expect(resumed.comments.every((entry) => entry.reactionDetailsState === "borrowed")).toBe(true);
+    expect(resumed.reviewComments.filter((entry) => entry.reactionDetailsState === undefined)).toHaveLength(17);
+    // A borrow is dated by the read it descends from, so it cannot pass for this wave's
+    // knowledge; only the targets this wave read are stamped by it.
+    expect(resumed.comments.map((entry) => entry.reactionDetailsReadAt))
+      .toEqual(result.comments.map((entry) => entry.reactionDetailsReadAt));
+    expect(resumed.comments.every((entry) => entry.reactionDetailsReadAt !== undefined)).toBe(true);
+    const freshlyRead = resumed.reviewComments.filter((entry) => entry.reactionDetailsState === undefined);
+    expect(freshlyRead.every((entry) => Date.parse(entry.reactionDetailsReadAt ?? "") >= secondWaveStart)).toBe(true);
+  });
+
+  it("resumes a single reaction collection across request budgets", async () => {
+    const requested: string[] = [];
+    let page = 0;
+    const reactions = () => {
+      page += 1;
+      const records = Array.from({ length: 100 }, (_, index) => ({
+        id: page * 100 + index,
+        content: "heart",
+        user: { login: `user-${page}-${index}`, id: page * 100 + index },
+        created_at: "now",
+      }));
+      const headers = page < 65
+        ? { link: `<https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=${page + 1}>; rel="next"` }
+        : undefined;
+      return Response.json(records, { headers });
+    };
+    stubPullRequest({
+      title: "large",
+      bodyReactions: { heart: 6_500, total_count: 6_500 },
+      reactions,
+      requested,
+    });
+    const partial = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(page).toBe(64);
+    expect(partial.bodyReactionDetails).toBeUndefined();
+    expect(partial.bodyReactionProgress?.records).toHaveLength(6_400);
+
+    stubPullRequest({
+      title: "large",
+      bodyReactions: { heart: 6_500, total_count: 6_500 },
+      reactions,
+      requested,
+    });
+    const complete = await pullRequestSnapshot("token", "owner/repo", 7, partial);
+    expect(page).toBe(65);
+    expect(complete.bodyReactionProgress).toBeUndefined();
+    expect(complete.bodyReactionDetails).toHaveLength(6_500);
+  });
+
+  it("resumes at the page whose request failed instead of re-reading the pages it already had", async () => {
+    const requested: string[] = [];
+    const record = (id: number) => ({ id, content: "heart", user: { login: `user-${id}`, id }, created_at: "now" });
+    const stored = (id: number) => ({ id, content: "heart", author: `user-${id}`, authorId: id, createdAt: "now" });
+    const counts = { heart: 2, total_count: 2 };
+    const secondPage = "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2";
+    let secondPageFails = true;
+    const reactions = (url: string) => {
+      if (!url.includes("page=2")) {
+        return Response.json([record(1)], { headers: { link: `<${secondPage}>; rel="next"` } });
+      }
+      return secondPageFails
+        ? new Response("upstream failure", { status: 502 })
+        : Response.json([record(2)]);
+    };
+    const reactionRequests = () => requested.filter((url) => url.includes("/reactions"));
+
+    stubPullRequest({ title: "flaky page", bodyReactions: counts, reactions, requested });
+    const interrupted = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(reactionRequests()).toEqual([
+      "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100",
+      secondPage,
+    ]);
+    // The page that failed says nothing about the page that succeeded, so the read resumes
+    // from the failure rather than paying for the first page again.
+    expect(interrupted.bodyReactionDetails).toBeUndefined();
+    expect(interrupted.bodyReactionProgress).toEqual({ records: [stored(1)], nextUrl: secondPage });
+
+    requested.length = 0;
+    stubPullRequest({ title: "flaky page", bodyReactions: counts, reactions, requested });
+    const stillFailing = await pullRequestSnapshot("token", "owner/repo", 7, interrupted);
+    expect(reactionRequests()).toEqual([secondPage]);
+    expect(stillFailing.bodyReactionProgress).toEqual({ records: [stored(1)], nextUrl: secondPage });
+
+    secondPageFails = false;
+    requested.length = 0;
+    stubPullRequest({ title: "flaky page", bodyReactions: counts, reactions, requested });
+    const complete = await pullRequestSnapshot("token", "owner/repo", 7, stillFailing);
+    expect(reactionRequests()).toEqual([secondPage]);
+    expect(complete.bodyReactionProgress).toBeUndefined();
+    expect(complete.bodyReactionDetails).toEqual([stored(1), stored(2)]);
+  });
+
+  it("restarts a resumed reaction read whose stored prefix a mutation between waves invalidated", async () => {
+    const requested: string[] = [];
+    const record = (id: number) => ({ id, content: "heart", user: { login: `user-${id}`, id }, created_at: "now" });
+    const stored = (id: number) => ({ id, content: "heart", author: `user-${id}`, authorId: id, createdAt: "now" });
+    const counts = { heart: 3, total_count: 3 };
+    stubPullRequest({ title: "paginating", bodyReactions: {}, reactions: () => Response.json([]), requested });
+    const empty = await pullRequestSnapshot("token", "owner/repo", 7);
+    // A previous refresh ran out of request budget one page into this target.
+    const resumable = {
+      ...empty,
+      bodyReactions: counts,
+      bodyReactionDetails: undefined,
+      bodyReactionDetailsReadAt: "2026-09-03T00:01:00.000Z",
+      bodyReactionProgress: {
+        records: [stored(1), stored(2)],
+        nextUrl: "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2",
+      },
+    };
+
+    // A reaction moved while the read was suspended, so the page boundaries shifted and the
+    // suffix hands back a record the stored prefix already holds.
+    requested.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:05:00.000Z");
+    stubPullRequest({
+      title: "mutated",
+      bodyReactions: counts,
+      reactions: (url) => Response.json(url.includes("page=2") ? [record(1)] : [record(1), record(2), record(3)]),
+      requested,
+    });
+    const incoherent = await pullRequestSnapshot("token", "owner/repo", 7, resumable);
+    expect(requested.filter((url) => url.includes("/reactions"))).toEqual([
+      "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2",
+    ]);
+    // Three records against a count of three, but one of them twice: the prefix cannot be
+    // part of any coherent read, so it goes with the cursor rather than being replayed.
+    expect(incoherent.bodyReactions).toEqual(counts);
+    expect(incoherent.bodyReactionDetails).toBeUndefined();
+    expect(incoherent.bodyReactionProgress).toBeUndefined();
+    // Dropping the cursor here only clears this snapshot; the committed one is removed by the
+    // merge, which needs the transition stated and dated by the read that disproved it.
+    expect(incoherent.bodyReactionDetailsState).toBe("invalidated");
+    expect(incoherent.bodyReactionDetailsReadAt).toBe("2026-09-03T00:05:00.000Z");
+    vi.useRealTimers();
+
+    // The next refresh therefore starts at page one and finishes the target.
+    requested.length = 0;
+    stubPullRequest({
+      title: "settled",
+      bodyReactions: counts,
+      reactions: () => Response.json([record(1), record(2), record(3)]),
+      requested,
+    });
+    const settled = await pullRequestSnapshot("token", "owner/repo", 7, incoherent);
+    expect(requested.filter((url) => url.includes("/reactions"))).toEqual([
+      "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100",
+    ]);
+    expect(settled.bodyReactionDetails).toEqual([stored(1), stored(2), stored(3)]);
+    expect(settled.bodyReactionProgress).toBeUndefined();
+  });
+
+  it("reuses stored reaction details while the summary counts are unchanged", async () => {
+    const requested: string[] = [];
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:01:00.000Z");
+    stubPullRequest({ title: "first", bodyReactions: { heart: 1, total_count: 1 }, reactions: () => Response.json([HEART]), requested });
+    const first = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(first.bodyReactionDetailsReadAt).toBe("2026-09-03T00:01:00.000Z");
+
+    requested.length = 0;
+    vi.setSystemTime("2026-09-03T00:02:00.000Z");
+    stubPullRequest({
+      title: "second",
+      bodyReactions: { heart: 1, total_count: 1 },
+      reactions: () => Response.json([HEART]),
+      requested,
+    });
+    const second = await pullRequestSnapshot("token", "owner/repo", 7, first);
+    // The minute poll costs nothing for a target GitHub still summarises the same way.
+    expect(requested.some((url) => url.includes("/reactions"))).toBe(false);
+    expect(second.bodyReactionDetails).toEqual(first.bodyReactionDetails);
+    expect(first.bodyReactionDetailsState).toBeUndefined();
+    expect(second.bodyReactionDetailsState).toBe("borrowed");
+    // Reuse is not a read: the borrow is still dated by the read it descends from, so it
+    // cannot outrank a read another refresh took in between.
+    expect(second.bodyReactionDetailsReadAt).toBe("2026-09-03T00:01:00.000Z");
+    expect(second.title).toBe("second");
+
+    requested.length = 0;
+    vi.setSystemTime("2026-09-03T00:03:00.000Z");
+    stubPullRequest({
+      title: "third",
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      reactions: () => Response.json([HEART, ROCKET]),
+      requested,
+    });
+    const third = await pullRequestSnapshot("token", "owner/repo", 7, second);
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(third.bodyReactionDetails).toHaveLength(2);
+    expect(third.bodyReactionDetailsState).toBeUndefined();
+    expect(third.bodyReactionDetailsReadAt).toBe("2026-09-03T00:03:00.000Z");
+  });
+
+  it("dates a zero reaction summary when its own response returned, not when the wave ended", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:00:00.000Z");
+    // Every response is held until the test releases it, and stamps the clock as it returns,
+    // so each aggregate lands at a different point of one slow wave.
+    const pending: (() => void)[] = [];
+    const staged = (time: string, body: unknown, nextPage?: string): Promise<Response> =>
+      new Promise<Response>((resolve) => {
+        pending.push(() => {
+          vi.setSystemTime(time);
+          resolve(Response.json(body, nextPage ? { headers: { link: `<${nextPage}>; rel="next"` } } : undefined));
+        });
+      });
+    const listedComment = (id: number, author: string, body: string) => ({
+      id,
+      user: { login: author },
+      body,
+      created_at: "2026-09-03T00:00:00.000Z",
+      updated_at: "2026-09-03T00:00:00.000Z",
+      reactions: { total_count: 0 },
+      html_url: `https://github.com/owner/repo/pull/7#issuecomment-${id}`,
+    });
+    const noReactions = { total_count: 0 };
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/7")) {
+        return staged("2026-09-03T00:00:30.000Z", {
+          number: 7,
+          html_url: "https://github.com/owner/repo/pull/7",
+          title: "slow wave",
+          state: "open",
+          user: { login: "author" },
+          head: { ref: "feature", sha: null },
+          base: { ref: "main" },
+        });
+      }
+      if (url.endsWith("/issues/7")) return staged("2026-09-03T00:01:00.000Z", { reactions: noReactions });
+      // Two pages of one list, minutes apart: a comment is only as fresh as its own page.
+      if (url.endsWith("/issues/7/comments?per_page=100")) {
+        return staged(
+          "2026-09-03T00:02:00.000Z",
+          [listedComment(21, "bob", "Top-level note")],
+          "https://api.github.com/repos/owner/repo/issues/7/comments?per_page=100&page=2",
+        );
+      }
+      if (url.endsWith("/issues/7/comments?per_page=100&page=2")) {
+        return staged("2026-09-03T00:08:00.000Z", [listedComment(22, "bob", "Later note")]);
+      }
+      if (url.endsWith("/pulls/7/reviews?per_page=100")) return staged("2026-09-03T00:03:00.000Z", []);
+      if (url.endsWith("/pulls/7/comments?per_page=100")) {
+        return staged("2026-09-03T00:04:00.000Z", [{
+          id: 31,
+          user: { login: "carol" },
+          body: "Inline note",
+          created_at: "2026-09-03T00:00:00.000Z",
+          updated_at: "2026-09-03T00:00:00.000Z",
+          reactions: noReactions,
+          html_url: "https://github.com/owner/repo/pull/7#discussion_r31",
+        }]);
+      }
+      if (url.endsWith("/graphql")) {
+        return staged("2026-09-03T00:06:00.000Z", {
+          data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } },
+        });
+      }
+      throw new Error(`unexpected GitHub URL ${url}`);
+    }) as typeof fetch;
+
+    let settled = false;
+    const wave = pullRequestSnapshot("token", "owner/repo", 7).finally(() => { settled = true; });
+    for (let round = 0; !settled; round += 1) {
+      if (round > 100) throw new Error("snapshot never settled");
+      for (let drain = 0; drain < 50; drain += 1) await Promise.resolve();
+      pending.shift()?.();
+    }
+    const stale = await wave;
+
+    // The wave ends minutes after the summaries it is built from, and no target inherits
+    // that end time: each zero is only as authoritative as the response that reported it.
+    expect(stale.fetchedAt).toBe("2026-09-03T00:08:00.000Z");
+    expect(stale.bodyReactionDetails).toEqual([]);
+    expect(stale.bodyReactionDetailsReadAt).toBe("2026-09-03T00:01:00.000Z");
+    expect(stale.comments.map((comment) => [comment.id, comment.reactionDetailsReadAt])).toEqual([
+      [21, "2026-09-03T00:02:00.000Z"],
+      [22, "2026-09-03T00:08:00.000Z"],
+    ]);
+    expect(stale.reviewComments[0].reactionDetailsReadAt).toBe("2026-09-03T00:04:00.000Z");
+    // The aggregates are dated the same way and separately from the reads, because a merge
+    // has to order counts against counts when no read stands behind them.
+    expect(stale.bodyReactionsObservedAt).toBe("2026-09-03T00:01:00.000Z");
+    expect(stale.comments.map((comment) => comment.reactionsObservedAt)).toEqual([
+      "2026-09-03T00:02:00.000Z",
+      "2026-09-03T00:08:00.000Z",
+    ]);
+    expect(stale.reviewComments[0].reactionsObservedAt).toBe("2026-09-03T00:04:00.000Z");
+
+    // A concurrent refresh read the body at 00:03 and committed the heart added at 00:02:30.
+    const heart = { id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:02:30.000Z" };
+    const committed = {
+      ...stale,
+      fetchedAt: "2026-09-03T00:03:30.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [heart],
+      bodyReactionDetailsReadAt: "2026-09-03T00:03:00.000Z",
+    };
+    const merged = mergeReactionKnowledge(stale, committed);
+    // Stamped at the end of the wave the zero would outrank that read and publish the heart
+    // as a deletion; dated by its own response it loses, as a stale observation should.
+    expect(merged.bodyReactionDetails).toEqual([heart]);
+    expect(merged.bodyReactions).toEqual({ heart: 1, total_count: 1 });
+    expect(merged.bodyReactionDetailsReadAt).toBe("2026-09-03T00:03:00.000Z");
+    expect(monitorEventDetails(committed, merged).some((line) => line.startsWith("reaction"))).toBe(false);
+  });
+
+  it("retries reaction details that disagree with their aggregate counts", async () => {
+    const requested: string[] = [];
+    stubPullRequest({
+      title: "raced",
+      bodyReactions: { heart: 1, total_count: 1 },
+      reactions: () => Response.json([]),
+      requested,
+    });
+    const raced = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(raced.bodyReactions).toEqual({ heart: 1, total_count: 1 });
+    expect(raced.bodyReactionDetails).toBeUndefined();
+    // Nothing was resumed, so no committed prefix needs removing. Claiming the transition
+    // anyway would make the merge discard details a concurrent refresh had already read.
+    expect(raced.bodyReactionDetailsState).toBeUndefined();
+
+    requested.length = 0;
+    stubPullRequest({
+      title: "settled",
+      bodyReactions: { heart: 1, total_count: 1 },
+      reactions: () => Response.json([HEART]),
+      requested,
+    });
+    const settled = await pullRequestSnapshot("token", "owner/repo", 7, raced);
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(settled.bodyReactionDetails).toEqual([{
+      id: 901,
+      content: "heart",
+      author: "alice",
+      authorId: 11,
+      createdAt: "2026-09-19T12:00:00.000Z",
+    }]);
+  });
+
+  it("leaves a failed reaction read unknown so transactional state wins and the next refresh retries", async () => {
+    const requested: string[] = [];
+    stubPullRequest({ title: "seed", bodyReactions: { heart: 1, total_count: 1 }, reactions: () => Response.json([HEART]), requested });
+    const stored = await pullRequestSnapshot("token", "owner/repo", 7);
+
+    requested.length = 0;
+    stubPullRequest({
+      title: "upstream moved",
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      reactions: () => new Response("Not Found", { status: 404 }),
+      requested,
+    });
+    const failed = await pullRequestSnapshot("token", "owner/repo", 7, stored);
+    // Unknown details tell the transactional merge not to overwrite knowledge a concurrent
+    // refresh may have committed while this read was in flight.
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(failed.bodyReactions).toEqual({ heart: 1, rocket: 1, total_count: 2 });
+    expect(failed.bodyReactionDetails).toBeUndefined();
+    expect(failed.title).toBe("upstream moved");
+    expect(monitorEventDetails(stored, failed)).toEqual([]);
+    const preserved = mergeReactionKnowledge(failed, stored);
+    expect(preserved.bodyReactions).toEqual(stored.bodyReactions);
+    expect(preserved.bodyReactionDetails).toEqual(stored.bodyReactionDetails);
+
+    requested.length = 0;
+    stubPullRequest({
+      title: "upstream moved",
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      reactions: () => Response.json([HEART, ROCKET]),
+      requested,
+    });
+    // Unknown details force another read even though the summary itself is unchanged.
+    const recovered = await pullRequestSnapshot("token", "owner/repo", 7, preserved);
+    expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(recovered.bodyReactions).toEqual({ heart: 1, rocket: 1, total_count: 2 });
+    expect(monitorEventDetails(preserved, recovered)).toEqual([
+      "reaction created: @dave ROCKET on PR #7 @author https://github.com/owner/repo/pull/7",
     ]);
   });
 

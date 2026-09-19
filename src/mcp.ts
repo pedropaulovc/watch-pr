@@ -2,10 +2,21 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { ReadResourceRequestSchema, SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
-import { parseResourceUri, resourceUri, watchKey } from "./events";
-import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestComment, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
+import {
+  normalizedLogin,
+  parseResourceUri,
+  reactionStateLine,
+  resourceUri,
+  snapshotReactions,
+  watchKey,
+} from "./events";
+import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestComment, PullRequestReaction, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
 
 export type McpOutputMode = "brief" | "full";
+
+/** A brief snapshot spends at most this many lines, and this many characters, on reactions. */
+const MAX_BRIEF_REACTION_LINES = 12;
+const MAX_BRIEF_REACTION_LENGTH = 1_000;
 
 export interface WatchRegistration {
   key: string;
@@ -49,17 +60,6 @@ function textResult(value: unknown, mode: McpOutputMode, briefLines: string[]) {
   };
 }
 
-const reactionNames: Record<string, string> = {
-  "+1": "THUMBS_UP",
-  "-1": "THUMBS_DOWN",
-  eyes: "EYES",
-  laugh: "LAUGH",
-  hooray: "HOORAY",
-  confused: "CONFUSED",
-  heart: "HEART",
-  rocket: "ROCKET",
-};
-
 function checkBucket(check: PullRequestCheck): string {
   if (check.status?.toLowerCase() !== "completed") return "pending";
   switch (check.conclusion?.toLowerCase()) {
@@ -84,25 +84,6 @@ function checkLines(checks: PullRequestCheck[]): string[] {
     const completedAt = bucket === "pending" ? "" : check.completedAt ?? "";
     return `check ${check.name}: ${bucket}${completedAt ? ` @${completedAt}` : ""}`;
   });
-}
-
-function reactionLines(reactions: Record<string, number | undefined>, prefix: string): string[] {
-  return Object.entries(reactions)
-    .filter(([content, count]) => content !== "total_count" && typeof count === "number" && count > 0)
-    .map(([content, count]) => `${prefix} ${reactionNames[content] ?? content}: ${count}`);
-}
-
-function commentReactionLines(comments: PullRequestComment[]): string[] {
-  const counts = new Map<string, number>();
-  for (const comment of comments) {
-    for (const [content, count] of Object.entries(comment.reactions)) {
-      if (content === "total_count" || typeof count !== "number" || count <= 0) continue;
-      counts.set(content, (counts.get(content) ?? 0) + count);
-    }
-  }
-  return [...counts.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([content, count]) => `comment-reaction ${reactionNames[content] ?? content}: ${count}`);
 }
 
 function commentLocation(comment: PullRequestComment): string {
@@ -130,10 +111,80 @@ function feedbackLines(threads: PullRequestThread[], comments: PullRequestCommen
     });
 }
 
-function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): string[] {
-  const comments = snapshot.comments.filter((comment) => comment.author !== login);
-  const reviewComments = snapshot.reviewComments.filter((comment) => comment.author !== login);
-  const reviews = snapshot.reviews.filter((review) => review.author !== login);
+function aggregateReactionSummary(counts: PullRequestSnapshot["bodyReactions"]): string {
+  return Object.entries(counts)
+    .filter((entry): entry is [string, number] =>
+      entry[0] !== "total_count" && typeof entry[1] === "number" && entry[1] > 0)
+    .map(([content, count]) => `${content.toUpperCase()}×${count}`)
+    .sort()
+    .join(", ");
+}
+
+function unknownReactionLines(snapshot: PullRequestSnapshot): string[] {
+  const lines: string[] = [];
+  const add = (
+    counts: PullRequestSnapshot["bodyReactions"],
+    details: PullRequestReaction[] | undefined,
+    target: string,
+  ): void => {
+    if (details !== undefined) return;
+    const summary = aggregateReactionSummary(counts);
+    if (summary) lines.push(`reactions: attribution unavailable for ${summary} on ${target}`);
+  };
+  add(
+    snapshot.bodyReactions,
+    snapshot.bodyReactionDetails,
+    `PR #${snapshot.number} @${snapshot.author ?? "unknown"} ${snapshot.url}`,
+  );
+  for (const comment of snapshot.comments) {
+    add(
+      comment.reactions,
+      comment.reactionDetails,
+      `comment #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}`,
+    );
+  }
+  for (const comment of snapshot.reviewComments) {
+    add(
+      comment.reactions,
+      comment.reactionDetails,
+      `feedback #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * A brief listing summarises many PRs at once, so the attributed reaction lines of one
+ * snapshot are bounded; the overflow is reported as a count rather than dropped silently.
+ */
+function briefReactionLines(snapshot: PullRequestSnapshot, user: GithubUser): string[] {
+  // Reactions the watcher left are their own activity; everyone else's is the signal.
+  // The actor's numeric ID is the identity: a renamed or recased login must still be theirs.
+  // Records persisted before actor IDs were stored have none - null or absent - and fall
+  // back to the login, compared normalized so at least a recase is still recognised.
+  const lines = [
+    ...snapshotReactions(snapshot)
+      .filter((entry) => (entry.reaction.authorId == null
+        ? normalizedLogin(entry.reaction.author) !== normalizedLogin(user.login)
+        : entry.reaction.authorId !== user.id))
+      .map(reactionStateLine),
+    ...unknownReactionLines(snapshot),
+  ].sort();
+  const kept: string[] = [];
+  let length = 0;
+  for (const line of lines) {
+    if (kept.length === MAX_BRIEF_REACTION_LINES || length + line.length > MAX_BRIEF_REACTION_LENGTH) break;
+    kept.push(line);
+    length += line.length;
+  }
+  if (kept.length < lines.length) kept.push(`+${lines.length - kept.length} more reactions`);
+  return kept;
+}
+
+function briefSnapshotLines(snapshot: PullRequestSnapshot, user: GithubUser): string[] {
+  const comments = snapshot.comments.filter((comment) => comment.author !== user.login);
+  const reviewComments = snapshot.reviewComments.filter((comment) => comment.author !== user.login);
+  const reviews = snapshot.reviews.filter((review) => review.author !== user.login);
   const mergeableState = snapshot.mergeableState?.toUpperCase();
   const mergeable = snapshot.mergeable === null ? "unknown" : snapshot.mergeable ? "yes" : "no";
   const lines = [
@@ -141,8 +192,7 @@ function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): strin
     `head: ${snapshot.headRefName}@${snapshot.headSha}`,
     `mergeable: ${mergeable}${mergeableState ? ` (${mergeableState})` : ""}`,
     ...checkLines(snapshot.checks),
-    ...reactionLines(snapshot.bodyReactions, "reaction"),
-    ...commentReactionLines(comments),
+    ...briefReactionLines(snapshot, user),
     ...reviews.map((review) => `review ${review.author ?? "unknown"}: ${review.state}${review.submittedAt ? ` @${review.submittedAt}` : ""}`),
     `reviews: ${reviews.length}`,
     `comments: ${comments.length}`,
@@ -155,9 +205,9 @@ function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): strin
 }
 
 
-function briefRegistration(registration: WatchRegistration, login: string): string[] {
+function briefRegistration(registration: WatchRegistration, user: GithubUser): string[] {
   const lines = [`watching ${registration.key}`, `resource: ${registration.resourceUri}`];
-  if (registration.snapshot) lines.push(...briefSnapshotLines(registration.snapshot, login));
+  if (registration.snapshot) lines.push(...briefSnapshotLines(registration.snapshot, user));
   else if (registration.refreshScheduled) lines.push("snapshot: refresh scheduled");
   return lines;
 }
@@ -192,7 +242,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     },
     async ({ repository, number, mode }) => {
       const registration = await context.watch(repository, number);
-      return textResult(registration, mode, briefRegistration(registration, context.user.login));
+      return textResult(registration, mode, briefRegistration(registration, context.user));
     },
   );
 
@@ -238,7 +288,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       return textResult(
         registrations,
         mode,
-        registrations.flatMap((registration) => briefRegistration(registration, context.user.login)),
+        registrations.flatMap((registration) => briefRegistration(registration, context.user)),
       );
     },
   );
@@ -253,7 +303,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     async ({ repository, number, mode }) => {
       const state = await context.readWatch(repository, number);
       const lines = state.snapshot
-        ? briefSnapshotLines(state.snapshot, context.user.login)
+        ? briefSnapshotLines(state.snapshot, context.user)
         : ["snapshot: unavailable"];
       return textResult(state.snapshot, mode, lines);
     },
