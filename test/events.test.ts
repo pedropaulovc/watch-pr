@@ -356,6 +356,13 @@ describe("watch-pr event contracts", () => {
     expect(details.length).toBeLessThanOrEqual(24);
     expect(details.join("").length).toBeLessThanOrEqual(3_900);
     expect(details.at(-1)).toMatch(/^\+\d+ more changes$/u);
+    const unicodeDetails = monitorEventDetails(snapshot(), snapshot({
+      comments: [{ ...comments[0], id: 99, body: `${"x".repeat(238)}😀z` }],
+    }));
+    expect([...unicodeDetails.join("")].some((character) => {
+      const code = character.charCodeAt(0);
+      return character.length === 1 && code >= 0xd800 && code <= 0xdfff;
+    })).toBe(false);
   });
 
   it("emits only the changed comment body after a PR accumulates many comments", () => {

@@ -32,7 +32,10 @@ const ANSI_ESCAPE_SEQUENCE_RE = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?
 
 function truncate(value: string, maximumLength: number): string {
   if (value.length <= maximumLength) return value;
-  return `${value.slice(0, maximumLength - 1)}…`;
+  let prefix = value.slice(0, maximumLength - 1);
+  const lastCodeUnit = prefix.charCodeAt(prefix.length - 1);
+  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) prefix = prefix.slice(0, -1);
+  return `${prefix}…`;
 }
 
 function boundedDetails(lines: string[]): string[] {
