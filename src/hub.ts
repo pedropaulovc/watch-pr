@@ -12,6 +12,7 @@ import {
   reactionKnowledgeAdvanced,
   resourceUri,
   snapshotChanges,
+  terminalState,
   watchKey,
 } from "./events";
 import { exchangeGithubCode, GithubApiError, githubUser, pullRequestSnapshot, refreshGithubToken } from "./github";
@@ -1376,11 +1377,6 @@ function logWebhookFanout(eventName: string, outcome: "completed" | "failed", st
 }
 
 const monitorEncoder = new TextEncoder();
-
-function terminalState(snapshot: PullRequestSnapshot | null): MonitorTerminalState {
-  if (snapshot?.merged) return "merged";
-  return snapshot?.state.toLowerCase() === "closed" ? "closed" : "watching";
-}
 
 function resumesClosedWatch(event: WatchEvent, snapshot: PullRequestSnapshot | null): boolean {
   if (terminalState(snapshot) !== "watching") return false;

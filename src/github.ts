@@ -313,7 +313,11 @@ interface SnapshotReactions {
  * from rather than passing as read now.
  * A failed or internally inconsistent read leaves that target unknown. Its current summary
  * counts still advance, but the absent details force the next refresh to read the target
- * again. Unknown details also let the transactional merge preserve reaction knowledge that
+ * again. The two failures part company over the cursor: a transport failure leaves the pages
+ * already collected intact and resumable, while a finished read whose records contradict the
+ * counts proves the prefix itself is incoherent, so the cursor is dropped with the details
+ * and the next refresh starts at page one instead of replaying the same prefix forever.
+ * Unknown details also let the transactional merge preserve reaction knowledge that
  * another concurrent refresh committed while this request was in flight. Every other
  * snapshot field still advances.
  *
@@ -386,8 +390,8 @@ async function snapshotReactions(
 
   const budget: RequestBudget = { remaining: REACTION_REQUEST_BUDGET };
   const states = await mapBounded(reads, REACTION_CONCURRENCY, async (read): Promise<ReactionState> => {
+    const reactions = slots[read.slot].reactions;
     try {
-      const reactions = slots[read.slot].reactions;
       const page = await reactionRecords(
         token,
         read.path,
@@ -395,7 +399,12 @@ async function snapshotReactions(
         slots[read.slot].reactionProgress,
       );
       if (page.reactionDetails && !reactionDetailsMatchCounts(page.reactionDetails, reactions)) {
-        throw new Error(`GitHub returned reaction details inconsistent with ${read.path}`);
+        // The finished read does not describe the counts: a reaction was added or removed
+        // while it was paginating, which shifts page boundaries and leaves the collected
+        // records duplicated or short. Resuming the same cursor would replay the same
+        // incoherent prefix forever, so the target keeps only its counts and the next
+        // refresh starts again at page one.
+        return { reactions };
       }
       return {
         reactions,
@@ -404,6 +413,8 @@ async function snapshotReactions(
         reactionDetailsReadAt: page.reactionDetailsReadAt ?? slots[read.slot].reactionDetailsReadAt,
       };
     } catch {
+      // A transport or HTTP failure says nothing about the records already collected, so the
+      // cursor stays resumable and the next refresh continues where this one stopped.
       return slots[read.slot];
     }
   });

@@ -466,6 +466,120 @@ describe("native monitor feed", () => {
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-terminal"]);
   });
 
+  it("reports the reaction counts a merge could not attribute instead of restoring the stored ones", async () => {
+    const { hub, storage } = hubFixture();
+    const read = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [{ id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-10T11:59:00.000Z" }],
+      bodyReactionDetailsReadAt: "2026-09-10T12:00:00.000Z",
+    });
+    await storeMonitor(storage, { snapshot: read, events: [event("event-1", read)] });
+    const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}?cursor=event-1`));
+    const feed = feedReader(response);
+
+    // The refresh that saw the merge also saw two more hearts, and its detail read failed.
+    const mergedSnapshot = snapshot({
+      state: "closed",
+      merged: true,
+      mergedAt: "2026-09-10T12:02:00.000Z",
+      fetchedAt: "2026-09-10T12:02:00.000Z",
+      bodyReactions: { heart: 3, total_count: 3 },
+      bodyReactionDetails: undefined,
+    });
+    const internals = hub as unknown as HubInternals;
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-merged", mergedSnapshot, { action: "closed", changes: ["lifecycle", "reactions"] }),
+      { snapshot: mergedSnapshot },
+    );
+
+    const delivered = await nextMonitorEvent(feed);
+    expect(delivered).toMatchObject({ id: "event-merged", terminalState: "merged" });
+    expect(delivered.details.filter((line) => line.startsWith("reaction"))).toEqual([
+      "reaction counts: HEART 1 -> 3 on PR #7 @author https://github.com/owner/repo/pull/7 (attribution unavailable)",
+    ]);
+    await expect(feed.reader.read()).resolves.toMatchObject({ done: true });
+
+    // Nothing will read this PR again, so the terminal snapshot keeps the counts it saw
+    // rather than the complete-looking pair it could no longer confirm.
+    const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
+    expect(stored.snapshot).toMatchObject({ merged: true, bodyReactions: { heart: 3, total_count: 3 } });
+    expect(stored.snapshot?.bodyReactionDetails).toBeUndefined();
+    expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-merged"]);
+  });
+
+  it("reports an unfinished reaction cursor on closure and drops the cursor nothing will resume", async () => {
+    const { hub, storage } = hubFixture();
+    const comment = {
+      id: 11,
+      author: "commenter",
+      body: "please review",
+      createdAt: "2026-09-10T11:00:00.000Z",
+      updatedAt: "2026-09-10T11:00:00.000Z",
+      htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-11",
+      reactions: { rocket: 1, total_count: 1 },
+    };
+    // A second target neither snapshot ever read: unchanged counts have nothing to report,
+    // so closure must not turn every unknown target into a line.
+    const unread = {
+      id: 12,
+      author: "reviewer",
+      body: "nit",
+      createdAt: "2026-09-10T11:10:00.000Z",
+      updatedAt: "2026-09-10T11:10:00.000Z",
+      htmlUrl: "https://github.com/owner/repo/pull/7#discussion_r12",
+      reactions: { "+1": 2, total_count: 2 },
+    };
+    const read = snapshot({
+      comments: [{
+        ...comment,
+        reactionDetails: [{ id: 902, content: "rocket", author: "bob", authorId: 12, createdAt: "2026-09-10T11:30:00.000Z" }],
+        reactionDetailsReadAt: "2026-09-10T12:00:00.000Z",
+      }],
+      reviewComments: [unread],
+    });
+    await storeMonitor(storage, { snapshot: read, events: [event("event-1", read)] });
+    const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}?cursor=event-1`));
+    const feed = feedReader(response);
+
+    // This refresh ran out of reaction request budget one page in, and then the PR closed.
+    const closedSnapshot = snapshot({
+      state: "closed",
+      fetchedAt: "2026-09-10T12:02:00.000Z",
+      comments: [{
+        ...comment,
+        reactions: { rocket: 4, total_count: 4 },
+        reactionProgress: {
+          records: [{ id: 902, content: "rocket", author: "bob", authorId: 12, createdAt: "2026-09-10T11:30:00.000Z" }],
+          nextUrl: "https://api.github.com/repos/owner/repo/issues/comments/11/reactions?per_page=100&page=2",
+        },
+        reactionDetailsReadAt: "2026-09-10T12:01:00.000Z",
+      }],
+      reviewComments: [unread],
+    });
+    const internals = hub as unknown as HubInternals;
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-closed", closedSnapshot, { action: "closed", changes: ["lifecycle", "reactions"] }),
+      { snapshot: closedSnapshot },
+    );
+
+    const delivered = await nextMonitorEvent(feed);
+    expect(delivered).toMatchObject({ id: "event-closed", terminalState: "closed" });
+    expect(delivered.details.filter((line) => line.startsWith("reaction"))).toEqual([
+      "reaction counts: ROCKET 1 -> 4 on comment #11 @commenter https://github.com/owner/repo/pull/7#issuecomment-11 (attribution unavailable)",
+    ]);
+    await expect(feed.reader.read()).resolves.toMatchObject({ done: true });
+
+    const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
+    expect(stored.snapshot?.comments[0]).toMatchObject({ reactions: { rocket: 4, total_count: 4 } });
+    expect(stored.snapshot?.comments[0]?.reactionDetails).toBeUndefined();
+    expect(stored.snapshot?.comments[0]?.reactionProgress).toBeUndefined();
+    expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-closed"]);
+  });
+
   it("deduplicates an already-persisted delivery inside the state transaction", async () => {
     const { hub, storage } = hubFixture();
     const incoming = event("event-duplicate", snapshot());

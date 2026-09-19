@@ -289,6 +289,61 @@ describe("GitHub API adapter", () => {
     expect(complete.bodyReactionDetails).toHaveLength(6_500);
   });
 
+  it("restarts a resumed reaction read whose stored prefix a mutation between waves invalidated", async () => {
+    const requested: string[] = [];
+    const record = (id: number) => ({ id, content: "heart", user: { login: `user-${id}`, id }, created_at: "now" });
+    const stored = (id: number) => ({ id, content: "heart", author: `user-${id}`, authorId: id, createdAt: "now" });
+    const counts = { heart: 3, total_count: 3 };
+    stubPullRequest({ title: "paginating", bodyReactions: {}, reactions: () => Response.json([]), requested });
+    const empty = await pullRequestSnapshot("token", "owner/repo", 7);
+    // A previous refresh ran out of request budget one page into this target.
+    const resumable = {
+      ...empty,
+      bodyReactions: counts,
+      bodyReactionDetails: undefined,
+      bodyReactionDetailsReadAt: "2026-09-03T00:01:00.000Z",
+      bodyReactionProgress: {
+        records: [stored(1), stored(2)],
+        nextUrl: "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2",
+      },
+    };
+
+    // A reaction moved while the read was suspended, so the page boundaries shifted and the
+    // suffix hands back a record the stored prefix already holds.
+    requested.length = 0;
+    stubPullRequest({
+      title: "mutated",
+      bodyReactions: counts,
+      reactions: (url) => Response.json(url.includes("page=2") ? [record(1)] : [record(1), record(2), record(3)]),
+      requested,
+    });
+    const incoherent = await pullRequestSnapshot("token", "owner/repo", 7, resumable);
+    expect(requested.filter((url) => url.includes("/reactions"))).toEqual([
+      "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2",
+    ]);
+    // Three records against a count of three, but one of them twice: the prefix cannot be
+    // part of any coherent read, so it goes with the cursor rather than being replayed.
+    expect(incoherent.bodyReactions).toEqual(counts);
+    expect(incoherent.bodyReactionDetails).toBeUndefined();
+    expect(incoherent.bodyReactionProgress).toBeUndefined();
+    expect(incoherent.bodyReactionDetailsReadAt).toBeUndefined();
+
+    // The next refresh therefore starts at page one and finishes the target.
+    requested.length = 0;
+    stubPullRequest({
+      title: "settled",
+      bodyReactions: counts,
+      reactions: () => Response.json([record(1), record(2), record(3)]),
+      requested,
+    });
+    const settled = await pullRequestSnapshot("token", "owner/repo", 7, incoherent);
+    expect(requested.filter((url) => url.includes("/reactions"))).toEqual([
+      "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100",
+    ]);
+    expect(settled.bodyReactionDetails).toEqual([stored(1), stored(2), stored(3)]);
+    expect(settled.bodyReactionProgress).toBeUndefined();
+  });
+
   it("reuses stored reaction details while the summary counts are unchanged", async () => {
     const requested: string[] = [];
     vi.useFakeTimers({ toFake: ["Date"] });

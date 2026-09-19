@@ -1,4 +1,5 @@
 import type {
+  MonitorTerminalState,
   PullRequestCheck,
   PullRequestComment,
   PullRequestReaction,
@@ -391,11 +392,19 @@ function readIsNewer(candidate: ReactionKnowledge, incumbent: ReactionKnowledge)
  * knowledge and restarts at page one, only to be overwritten again - so a cursor opened
  * against counts `source` does not share is the only route to the reactions those older
  * details predate.
+ *
+ * All three rules lean on a next refresh that a merge or closure never grants. Once `base`
+ * is terminal, counts it observed and could not attribute are the last word on that target:
+ * taking back details the committed state read against counts this snapshot has already
+ * left would restore a reaction state the pull request is no longer in and hide the
+ * movement behind it, and a cursor nothing will resume is no better. The counts stand alone
+ * instead, and the event announces them as unattributed.
  */
 function resolveReactionKnowledge(
   base: ReactionKnowledge,
   source: ReactionKnowledge | undefined,
   basePublishes: boolean,
+  baseIsTerminal: boolean,
 ): ReactionKnowledge | undefined {
   const agrees = source !== undefined && sameReactionCounts(base.reactions, source.reactions);
   if (base.reactionDetails !== undefined) {
@@ -441,6 +450,11 @@ function resolveReactionKnowledge(
     };
   }
   if (source === undefined) return undefined;
+  if (baseIsTerminal && !agrees) {
+    // Nothing will read this target again, so a cursor here is dead weight; dropping it
+    // leaves the counts as the only claim the terminal snapshot makes about it.
+    return base.reactionProgress === undefined ? undefined : { reactions: base.reactions };
+  }
   const supersedes = agrees || readIsNewer(source, base);
   if (
     source.reactionDetails !== undefined &&
@@ -499,6 +513,7 @@ export function mergeReactionKnowledge(
   const baseTime = Date.parse(base.fetchedAt);
   const sourceTime = Date.parse(source.fetchedAt);
   const basePublishes = !(Number.isFinite(baseTime) && Number.isFinite(sourceTime) && baseTime < sourceTime);
+  const baseIsTerminal = terminalState(base) !== "watching";
   let merged = false;
   const body = resolveReactionKnowledge(
     {
@@ -516,12 +531,18 @@ export function mergeReactionKnowledge(
       reactionProgress: source.bodyReactionProgress,
     },
     basePublishes,
+    baseIsTerminal,
   );
   if (body) merged = true;
   const fill = (targets: PullRequestComment[], known: PullRequestComment[]): PullRequestComment[] => {
     const knownById = new Map(known.map((comment) => [comment.id, comment] as const));
     return targets.map((comment) => {
-      const resolved = resolveReactionKnowledge(comment, knownById.get(comment.id), basePublishes);
+      const resolved = resolveReactionKnowledge(
+        comment,
+        knownById.get(comment.id),
+        basePublishes,
+        baseIsTerminal,
+      );
       if (!resolved) return comment;
       merged = true;
       return {
@@ -552,6 +573,15 @@ export function mergeReactionKnowledge(
 /** Logins are renameable and recasable, so they are only ever compared normalized. */
 export function normalizedLogin(login: string | null | undefined): string {
   return (login ?? "").toLowerCase();
+}
+
+/**
+ * The watch lifecycle a snapshot implies. A merged or closed pull request is terminal: no
+ * later refresh reads it, so whatever a terminal snapshot leaves unresolved stays that way.
+ */
+export function terminalState(snapshot: PullRequestSnapshot | null): MonitorTerminalState {
+  if (snapshot?.merged) return "merged";
+  return snapshot?.state.toLowerCase() === "closed" ? "closed" : "watching";
 }
 
 export function snapshotChanges(
@@ -829,6 +859,8 @@ interface ReactionGroup {
   target: ReactionTarget;
   /** Undefined is unknown: never read, or read and failed. It is not "no reactions". */
   reactions: PullRequestReaction[] | undefined;
+  /** The aggregate GitHub reports for this target, known whether the details are or not. */
+  counts: ReactionCounts;
 }
 
 /** Every reaction target the snapshot knows, including the ones carrying no reactions. */
@@ -839,14 +871,18 @@ function reactionGroups(snapshot: PullRequestSnapshot): Map<string, ReactionGrou
     author: snapshot.author,
     url: snapshot.url,
   };
-  groups.set(pullRequest.label, { target: pullRequest, reactions: snapshot.bodyReactionDetails });
+  groups.set(pullRequest.label, {
+    target: pullRequest,
+    reactions: snapshot.bodyReactionDetails,
+    counts: snapshot.bodyReactions,
+  });
   for (const comment of snapshot.comments) {
     const target = commentReactionTarget(comment, "comment");
-    groups.set(target.label, { target, reactions: comment.reactionDetails });
+    groups.set(target.label, { target, reactions: comment.reactionDetails, counts: comment.reactions });
   }
   for (const comment of snapshot.reviewComments) {
     const target = commentReactionTarget(comment, "feedback");
-    groups.set(target.label, { target, reactions: comment.reactionDetails });
+    groups.set(target.label, { target, reactions: comment.reactionDetails, counts: comment.reactions });
   }
   return groups;
 }
@@ -911,6 +947,20 @@ function reactionTargetDetails(
 }
 
 /**
+ * Per-content movement between two aggregates, as `HEART 1 -> 3`, for the targets whose
+ * individual reactions never became known. `total_count` is left out: it restates the rest.
+ */
+function reactionCountMovement(previous: ReactionCounts, current: ReactionCounts): string[] {
+  const contents = [...new Set([...Object.keys(previous), ...Object.keys(current)])]
+    .filter((content) => content !== "total_count")
+    .sort();
+  return contents
+    .filter((content) => (previous[content] ?? 0) !== (current[content] ?? 0))
+    .map((content) =>
+      `${reactionContentName(content)} ${previous[content] ?? 0} -> ${current[content] ?? 0}`);
+}
+
+/**
  * Within an ongoing watch every reaction the current snapshot carries is news, including
  * the ones on a target this refresh reveals for the first time. Only the initial
  * reconciliation suppresses reaction history, and it never reaches here: `monitorEventDetails`
@@ -920,13 +970,28 @@ function reactionTargetDetails(
  * A target whose previous reactions are unknown - a snapshot persisted before individual
  * reactions existed, or a read that failed - reports nothing on the refresh that first learns
  * them: those reactions are a baseline, not activity. It is diffed normally from then on.
+ *
+ * An unknown target is normally silent too, because the next refresh reads it and reports
+ * what it finds. A merge or a closure is the one event with no next refresh: the counts it
+ * saw move are all anyone will ever get, so they are reported as an aggregate the event
+ * states it could not attribute, rather than being dropped for want of the actors. These
+ * lines are ordinary details, so `boundedDetails` caps them with everything else.
  */
 function reactionDetails(previous: PullRequestSnapshot, current: PullRequestSnapshot): string[] {
   const previousGroups = reactionGroups(previous);
+  const unresolvedIsFinal = terminalState(current) !== "watching";
   const lines: string[] = [];
   for (const [label, group] of reactionGroups(current)) {
-    if (group.reactions === undefined) continue;
     const prior = previousGroups.get(label);
+    if (group.reactions === undefined) {
+      if (!unresolvedIsFinal) continue;
+      const movement = reactionCountMovement(prior?.counts ?? {}, group.counts);
+      if (movement.length === 0) continue;
+      lines.push(
+        `reaction counts: ${movement.join(", ")} on ${reactionTargetDescription(group.target)} (attribution unavailable)`,
+      );
+      continue;
+    }
     if (prior && prior.reactions === undefined) continue;
     lines.push(...reactionTargetDetails(prior?.reactions ?? [], group.reactions, group.target));
   }
