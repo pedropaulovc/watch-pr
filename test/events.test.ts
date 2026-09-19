@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { hmacSha256Hex, verifyGithubSignature } from "../src/crypto";
-import { eventPullRequestNumbers, parseResourceUri, resourceUri, snapshotChanges, watchKey } from "../src/events";
+import {
+  eventPullRequestNumbers,
+  monitorEventDetails,
+  parseResourceUri,
+  resourceUri,
+  snapshotChanges,
+  watchKey,
+} from "../src/events";
 import type { PullRequestSnapshot } from "../src/types";
 
 const snapshot = (overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnapshot => ({
@@ -204,6 +211,88 @@ describe("watch-pr event contracts", () => {
 
   it("detects merged timestamp changes as lifecycle changes", () => {
     expect(snapshotChanges(snapshot(), snapshot({ merged: true, mergedAt: "2026-09-03T01:00:00.000Z" }))).toEqual(["lifecycle"]);
+  });
+
+  it("coalesces a check rerun into one start and one terminal summary", () => {
+    const pending = (id: number, name: string) => ({
+      id,
+      name,
+      status: "in_progress",
+      conclusion: null,
+      completedAt: null,
+      startedAt: "2026-09-19T12:00:00.000Z",
+      url: `https://github.com/owner/repo/actions/runs/${id}`,
+      kind: "check_run" as const,
+    });
+    const completed = (id: number, name: string) => ({
+      ...pending(id, name),
+      status: "completed",
+      conclusion: "success",
+      completedAt: "2026-09-19T12:01:00.000Z",
+    });
+    const before = snapshot();
+    const started = snapshot({ checks: [pending(1, "CI"), pending(2, "Lint")] });
+    const partial = snapshot({ checks: [completed(1, "CI"), pending(2, "Lint")] });
+    const finished = snapshot({ checks: [completed(1, "CI"), completed(2, "Lint")] });
+
+    expect(monitorEventDetails(before, started)).toEqual([
+      "checks: rerun started (pending: CI, Lint)",
+    ]);
+    expect(monitorEventDetails(started, partial)).toEqual([]);
+    expect(monitorEventDetails(partial, finished)).toEqual([
+      "checks: all terminal (pass: 2, fail: 0, skipping: 0, cancel: 0)",
+    ]);
+  });
+
+  it("emits only the changed comment body after a PR accumulates many comments", () => {
+    const existing = Array.from({ length: 20 }, (_, index) => ({
+      id: index + 1,
+      author: "reviewer",
+      body: `old comment ${index + 1}`,
+      createdAt: "2026-09-18T12:00:00.000Z",
+      updatedAt: "2026-09-18T12:00:00.000Z",
+      reactions: {},
+      htmlUrl: `https://github.com/owner/repo/pull/7#issuecomment-${index + 1}`,
+    }));
+    const newComment = {
+      id: 21,
+      author: "reviewer",
+      body: "<!-- hidden -->Please cover the retry race\nbefore merging.",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
+    };
+
+    expect(monitorEventDetails(
+      snapshot({ comments: existing }),
+      snapshot({ comments: [...existing, newComment] }),
+    )).toEqual([
+      "comment #21 @reviewer https://github.com/owner/repo/pull/7#issuecomment-21: Please cover the retry race before merging.",
+    ]);
+  });
+
+  it("includes the changed review comment body, comment ID, and thread ID inline", () => {
+    const reviewComment = {
+      id: 21,
+      author: "reviewer",
+      body: "This retry can race the cancellation path.",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      path: "src/retry.ts",
+      line: 44,
+      startLine: 42,
+      htmlUrl: "https://github.com/owner/repo/pull/7#discussion_r21",
+    };
+    const after = snapshot({
+      reviewComments: [reviewComment],
+      threads: [{ id: "PRRT_thread", isResolved: false, commentIds: [21] }],
+    });
+
+    expect(monitorEventDetails(snapshot(), after)).toEqual([
+      "feedback [PRRT_thread] #21 src/retry.ts:42-44 @reviewer https://github.com/owner/repo/pull/7#discussion_r21: This retry can race the cancellation path.",
+    ]);
   });
 
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {

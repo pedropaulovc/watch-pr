@@ -44,6 +44,7 @@ export interface PrMonitorEvent {
   action: string | null;
   receivedAt: string;
   changes: string[];
+  details: string[];
   terminalState: MonitorTerminalState;
 }
 export interface OAuthClientRecord {
@@ -161,6 +162,11 @@ export interface WatchEvent {
   payload: unknown;
   snapshot: PullRequestSnapshot | null;
   changes: string[];
+  /**
+   * Compact, event-specific lines that let monitor clients act without fetching the
+   * complete snapshot. Optional for persisted events written before this field existed.
+   */
+  details?: string[];
 }
 
 export interface StoredWatchState {

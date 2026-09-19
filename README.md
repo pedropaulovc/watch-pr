@@ -11,7 +11,7 @@ Authenticate with the OAuth 2.0 authorization-code + S256 PKCE flow advertised a
 Tools:
 
 - `watch_pr` — subscribe to `repository` (`owner/name`) and `number`.
-- `open_pr_monitor` — create a revocable read-only SSE capability for an already-watched PR; the JSON result includes `monitorUrl`, `cursor`, and `terminalState`.
+- `open_pr_monitor` — create a revocable, read-only SSE capability for an already-watched PR; the JSON result includes `monitorUrl`, `cursor`, and `terminalState`.
 - `unwatch_pr` — remove a subscription for the current GitHub account.
 - `list_watched_prs` — list the current account's subscriptions.
 - `get_pr` — read the latest durable pull request snapshot.
@@ -20,7 +20,7 @@ Tools:
 
 Each watched PR is also available as a resource at `watch-pr://owner/repository/pull/NUMBER`. A webhook or changed snapshot sends the standard `notifications/resources/updated` notification; clients can then call `resources/read`. The server also sends a compact event summary through `notifications/message` for clients that support logging notifications.
 
-The monitor URL is scoped to the current OAuth session and PR and carries no GitHub credential. `GET /monitor/...` replays events after the URL's `cursor` (or the `Last-Event-ID` header), then remains open for live events and heartbeat comments. A cursor older than the bounded event history receives a reconciliation event from the current snapshot. `unwatch_pr` revokes the capability; merged or closed feeds emit their terminal event and close naturally.
+The monitor URL is scoped to the current OAuth session and PR, carries no GitHub credential, and expires 12 hours after minting. Only `GET /monitor/...` is accepted. The feed replays events after the URL's `cursor` (or the `Last-Event-ID` header), then remains open for live events and heartbeat comments. Each event includes compact `details` for actionable state: check waves, named failures and cancellations with URLs, head/rebase changes, and the bodies and IDs of changed comments, reviews, and review comments. Routine check churn has empty details. A cursor older than the bounded event history receives a reconciliation event from the current snapshot. `unwatch_pr` revokes the capability; merged or closed feeds emit their terminal event and close naturally.
 
 Snapshots include PR lifecycle and mergeability, base/head refs, checks and commit statuses, reviews, top-level comments and reactions, inline review comments and reactions, and GraphQL review-thread resolution state.
 

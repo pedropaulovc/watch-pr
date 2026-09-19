@@ -1,7 +1,17 @@
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { constantTimeEqual, parseBearerToken, randomToken, sha256Base64Url, verifyGithubSignature } from "./crypto";
-import { createWatchEvent, eventPullRequestNumbers, isSupportedGithubEvent, parseWatchKey, resourceUri, snapshotChanges, watchKey } from "./events";
+import {
+  createWatchEvent,
+  eventPullRequestNumbers,
+  isSupportedGithubEvent,
+  monitorEventDetails,
+  monitorReconciliationDetails,
+  parseWatchKey,
+  resourceUri,
+  snapshotChanges,
+  watchKey,
+} from "./events";
 import { exchangeGithubCode, GithubApiError, githubUser, pullRequestSnapshot, refreshGithubToken } from "./github";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "./mcp";
 import type {
@@ -65,6 +75,7 @@ interface ActiveMonitorFeed {
   key: string;
   controller: ReadableStreamDefaultController<Uint8Array>;
   heartbeat: number;
+  expiration: number;
   closed: boolean;
 }
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -72,6 +83,7 @@ const OAUTH_TTL_SECONDS = 10 * 60;
 const MAX_EVENTS = 100;
 const MAX_CLOSED_MCP_SESSIONS = 64;
 const MONITOR_HEARTBEAT_MS = 15_000;
+const MONITOR_TTL_MS = 12 * 60 * 60 * 1000;
 const MAX_MONITOR_CURSOR_LENGTH = 256;
 
 const MAX_STORAGE_BATCH_KEYS = 128;
@@ -393,7 +405,8 @@ function isWatchEventSummary(value: unknown): value is WatchEventSummary {
     typeof summary.repository === "string" &&
     Number.isSafeInteger(summary.pullRequestNumber) &&
     typeof summary.resourceUri === "string" &&
-    isStringArray(summary.changes);
+    isStringArray(summary.changes) &&
+    (summary.details === undefined || isStringArray(summary.details));
 }
 
 function isSidecarPayloadRef(value: unknown): value is SidecarPayloadRef {
@@ -512,6 +525,7 @@ function eventSummary(event: WatchEvent): WatchEventSummary {
     pullRequestNumber: event.pullRequestNumber,
     resourceUri: event.resourceUri,
     changes: event.changes,
+    details: event.details ?? [],
   };
 }
 
@@ -1221,6 +1235,7 @@ function compactMonitorEvent(event: WatchEventSummary, state: MonitorTerminalSta
     action: event.action,
     receivedAt: event.receivedAt,
     changes: event.changes,
+    details: event.details ?? [],
     terminalState: state,
   };
 }
@@ -1241,6 +1256,7 @@ function reconciliationMonitorEvent(
     action,
     receivedAt: snapshot?.fetchedAt ?? latest?.receivedAt ?? new Date().toISOString(),
     changes: action === "cursor_miss" ? ["reconciled"] : [],
+    details: snapshot ? monitorReconciliationDetails(snapshot) : [],
     terminalState: terminalState(snapshot),
   };
 }
@@ -1302,7 +1318,7 @@ export class WatchPrHub {
     const session = await this.state.storage.get<SessionRecord>(sessionStorageKey(record.sessionToken));
     const key = watchKey(record.repository, record.pullRequestNumber);
     if (
-      record.expiresAt <= Date.now() ||
+      Math.min(record.expiresAt, record.createdAt + MONITOR_TTL_MS) <= Date.now() ||
       !session ||
       session.expiresAt <= Date.now() ||
       session.user.id !== record.userId ||
@@ -1355,6 +1371,11 @@ export class WatchPrHub {
           }
         }, MONITOR_HEARTBEAT_MS);
         for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) this.closeMonitorFeed(feed);
+        const expiration = setTimeout(() => {
+          if (!activeFeed || activeFeed.closed) return;
+          this.closeMonitorFeed(activeFeed);
+          this.state.waitUntil(this.revokeMonitorCapability(capability, record));
+        }, Math.max(0, Math.min(record.expiresAt, record.createdAt + MONITOR_TTL_MS) - Date.now()));
         activeFeed = {
           capability,
           userId: record.userId,
@@ -1362,6 +1383,7 @@ export class WatchPrHub {
           key,
           controller,
           heartbeat,
+          expiration,
           closed: false,
         };
         const feeds = this.activeMonitorFeeds.get(capability) ?? new Set<ActiveMonitorFeed>();
@@ -1398,6 +1420,7 @@ export class WatchPrHub {
     if (feed.closed) return;
     feed.closed = true;
     clearInterval(feed.heartbeat);
+    clearTimeout(feed.expiration);
     const feeds = this.activeMonitorFeeds.get(feed.capability);
     feeds?.delete(feed);
     if (feeds?.size === 0) this.activeMonitorFeeds.delete(feed.capability);
@@ -1658,17 +1681,18 @@ export class WatchPrHub {
       record.userId !== active.record.user.id ||
       record.repository !== parsed.repository ||
       record.pullRequestNumber !== parsed.number ||
-      record.expiresAt <= Date.now()
+      Math.min(record.expiresAt, record.createdAt + MONITOR_TTL_MS) <= Date.now()
     ) {
       if (capability) await this.revokeMonitorCapability(capability, record);
       capability = randomToken(32);
+      const createdAt = Date.now();
       record = {
         sessionToken: active.token,
         userId: active.record.user.id,
         repository: parsed.repository,
         pullRequestNumber: parsed.number,
-        createdAt: Date.now(),
-        expiresAt: active.record.expiresAt,
+        createdAt,
+        expiresAt: Math.min(active.record.expiresAt, createdAt + MONITOR_TTL_MS),
       };
       await putStorageEntries(this.state.storage, {
         [scopeKey]: capability,
@@ -2227,7 +2251,12 @@ export class WatchPrHub {
           }
         }
         if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
-        deliveredEvent = { ...event, snapshot, changes };
+        const details = snapshot === current.snapshot
+          ? []
+          : snapshot
+            ? monitorEventDetails(current.snapshot, snapshot)
+            : [];
+        deliveredEvent = { ...event, snapshot, changes, details };
         write = await mutation.append(deliveredEvent, snapshot);
         published = true;
       });

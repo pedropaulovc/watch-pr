@@ -1,4 +1,10 @@
-import type { PullRequestSnapshot, WatchEvent } from "./types";
+import type {
+  PullRequestCheck,
+  PullRequestComment,
+  PullRequestReview,
+  PullRequestSnapshot,
+  WatchEvent,
+} from "./types";
 
 export const SUPPORTED_GITHUB_EVENTS = [
   "check_run",
@@ -210,6 +216,187 @@ export function snapshotChanges(
   if (JSON.stringify(previous.bodyReactions) !== JSON.stringify(current.bodyReactions)) changes.push("reactions");
   if (JSON.stringify(previous.threads) !== JSON.stringify(current.threads)) changes.push("review_threads");
   return changes;
+}
+
+function checkBucket(check: PullRequestCheck): "pending" | "pass" | "fail" | "skipping" | "cancel" {
+  if (check.status?.toLowerCase() !== "completed") return "pending";
+  switch (check.conclusion?.toLowerCase()) {
+    case "success":
+    case "neutral":
+      return "pass";
+    case "skipped":
+      return "skipping";
+    case "cancelled":
+    case "canceled":
+      return "cancel";
+    default:
+      return check.conclusion ? "fail" : "pending";
+  }
+}
+
+function checkKey(check: PullRequestCheck): string {
+  return `${check.kind}:${check.id}`;
+}
+
+function checkTerminalSummary(checks: PullRequestCheck[]): string {
+  const counts = { pass: 0, fail: 0, skipping: 0, cancel: 0 };
+  for (const check of checks) {
+    const bucket = checkBucket(check);
+    if (bucket !== "pending") counts[bucket] += 1;
+  }
+  return `checks: all terminal (pass: ${counts.pass}, fail: ${counts.fail}, skipping: ${counts.skipping}, cancel: ${counts.cancel})`;
+}
+
+function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[]): string[] {
+  const previousByKey = new Map(previous.map((check) => [checkKey(check), check]));
+  const previousPending = new Set(
+    previous.filter((check) => checkBucket(check) === "pending").map(checkKey),
+  );
+  const currentPending = new Set(
+    current.filter((check) => checkBucket(check) === "pending").map(checkKey),
+  );
+  const lines = current
+    .filter((check) => {
+      const bucket = checkBucket(check);
+      if (bucket !== "fail" && bucket !== "cancel") return false;
+      const prior = previousByKey.get(checkKey(check));
+      return !prior || checkBucket(prior) !== bucket || prior.completedAt !== check.completedAt;
+    })
+    .map((check) => `check ${check.name}: ${checkBucket(check)}${check.url ? ` ${check.url}` : ""}`);
+
+  if (previousPending.size === 0 && currentPending.size > 0) {
+    const names = [...new Set(
+      current.filter((check) => currentPending.has(checkKey(check))).map((check) => check.name),
+    )].sort();
+    lines.push(`checks: rerun started (pending: ${names.join(", ")})`);
+  }
+  if (
+    previousPending.size > 0 &&
+    currentPending.size === 0 &&
+    [...previousPending].every((key) => current.some((check) => checkKey(check) === key))
+  ) {
+    lines.push(checkTerminalSummary(current));
+  }
+  return lines;
+}
+
+function compactBody(value: string): string {
+  return value.replace(/<!--[\s\S]*?-->/gu, "").replace(/\s+/gu, " ").trim();
+}
+
+function commentLocation(comment: PullRequestComment): string {
+  if (!comment.path) return "";
+  const start = comment.startLine ?? comment.line;
+  const end = comment.line ?? start;
+  if (!start) return comment.path;
+  return `${comment.path}:${start}${end && end !== start ? `-${end}` : ""}`;
+}
+
+function commentContentKey(comment: PullRequestComment): string {
+  return JSON.stringify([
+    comment.author,
+    comment.body,
+    comment.updatedAt,
+    comment.path,
+    comment.line,
+    comment.startLine,
+    comment.inReplyToId,
+  ]);
+}
+
+function reviewContentKey(review: PullRequestReview): string {
+  return JSON.stringify([review.author, review.state, review.body, review.submittedAt]);
+}
+
+function changedComments(
+  previous: PullRequestComment[],
+  current: PullRequestComment[],
+): PullRequestComment[] {
+  const previousById = new Map(previous.map((comment) => [comment.id, comment]));
+  return current.filter((comment) => {
+    const prior = previousById.get(comment.id);
+    return !prior || commentContentKey(prior) !== commentContentKey(comment);
+  });
+}
+
+function changedReviews(
+  previous: PullRequestReview[],
+  current: PullRequestReview[],
+): PullRequestReview[] {
+  const previousById = new Map(previous.map((review) => [review.id, review]));
+  return current.filter((review) => {
+    const prior = previousById.get(review.id);
+    return !prior || reviewContentKey(prior) !== reviewContentKey(review);
+  });
+}
+
+function commentDetail(comment: PullRequestComment): string {
+  const body = compactBody(comment.body);
+  return `comment #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+}
+
+function reviewDetail(review: PullRequestReview): string {
+  const body = compactBody(review.body);
+  return `review #${review.id} @${review.author ?? "unknown"} ${review.state}${review.htmlUrl ? ` ${review.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+}
+
+function reviewCommentDetail(comment: PullRequestComment, snapshot: PullRequestSnapshot): string {
+  const thread = snapshot.threads.find((candidate) => candidate.commentIds.includes(comment.id));
+  const location = commentLocation(comment);
+  const body = compactBody(comment.body);
+  return `feedback [${thread?.id ?? comment.id}] #${comment.id}${location ? ` ${location}` : ""} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+}
+
+function mergeabilityDetails(
+  previous: PullRequestSnapshot | null,
+  current: PullRequestSnapshot,
+): string[] {
+  const lines: string[] = [];
+  if (!previous || previous.headRefName !== current.headRefName || previous.headSha !== current.headSha) {
+    lines.push(`head: ${current.headRefName}@${current.headSha}`);
+  }
+  const mergeableState = current.mergeableState?.toUpperCase();
+  if (
+    (mergeableState === "BEHIND" || mergeableState === "DIRTY") &&
+    (!previous || previous.mergeableState?.toUpperCase() !== mergeableState)
+  ) {
+    lines.push(`rebase: ${mergeableState}`);
+  }
+  return lines;
+}
+
+export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): string[] {
+  const unresolvedCommentIds = new Set(
+    snapshot.threads
+      .filter((thread) => !thread.isResolved)
+      .flatMap((thread) => thread.commentIds),
+  );
+  return [
+    ...mergeabilityDetails(null, snapshot),
+    ...checkDetails([], snapshot.checks),
+    ...snapshot.reviewComments
+      .filter((comment) => unresolvedCommentIds.has(comment.id))
+      .map((comment) => reviewCommentDetail(comment, snapshot)),
+  ];
+}
+
+export function monitorEventDetails(
+  previous: PullRequestSnapshot | null,
+  current: PullRequestSnapshot,
+): string[] {
+  if (!previous) return monitorReconciliationDetails(current);
+  const lines = [
+    ...mergeabilityDetails(previous, current),
+    ...checkDetails(previous.checks, current.checks),
+    ...changedComments(previous.comments, current.comments).map(commentDetail),
+    ...changedReviews(previous.reviews, current.reviews).map(reviewDetail),
+    ...changedComments(previous.reviewComments, current.reviewComments)
+      .map((comment) => reviewCommentDetail(comment, current)),
+  ];
+  if (previous.state !== current.state || previous.draft !== current.draft) {
+    lines.unshift(`PR state: ${current.state.toUpperCase()}${current.draft ? " DRAFT" : ""}`);
+  }
+  return [...new Set(lines)];
 }
 
 export function createWatchEvent(input: {

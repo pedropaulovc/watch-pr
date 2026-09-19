@@ -372,6 +372,7 @@ describe("native monitor feed", () => {
       pullRequestNumber: number,
       githubEvent: "pull_request",
       terminalState: "watching",
+      details: ["head: feature@def"],
     });
     await feed.reader.cancel();
   });
@@ -428,6 +429,7 @@ describe("native monitor feed", () => {
       action: "cursor_miss",
       receivedAt: current.fetchedAt,
       changes: ["reconciled"],
+      details: ["head: feature@current"],
       terminalState: "watching",
     });
     await feed.reader.cancel();
@@ -1232,6 +1234,76 @@ describe("native monitor feed", () => {
     await expect(storage.get(monitorCapabilityStorageKey(capability))).resolves.toBeUndefined();
   });
 
+  it("mints a GET-only monitor capability with a strict twelve-hour lifetime", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-09-19T12:00:00.000Z");
+    vi.setSystemTime(now);
+    const { hub, storage } = hubFixture();
+    const record = sessionRecord({ expiresAt: now.getTime() + 30 * 24 * 60 * 60 * 1000 });
+    await storage.put(sessionStorageKey(sessionToken), record);
+    await writeStoredWatchState(
+      storage as unknown as DurableObjectStorage,
+      watchStorageKey(userId, repository, number),
+      { snapshot: snapshot(), events: [] },
+    );
+    const internals = hub as unknown as HubInternals;
+    const active = internals.newActiveSession(sessionToken, record, "stateful");
+
+    try {
+      const registration = await internals.openMonitor(active, repository, number);
+      const capabilityName = new URL(registration.monitorUrl).pathname.split("/").at(-1);
+      expect(capabilityName).toBeTruthy();
+      const stored = await storage.get<MonitorCapabilityRecord>(
+        monitorCapabilityStorageKey(capabilityName!),
+      ) as MonitorCapabilityRecord;
+      expect(stored.createdAt).toBe(now.getTime());
+      expect(stored.expiresAt).toBe(now.getTime() + 12 * 60 * 60 * 1000);
+
+      const writeAttempt = await hub.fetch(new Request(registration.monitorUrl, { method: "POST" }));
+      expect(writeAttempt.status).toBe(405);
+      await expect(storage.get(monitorCapabilityStorageKey(capabilityName!))).resolves.toBeDefined();
+
+      vi.setSystemTime(now.getTime() + 12 * 60 * 60 * 1000 + 1);
+      const expired = await hub.fetch(new Request(registration.monitorUrl));
+      expect(expired.status).toBe(404);
+      await expect(storage.get(monitorCapabilityStorageKey(capabilityName!))).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes and revokes an active feed when its twelve-hour lifetime ends", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-09-19T12:00:00.000Z");
+    vi.setSystemTime(now);
+    const { hub, storage, pending } = hubFixture();
+    const record = sessionRecord({ expiresAt: now.getTime() + 30 * 24 * 60 * 60 * 1000 });
+    await storeMonitor(storage, { snapshot: snapshot(), events: [] }, record);
+    await storage.put(monitorCapabilityStorageKey(capability), {
+      sessionToken,
+      userId,
+      repository,
+      pullRequestNumber: number,
+      createdAt: now.getTime() - 12 * 60 * 60 * 1000 + 10,
+      expiresAt: record.expiresAt,
+    } satisfies MonitorCapabilityRecord);
+
+    try {
+      const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}`));
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      await reader.read();
+
+      await vi.advanceTimersByTimeAsync(11);
+      await Promise.all(pending);
+
+      await expect(reader.read()).resolves.toMatchObject({ done: true });
+      await expect(storage.get(monitorCapabilityStorageKey(capability))).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects invalid, expired, and out-of-scope capabilities without GitHub access", async () => {
     const { hub, storage } = hubFixture();
     await expect(hub.fetch(new Request("https://watch-pr.test/monitor/unknown-capability"))).resolves.toMatchObject({ status: 404 });
@@ -1268,7 +1340,10 @@ describe("native monitor feed", () => {
     expect(state.snapshot).toMatchObject({ headSha: "appended" });
     // The predecessor payload is still served from the untouched root record, and only the
     // newest event carries the snapshot, exactly as the single-record layout did.
-    expect(state.events).toEqual([{ ...legacy, snapshot: null }, appended]);
+    expect(state.events).toEqual([
+      { ...legacy, snapshot: null },
+      { ...appended, details: ["head: feature@appended"] },
+    ]);
   });
 
   it("keeps hot read paths off sidecar payload rows", async () => {
