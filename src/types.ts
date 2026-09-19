@@ -104,13 +104,18 @@ export interface ReactionReadProgress {
 }
 
 /**
- * Where a snapshot's `reactionDetails` came from while a refresh is in flight. `borrowed`
- * is reuse without a read: the summary counts had not moved, so the previous snapshot's
- * details were carried over unverified. Absence is the resolved form the hub persists -
- * details a read produced, or none at all - because the transactional merge settles every
- * borrowed target against the state its write lands on.
+ * What a refresh is asking the transactional merge to do with a target's reaction knowledge
+ * while it is in flight. `borrowed` is reuse without a read: the summary counts had not
+ * moved, so the previous snapshot's details were carried over unverified. `invalidated` is
+ * the opposite transition: a read that ran to completion and returned records its own counts
+ * contradict, which proves the pages behind it - including any prefix inherited from an
+ * earlier refresh - cannot be finished, so the committed details and cursor have to be
+ * removed rather than resumed forever. It is never set by a transport or HTTP failure, which
+ * says nothing about the pages already collected. Absence is the resolved form the hub
+ * persists - details a read produced, or none at all - because the merge settles every
+ * borrowed and every invalidated target against the state its write lands on.
  */
-export type ReactionDetailsState = "borrowed";
+export type ReactionDetailsState = "borrowed" | "invalidated";
 
 export interface PullRequestComment {
   id: number;

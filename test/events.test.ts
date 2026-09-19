@@ -1045,6 +1045,54 @@ describe("watch-pr event contracts", () => {
     expect(adopted.bodyReactionDetails).toEqual([alice, bob]);
   });
 
+  it("settles a resumed read that disproved itself against the read and the counts around it", () => {
+    const alice = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:01:00.000Z" };
+    const bob = { id: 2, content: "heart", author: "bob", authorId: 12, createdAt: "2026-09-03T00:02:00.000Z" };
+    // This refresh resumed a committed cursor and its suffix contradicted its own counts, so
+    // the prefix behind it - here and in storage - cannot be part of any coherent read.
+    const disproved = {
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionsObservedAt: "2026-09-03T00:04:00.000Z",
+      bodyReactionDetails: undefined,
+      bodyReactionDetailsState: "invalidated" as const,
+      bodyReactionDetailsReadAt: "2026-09-03T00:04:10.000Z",
+    };
+    // Committed while it was in flight: a slow read that finished later still describes the
+    // target, even though the summary it answers was observed before this refresh's.
+    const committed = snapshot({
+      fetchedAt: "2026-09-03T00:03:00.000Z",
+      bodyReactions: { heart: 2, total_count: 2 },
+      bodyReactionsObservedAt: "2026-09-03T00:03:00.000Z",
+      bodyReactionDetails: [alice, bob],
+      bodyReactionDetailsReadAt: "2026-09-03T00:05:00.000Z",
+    });
+    const watching = mergeReactionKnowledge(
+      snapshot({ fetchedAt: "2026-09-03T00:04:00.000Z", ...disproved }),
+      committed,
+    );
+    expect(watching.bodyReactions).toEqual({ heart: 2, total_count: 2 });
+    expect(watching.bodyReactionDetails).toEqual([alice, bob]);
+    expect(watching.bodyReactionDetailsState).toBeUndefined();
+
+    // Past a merge the same pair loses: nothing will read this target again, so the counts
+    // this refresh observed last stand alone and the reactions behind them go unattributed.
+    const merged = snapshot({
+      state: "closed",
+      merged: true,
+      mergedAt: "2026-09-03T00:04:00.000Z",
+      fetchedAt: "2026-09-03T00:04:00.000Z",
+      ...disproved,
+    });
+    const settled = mergeReactionKnowledge(merged, committed);
+    expect(settled.bodyReactions).toEqual({ heart: 1, total_count: 1 });
+    expect(settled.bodyReactionDetails).toBeUndefined();
+    expect(settled.bodyReactionProgress).toBeUndefined();
+    expect(settled.bodyReactionDetailsState).toBeUndefined();
+    expect(monitorEventDetails(committed, settled).filter((line) => line.startsWith("reaction"))).toEqual([
+      "reaction counts: HEART 2 -> 1 on PR #7 @author https://github.com/owner/repo/pull/7 (attribution unavailable)",
+    ]);
+  });
+
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {
     const body = JSON.stringify({ action: "opened" });
     const signature = `sha256=${await hmacSha256Hex("secret", body)}`;

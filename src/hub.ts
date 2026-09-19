@@ -2459,8 +2459,13 @@ export class WatchPrHub {
       // The stored snapshot is the base: this write reports nothing, so it must add the
       // reactions this refresh read and change nothing else. A title, head or check that
       // landed while the refresh was in flight stays exactly as the writer that saw it left it.
+      // Advancement is asked of the refresh's own snapshot: the merge has already settled
+      // and consumed the in-flight markers by which a refresh states a transition - an
+      // invalidated cursor it needs removed from the committed state - so asking the merged
+      // result instead would find nothing to store and leave that cursor durable forever.
+      // The merge returning `current` itself means a concurrent write already got there.
       const next = mergeReactionKnowledge(current, snapshot);
-      if (!reactionKnowledgeAdvanced(current, next)) return;
+      if (next === current || !reactionKnowledgeAdvanced(current, snapshot)) return;
       await mutation.replaceSnapshot(next);
       stored = true;
     });

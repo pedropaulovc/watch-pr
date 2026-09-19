@@ -292,44 +292,58 @@ function commentReactionsChanged(previous: PullRequestComment[], current: PullRe
 }
 
 /**
- * True when this refresh learned reactions a stored snapshot did not know: the PR body, or
- * a comment both snapshots carry, went from unknown details to known ones. Learning a
- * baseline is deliberately not a `snapshotChanges` entry - it publishes nothing and reports
- * no activity - so it is also the one case where a refresh has something worth storing and
- * no event to store it with. Without this the same unknown target would be re-read forever.
+ * True when this refresh changed what a stored snapshot knows about some reaction target
+ * without having anything to announce: it learned details the stored snapshot lacked, got
+ * further through a target's pages, or proved that the prefix the stored snapshot is holding
+ * cannot be finished. None of those are `snapshotChanges` entries - they publish nothing and
+ * report no activity - so this is the one case where a refresh has something worth storing
+ * and no event to store it with. Without it the same unknown target would be re-read
+ * forever, and an invalidated cursor would be inherited, fail coherence and be dropped again
+ * on every single refresh, because only a write can remove it from the committed state.
+ *
+ * It is asked of the refresh's own snapshot, before the transactional merge settles and
+ * consumes its in-flight markers, because those markers are how a refresh states a
+ * transition it did not read its way to.
  */
 export function reactionKnowledgeAdvanced(
   previous: PullRequestSnapshot,
   current: PullRequestSnapshot,
 ): boolean {
   const learned = (
-    prior: PullRequestReaction[] | undefined,
-    next: PullRequestReaction[] | undefined,
-    priorProgress: { records: PullRequestReaction[]; nextUrl: string } | undefined,
-    nextProgress: { records: PullRequestReaction[]; nextUrl: string } | undefined,
+    prior: ReactionKnowledge,
+    next: ReactionKnowledge,
   ): boolean => {
-    if (prior === undefined && next !== undefined) return true;
-    if (prior !== undefined || next !== undefined || !nextProgress) return false;
-    if (!priorProgress) return true;
-    return nextProgress.records.length > priorProgress.records.length ||
-      nextProgress.nextUrl !== priorProgress.nextUrl;
+    if (next.reactionDetailsState === "invalidated") {
+      return prior.reactionDetails !== undefined || prior.reactionProgress !== undefined;
+    }
+    if (prior.reactionDetails === undefined && next.reactionDetails !== undefined) return true;
+    if (
+      prior.reactionDetails !== undefined ||
+      next.reactionDetails !== undefined ||
+      !next.reactionProgress
+    ) return false;
+    if (!prior.reactionProgress) return true;
+    return next.reactionProgress.records.length > prior.reactionProgress.records.length ||
+      next.reactionProgress.nextUrl !== prior.reactionProgress.nextUrl;
   };
   if (learned(
-    previous.bodyReactionDetails,
-    current.bodyReactionDetails,
-    previous.bodyReactionProgress,
-    current.bodyReactionProgress,
+    {
+      reactions: previous.bodyReactions,
+      reactionDetails: previous.bodyReactionDetails,
+      reactionProgress: previous.bodyReactionProgress,
+    },
+    {
+      reactions: current.bodyReactions,
+      reactionDetails: current.bodyReactionDetails,
+      reactionDetailsState: current.bodyReactionDetailsState,
+      reactionProgress: current.bodyReactionProgress,
+    },
   )) return true;
   const learnedComment = (prior: PullRequestComment[], next: PullRequestComment[]): boolean => {
     const priorById = new Map(prior.map((comment) => [comment.id, comment] as const));
     return next.some((comment) => {
       const before = priorById.get(comment.id);
-      return before !== undefined && learned(
-        before.reactionDetails,
-        comment.reactionDetails,
-        before.reactionProgress,
-        comment.reactionProgress,
-      );
+      return before !== undefined && learned(before, comment);
     });
   };
   return learnedComment(previous.comments, current.comments) ||
@@ -418,6 +432,17 @@ function readIsNewer(candidate: ReactionKnowledge, incumbent: ReactionKnowledge)
  * instead, unresolved, and the event announces them as unattributed. Borrowed details take
  * the same route: a borrow is not a read, so it cannot buy the older counts authority they
  * would not otherwise have.
+ *
+ * A target either side marks `invalidated` is settled before any of that. The read behind it
+ * ran to completion and came back with records its own counts contradict, which condemns
+ * every page it collected, the committed prefix it resumed from included: resuming that
+ * cursor only reproduces the same contradiction, and dropping it in the fetched snapshot
+ * alone leaves the durable copy for the next refresh to inherit. Only a read that returned
+ * after the invalidation can still describe the target - and past a merge or closure not even
+ * that, since the counts a terminal snapshot observed last are not given back. Otherwise the
+ * target goes unknown against the later-observed counts, and the next refresh starts at page
+ * one. The marker is consumed here in every case, exactly as a borrow is, so it never
+ * reaches storage.
  */
 function resolveReactionKnowledge(
   base: ReactionKnowledge,
@@ -429,6 +454,32 @@ function resolveReactionKnowledge(
   // Terminal disagreement: `base` saw these counts last, and nothing will look again.
   const terminalCountsStand = baseIsTerminal && !agrees && source !== undefined &&
     !observedLater(source.reactionsObservedAt, base.reactionsObservedAt);
+  const invalidated = base.reactionDetailsState === "invalidated"
+    ? base
+    : source?.reactionDetailsState === "invalidated"
+      ? source
+      : undefined;
+  if (invalidated !== undefined) {
+    const other = invalidated === base ? source : base;
+    if (
+      !terminalCountsStand &&
+      other?.reactionDetails !== undefined &&
+      other.reactionDetailsState !== "borrowed" &&
+      readIsNewer(other, invalidated)
+    ) {
+      return {
+        reactions: other.reactions,
+        reactionsObservedAt: other.reactionsObservedAt,
+        reactionDetails: other.reactionDetails,
+        reactionDetailsReadAt: other.reactionDetailsReadAt,
+      };
+    }
+    const observed = other !== undefined &&
+        observedLater(other.reactionsObservedAt, invalidated.reactionsObservedAt)
+      ? other
+      : invalidated;
+    return { reactions: observed.reactions, reactionsObservedAt: observed.reactionsObservedAt };
+  }
   if (base.reactionDetails !== undefined) {
     if (base.reactionDetailsState !== "borrowed") {
       const sourceCompleteSupersedes = source?.reactionDetails !== undefined &&
@@ -528,8 +579,9 @@ function resolveReactionKnowledge(
  * A filled target also takes `source`'s aggregate counts, because the counts are what the
  * next refresh compares against: details from one refresh beside counts from another would
  * either hide a real change or force a pointless re-read. `base` is returned untouched when
- * there was nothing to add. Borrowed details are resolved here and never persist:
- * `resolveReactionKnowledge` settles each one against the committed state. The read time of
+ * there was nothing to add. In-flight markers are resolved here and never persist: borrowed
+ * details and invalidated cursors alike are settled by `resolveReactionKnowledge` against
+ * the committed state, which always rewrites the target that carried one. The read time of
  * whichever knowledge wins travels with it, since it is what orders the next overlapping
  * pair of reads.
  *

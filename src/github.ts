@@ -288,7 +288,7 @@ interface ReactionState {
   /** When the response carrying `reactions` arrived, which ages apart from any read. */
   reactionsObservedAt: string;
   reactionDetails?: PullRequestReaction[];
-  /** `borrowed` when details were reused from `previous` on unchanged counts, never read. */
+  /** In-flight provenance; the transactional merge consumes both states before storage. */
   reactionDetailsState?: ReactionDetailsState;
   /** When this target's own read last returned, independent of the snapshot's `fetchedAt`. */
   reactionDetailsReadAt?: string;
@@ -329,8 +329,10 @@ interface SnapshotReactions {
  * counts still advance, but the absent details force the next refresh to read the target
  * again. The two failures part company over the cursor: a transport failure leaves the pages
  * already collected intact and resumable, while a finished read whose records contradict the
- * counts proves the prefix itself is incoherent, so the cursor is dropped with the details
- * and the next refresh starts at page one instead of replaying the same prefix forever.
+ * counts proves the prefix itself is incoherent. A read that was resuming one reports that
+ * as `invalidated`, since the prefix it disproved is committed too and only the merge can
+ * remove it; the next refresh then starts at page one instead of inheriting the same prefix
+ * and disproving it again.
  * Unknown details also let the transactional merge preserve reaction knowledge that
  * another concurrent refresh committed while this request was in flight. Every other
  * snapshot field still advances.
@@ -407,21 +409,30 @@ async function snapshotReactions(
 
   const budget: RequestBudget = { remaining: REACTION_REQUEST_BUDGET };
   const states = await mapBounded(reads, REACTION_CONCURRENCY, async (read): Promise<ReactionState> => {
+    const resumed = slots[read.slot].reactionProgress;
     const { reactions, reactionsObservedAt } = slots[read.slot];
     try {
       const page = await reactionRecords(
         token,
         read.path,
         budget,
-        slots[read.slot].reactionProgress,
+        resumed,
       );
       if (page.reactionDetails && !reactionDetailsMatchCounts(page.reactionDetails, reactions)) {
         // The finished read does not describe the counts: a reaction was added or removed
         // while it was paginating, which shifts page boundaries and leaves the collected
-        // records duplicated or short. Resuming the same cursor would replay the same
-        // incoherent prefix forever, so the target keeps only its counts and the next
-        // refresh starts again at page one.
-        return { reactions, reactionsObservedAt };
+        // records duplicated or short. The target keeps only its counts, and a read that was
+        // resuming says so as a transition, because the prefix it just disproved is also
+        // sitting in the committed snapshot: dropping it here alone would leave the durable
+        // cursor for the next refresh to inherit and disprove again, forever.
+        return resumed === undefined
+          ? { reactions, reactionsObservedAt }
+          : {
+            reactions,
+            reactionsObservedAt,
+            reactionDetailsState: "invalidated",
+            reactionDetailsReadAt: page.reactionDetailsReadAt ?? slots[read.slot].reactionDetailsReadAt,
+          };
       }
       return {
         reactions,
@@ -454,6 +465,9 @@ async function snapshotReactions(
     }
     if (reactionProgress !== undefined) {
       return { ...comment, reactions, reactionsObservedAt, reactionProgress, reactionDetailsReadAt };
+    }
+    if (reactionDetailsState !== undefined) {
+      return { ...comment, reactions, reactionsObservedAt, reactionDetailsState, reactionDetailsReadAt };
     }
     return { ...comment, reactions, reactionsObservedAt };
   };

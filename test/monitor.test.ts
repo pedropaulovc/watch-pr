@@ -1954,6 +1954,83 @@ describe("native monitor feed", () => {
     }
   });
 
+  it("stores the removal of a reaction cursor a refresh disproved, so the next poll starts at page one", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const secondPage = "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2";
+    // A previous refresh stopped one page in; the cursor and its prefix are committed.
+    const resumable = snapshot({
+      headSha: "reopened",
+      bodyReactions: { heart: 2, total_count: 2 },
+      bodyReactionDetails: undefined,
+      bodyReactionDetailsReadAt: "2026-09-10T11:00:00.000Z",
+      bodyReactionProgress: {
+        records: [{ id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-10T11:00:00.000Z" }],
+        nextUrl: secondPage,
+      },
+    });
+    await storeMonitor(storage, { snapshot: resumable, events: [event("event-1", resumable)] });
+    const storageKey = watchStorageKey(userId, repository, number);
+    const base = openPullRequestFetch();
+    const reactionRequests: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/issues/7")) return Response.json({ reactions: { heart: 2, total_count: 2 } });
+      if (url.includes("/issues/7/reactions")) {
+        reactionRequests.push(url);
+        // The suffix answers with a reaction the counts cannot contain: a heart was swapped
+        // for a rocket while the read was suspended, so the stored prefix is unusable.
+        if (url.includes("page=2")) {
+          return Response.json([{ id: 902, content: "rocket", user: { login: "bob", id: 12 }, created_at: "2026-09-10T12:00:00.000Z" }]);
+        }
+        return Response.json([
+          { id: 901, content: "heart", user: { login: "alice", id: 11 }, created_at: "2026-09-10T11:00:00.000Z" },
+          { id: 903, content: "heart", user: { login: "carol", id: 13 }, created_at: "2026-09-10T12:00:00.000Z" },
+        ]);
+      }
+      return base(input);
+    });
+    const poll = async () => {
+      storage.putKeys.length = 0;
+      storage.deleteKeys.length = 0;
+      reactionRequests.length = 0;
+      const response = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending.splice(0));
+    };
+
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await poll();
+      expect(reactionRequests).toEqual([secondPage]);
+      // Nothing to announce - the counts never moved - but the write still has to happen, or
+      // the durable cursor is inherited and disproved again on every later poll.
+      expect(storage.putKeys.length).toBeGreaterThan(0);
+      const cleared = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(cleared.snapshot?.bodyReactionProgress).toBeUndefined();
+      expect(cleared.snapshot?.bodyReactionDetails).toBeUndefined();
+      expect(cleared.snapshot?.bodyReactionDetailsState).toBeUndefined();
+      expect(cleared.snapshot?.bodyReactions).toEqual({ heart: 2, total_count: 2 });
+      expect(cleared.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+
+      await poll();
+      // Page one, not the cursor: the target is read again from the start and completed.
+      expect(reactionRequests).toEqual(["https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100"]);
+      const settled = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(settled.snapshot?.bodyReactionDetails).toEqual([
+        { id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-10T11:00:00.000Z" },
+        { id: 903, content: "heart", author: "carol", authorId: 13, createdAt: "2026-09-10T12:00:00.000Z" },
+      ]);
+      expect(settled.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+
+      await poll();
+      // Known details against unchanged counts: the target costs nothing from here on.
+      expect(reactionRequests).toEqual([]);
+      expect(storage.putKeys).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("drops a learned-reaction refresh that lost the race to a newer stored snapshot", async () => {
     const { hub, pending, storage } = hubFixture();
     // Stored while this refresh was in flight: newer than anything the refresh can carry.

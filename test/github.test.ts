@@ -354,6 +354,8 @@ describe("GitHub API adapter", () => {
     // A reaction moved while the read was suspended, so the page boundaries shifted and the
     // suffix hands back a record the stored prefix already holds.
     requested.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:05:00.000Z");
     stubPullRequest({
       title: "mutated",
       bodyReactions: counts,
@@ -369,7 +371,11 @@ describe("GitHub API adapter", () => {
     expect(incoherent.bodyReactions).toEqual(counts);
     expect(incoherent.bodyReactionDetails).toBeUndefined();
     expect(incoherent.bodyReactionProgress).toBeUndefined();
-    expect(incoherent.bodyReactionDetailsReadAt).toBeUndefined();
+    // Dropping the cursor here only clears this snapshot; the committed one is removed by the
+    // merge, which needs the transition stated and dated by the read that disproved it.
+    expect(incoherent.bodyReactionDetailsState).toBe("invalidated");
+    expect(incoherent.bodyReactionDetailsReadAt).toBe("2026-09-03T00:05:00.000Z");
+    vi.useRealTimers();
 
     // The next refresh therefore starts at page one and finishes the target.
     requested.length = 0;
@@ -555,6 +561,9 @@ describe("GitHub API adapter", () => {
     const raced = await pullRequestSnapshot("token", "owner/repo", 7);
     expect(raced.bodyReactions).toEqual({ heart: 1, total_count: 1 });
     expect(raced.bodyReactionDetails).toBeUndefined();
+    // Nothing was resumed, so no committed prefix needs removing. Claiming the transition
+    // anyway would make the merge discard details a concurrent refresh had already read.
+    expect(raced.bodyReactionDetailsState).toBeUndefined();
 
     requested.length = 0;
     stubPullRequest({
