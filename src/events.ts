@@ -283,7 +283,7 @@ function checkBucket(check: PullRequestCheck): "pending" | "pass" | "fail" | "sk
 }
 
 function checkKey(check: PullRequestCheck): string {
-  return `${check.kind}:${check.id}`;
+  return check.kind === "commit_status" ? `${check.kind}:${check.name}` : `${check.kind}:${check.id}`;
 }
 
 function checkTerminalSummary(checks: PullRequestCheck[]): string {

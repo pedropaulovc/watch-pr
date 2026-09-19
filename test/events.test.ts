@@ -245,7 +245,7 @@ describe("watch-pr event contracts", () => {
     ]);
   });
 
-  it("keeps pending commit statuses in the check wave instead of reporting failures", () => {
+  it("tracks commit status waves by context when GitHub assigns a new status ID", () => {
     const pendingStatus = {
       id: 9,
       name: "buildkite/build",
@@ -256,9 +256,22 @@ describe("watch-pr event contracts", () => {
       url: "https://buildkite.com/build/9",
       kind: "commit_status" as const,
     };
+    const completedStatus = {
+      ...pendingStatus,
+      id: 10,
+      conclusion: "success",
+      completedAt: "2026-09-19T12:01:00.000Z",
+      url: "https://buildkite.com/build/10",
+    };
 
     expect(monitorEventDetails(snapshot(), snapshot({ checks: [pendingStatus] }))).toEqual([
       "checks: rerun started (pending: buildkite/build)",
+    ]);
+    expect(monitorEventDetails(
+      snapshot({ checks: [pendingStatus] }),
+      snapshot({ checks: [completedStatus] }),
+    )).toEqual([
+      "checks: all terminal (pass: 1, fail: 0, skipping: 0, cancel: 0)",
     ]);
   });
 
