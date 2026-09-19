@@ -273,6 +273,33 @@ function commentReactionsChanged(previous: PullRequestComment[], current: PullRe
   });
 }
 
+/**
+ * True when this refresh learned reactions a stored snapshot did not know: the PR body, or
+ * a comment both snapshots carry, went from unknown details to known ones. Learning a
+ * baseline is deliberately not a `snapshotChanges` entry - it publishes nothing and reports
+ * no activity - so it is also the one case where a refresh has something worth storing and
+ * no event to store it with. Without this the same unknown target would be re-read forever.
+ */
+export function reactionKnowledgeAdvanced(
+  previous: PullRequestSnapshot,
+  current: PullRequestSnapshot,
+): boolean {
+  const learned = (
+    prior: PullRequestReaction[] | undefined,
+    next: PullRequestReaction[] | undefined,
+  ): boolean => prior === undefined && next !== undefined;
+  if (learned(previous.bodyReactionDetails, current.bodyReactionDetails)) return true;
+  const learnedComment = (prior: PullRequestComment[], next: PullRequestComment[]): boolean => {
+    const priorById = new Map(prior.map((comment) => [comment.id, comment] as const));
+    return next.some((comment) => {
+      const before = priorById.get(comment.id);
+      return before !== undefined && learned(before.reactionDetails, comment.reactionDetails);
+    });
+  };
+  return learnedComment(previous.comments, current.comments) ||
+    learnedComment(previous.reviewComments, current.reviewComments);
+}
+
 export function snapshotChanges(
   previous: PullRequestSnapshot | null,
   current: PullRequestSnapshot,

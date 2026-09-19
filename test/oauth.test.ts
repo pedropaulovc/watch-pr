@@ -877,6 +877,38 @@ describe("watch state sidecar storage", () => {
       .resolves.toMatchObject({ snapshot: replacement });
   });
 
+  it("keeps a chunked retirement reachable when a snapshot is replaced without an event", async () => {
+    const storage = new MemoryStorage();
+    const chunked = pullRequestSnapshot("x".repeat(80_000), "2026-09-13T00:00:00.000Z");
+    const learned = pullRequestSnapshot("learned", "2026-09-13T00:01:00.000Z");
+    const first = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await first.append(watchEvent(0, { stored: true }), chunked);
+    const retiredKey = watchSidecarSnapshotKey(storageKey, 0);
+
+    const silent = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+    await silent.replaceSnapshot(learned);
+
+    // The enqueued job is only reachable through the queue pointer the index carries.
+    await expect(storage.get(watchSidecarCleanupKey(storageKey, 0))).resolves.toMatchObject({
+      recordKey: retiredKey,
+    });
+    await expect(storage.get(watchSidecarIndexKey(storageKey))).resolves.toMatchObject({
+      cleanup: { cursor: 0, next: 1 },
+    });
+    await expect(readStoredWatchState(storage as unknown as WatchStorage, storageKey))
+      .resolves.toMatchObject({ snapshot: learned });
+
+    for (let index = 1; index <= 4; index += 1) {
+      const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);
+      await mutation.append(watchEvent(index, { stored: true }), learned);
+    }
+
+    // Ordinary appends drain the queue, so the replaced snapshot's chunks are reclaimed.
+    await expect(storage.list({ prefix: `${retiredKey}:chunk:` })).resolves.toMatchObject({ size: 0 });
+    await expect(storage.list({ prefix: `${storageKey}:sidecar:cleanup:` })).resolves.toMatchObject({ size: 0 });
+    await expect(storage.get(retiredKey)).resolves.toBeUndefined();
+  });
+
   it("fails closed for a present but unreadable sidecar index", async () => {
     const storage = new MemoryStorage();
     const mutation = await openWatchStateMutation(storage as unknown as WatchStorage, storageKey);

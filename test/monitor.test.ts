@@ -1662,4 +1662,95 @@ describe("native monitor feed", () => {
     const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
   });
+
+  it("stores a refresh that only learned unknown reactions, then stops re-reading them", async () => {
+    const { hub, pending, storage } = hubFixture();
+    // Persisted before individual reactions: the count says one heart, nothing says whose.
+    const unknownReactions = snapshot({
+      headSha: "reopened",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: undefined,
+    });
+    await storeMonitor(storage, { snapshot: unknownReactions, events: [event("event-1", unknownReactions)] });
+    const storageKey = watchStorageKey(userId, repository, number);
+    const base = openPullRequestFetch();
+    let reactionReads = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/issues/7")) return Response.json({ reactions: { heart: 1, total_count: 1 } });
+      if (url.endsWith("/issues/7/reactions?per_page=100")) {
+        reactionReads += 1;
+        return Response.json([{ id: 901, content: "heart", user: { login: "alice", id: 11 }, created_at: "2026-09-10T12:00:00.000Z" }]);
+      }
+      return base(input);
+    });
+    const poll = async () => {
+      storage.putKeys.length = 0;
+      storage.deleteKeys.length = 0;
+      const response = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending.splice(0));
+    };
+
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await poll();
+      // The learned baseline is worth storing even though it announces nothing.
+      expect(reactionReads).toBe(1);
+      expect(storage.putKeys.length).toBeGreaterThan(0);
+      const enriched = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(enriched.snapshot?.bodyReactionDetails).toEqual([
+        { id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-10T12:00:00.000Z" },
+      ]);
+      // Silent: no event was appended, so no monitor frame and no resource notification.
+      expect(enriched.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+
+      await poll();
+      // The stored details now answer the unchanged summary, so the target costs nothing.
+      expect(reactionReads).toBe(1);
+      expect(storage.putKeys).toEqual([]);
+      expect(storage.deleteKeys).toEqual([]);
+      const settled = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(settled.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("drops a learned-reaction refresh that lost the race to a newer stored snapshot", async () => {
+    const { hub, pending, storage } = hubFixture();
+    // Stored while this refresh was in flight: newer than anything the refresh can carry.
+    const newer = snapshot({
+      headSha: "reopened",
+      fetchedAt: "2099-01-01T00:00:00.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: undefined,
+    });
+    await storeMonitor(storage, { snapshot: newer, events: [event("event-1", newer)] });
+    const storageKey = watchStorageKey(userId, repository, number);
+    const base = openPullRequestFetch();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/issues/7")) return Response.json({ reactions: { heart: 1, total_count: 1 } });
+      if (url.endsWith("/issues/7/reactions?per_page=100")) {
+        return Response.json([{ id: 901, content: "heart", user: { login: "alice", id: 11 }, created_at: "2026-09-10T12:00:00.000Z" }]);
+      }
+      return base(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      storage.putKeys.length = 0;
+      storage.deleteKeys.length = 0;
+      const response = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      expect(storage.putKeys).toEqual([]);
+      expect(storage.deleteKeys).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+    expect(stored.snapshot?.fetchedAt).toBe("2099-01-01T00:00:00.000Z");
+  });
 });

@@ -8,6 +8,7 @@ import {
   monitorEventDetails,
   monitorReconciliationDetails,
   parseWatchKey,
+  reactionKnowledgeAdvanced,
   resourceUri,
   snapshotChanges,
   watchKey,
@@ -255,6 +256,11 @@ function countWatchStorageWrites(storage: WatchStorage, writes: WatchStorageWrit
 export interface WatchStateMutation {
   metadata: WatchStateMetadata;
   append(event: WatchEvent, snapshot: PullRequestSnapshot | null): Promise<WatchAppendStats>;
+  /**
+   * Stores a newer snapshot without an event. Used only for refreshes that carry nothing
+   * reportable but do carry knowledge worth keeping, so the next refresh starts from it.
+   */
+  replaceSnapshot(snapshot: PullRequestSnapshot): Promise<WatchStateWriteStats>;
 }
 
 function emptyWatchState(): StoredWatchState {
@@ -1185,6 +1191,78 @@ export async function openWatchStateMutation(
         format: chunkCount > 0 ? "chunked" : "compact",
         windowEvents: windowed.length,
         rootReferences,
+      };
+    },
+    replaceSnapshot: async (nextSnapshot) => {
+      const snapshotSequence = nextSnapshotSequence;
+      const snapshotWrite = await writeChunkedRecord(
+        storage,
+        watchSidecarSnapshotKey(storageKey, snapshotSequence),
+        { snapshot: nextSnapshot } satisfies WatchSnapshotRecord,
+        0,
+      );
+      let puts = snapshotWrite.puts;
+      let deletes = snapshotWrite.deletes;
+      const nextSnapshotRef: SidecarSnapshotRef = {
+        sequence: snapshotSequence,
+        chunkCount: snapshotWrite.chunkCount,
+      };
+
+      // The old snapshot record is retired before the index is written: a deferred retirement
+      // moves the queue's `next`, and only the index write persists that pointer. Enqueueing
+      // after the write would leave the job rows unreachable and their chunks unreclaimable.
+      let nextCleanup = cleanup;
+      if (snapshotRef) {
+        const retirement = retireRecord(
+          watchSidecarSnapshotKey(storageKey, snapshotRef.sequence),
+          snapshotRef.chunkCount,
+        );
+        if (retirement.chunkCount > 0) {
+          const enqueued = await enqueueDeferredCleanup(storage, storageKey, nextCleanup, [retirement]);
+          nextCleanup = enqueued.cleanup;
+          puts += enqueued.puts;
+        } else {
+          if (protectedCleanupRecordKeys(storageKey, nextSnapshotRef, refs, root).has(retirement.recordKey)) {
+            throw sidecarCorruption();
+          }
+          await deleteStorageKeys(storage, [retirement.recordKey]);
+          deletes += 1;
+        }
+      }
+
+      // The events stay exactly where they are; only the snapshot record is replaced.
+      const nextIndex: WatchSidecarIndex = {
+        version: WATCH_SIDECAR_VERSION,
+        nextSequence,
+        nextSnapshotSequence: snapshotSequence + 1,
+        snapshot: nextSnapshotRef,
+        root,
+        cleanup: nextCleanup,
+        events: [...refs],
+      };
+      const indexWrite = await writeChunkedRecord(
+        storage,
+        watchSidecarIndexKey(storageKey),
+        nextIndex,
+        indexChunkCount,
+      );
+      puts += indexWrite.puts;
+      deletes += indexWrite.deletes;
+      indexChunkCount = indexWrite.chunkCount;
+
+      snapshotRef = nextSnapshotRef;
+      nextSnapshotSequence = snapshotSequence + 1;
+      cleanup = nextCleanup;
+      hasSidecar = true;
+      snapshot = nextSnapshot;
+      metadata = { snapshot, events: sidecarEventMetadata(refs, snapshot) };
+      const chunkCount = Math.max(snapshotWrite.chunkCount, indexWrite.chunkCount);
+      return {
+        puts,
+        deletes,
+        encodedBytes: snapshotWrite.encodedBytes + indexWrite.encodedBytes,
+        chunkCount,
+        format: chunkCount > 0 ? "chunked" : "compact",
       };
     },
   };
@@ -2272,7 +2350,14 @@ export class WatchPrHub {
     const currentTerminalState = terminalState(current.snapshot);
     if (currentTerminalState === "merged" || (currentTerminalState === "closed" && reason !== "watch")) return;
     const changes = snapshotChanges(current.snapshot, snapshot);
-    if (current.snapshot && changes.length === 0) return;
+    if (current.snapshot && changes.length === 0) {
+      // Nothing to report, but a refresh that learned previously unknown reactions must still
+      // be stored, or every later refresh re-reads the same targets and learns them again.
+      if (reactionKnowledgeAdvanced(current.snapshot, snapshot)) {
+        await this.storeSnapshotOnly(userId, parsed.repository, parsed.number, snapshot);
+      }
+      return;
+    }
     const event = createWatchEvent({
       deliveryId: `snapshot-${randomToken(12)}`,
       githubEvent: "snapshot",
@@ -2321,6 +2406,34 @@ export class WatchPrHub {
       expired_monitors_revoked: expiredMonitorsRevoked,
     }));
     return this.accepted({ accepted: true, scheduled });
+  }
+
+  /**
+   * Stores a refresh that has nothing to announce but does know more than the stored
+   * snapshot. No event is appended, so no monitor frame and no resource notification are
+   * produced; a concurrently stored newer snapshot wins exactly as it does in `publishEvent`.
+   */
+  private async storeSnapshotOnly(
+    userId: number,
+    repository: string,
+    pullRequestNumber: number,
+    snapshot: PullRequestSnapshot,
+  ): Promise<boolean> {
+    const storageKey = watchStorageKey(userId, repository, pullRequestNumber);
+    let stored = false;
+    await this.state.storage.transaction(async (storage) => {
+      const mutation = await openWatchStateMutation(storage, storageKey);
+      const current = mutation.metadata.snapshot;
+      if (!current || terminalState(current) === "merged") return;
+      const currentTime = Date.parse(current.fetchedAt);
+      const incomingTime = Date.parse(snapshot.fetchedAt);
+      if (Number.isFinite(currentTime) && Number.isFinite(incomingTime) && currentTime > incomingTime) return;
+      // Re-checked under the transaction: another writer may already have learned these.
+      if (!reactionKnowledgeAdvanced(current, snapshot)) return;
+      await mutation.replaceSnapshot(snapshot);
+      stored = true;
+    });
+    return stored;
   }
 
   private async publishEvent(
