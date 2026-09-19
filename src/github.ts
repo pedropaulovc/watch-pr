@@ -3,13 +3,14 @@ import type {
   PullRequestCheck,
   PullRequestComment,
   PullRequestReaction,
+  ReactionDetailsState,
   ReactionReadProgress,
   PullRequestReview,
   PullRequestSnapshot,
   PullRequestThread,
   ReactionCounts,
 } from "./types";
-import { normalizeRepository } from "./events";
+import { normalizeRepository, sameReactionCounts } from "./events";
 
 const API_ROOT = "https://api.github.com";
 const API_VERSION = "2022-11-28";
@@ -172,14 +173,6 @@ function normalizeReaction(record: GithubRecord): PullRequestReaction {
   };
 }
 
-function sameReactionCounts(previous: ReactionCounts, current: ReactionCounts): boolean {
-  const keys = new Set([...Object.keys(previous), ...Object.keys(current)]);
-  for (const key of keys) {
-    if (previous[key] !== current[key]) return false;
-  }
-  return true;
-}
-
 function reactionDetailsMatchCounts(
   details: readonly PullRequestReaction[],
   counts: ReactionCounts,
@@ -253,6 +246,8 @@ async function reactionRecords(
 interface ReactionState {
   reactions: ReactionCounts;
   reactionDetails?: PullRequestReaction[];
+  /** `borrowed` when details were reused from `previous` on unchanged counts, never read. */
+  reactionDetailsState?: ReactionDetailsState;
   reactionProgress?: ReactionReadProgress;
 }
 
@@ -265,6 +260,7 @@ interface ReactionTargetRead {
 interface SnapshotReactions {
   bodyReactions: ReactionCounts;
   bodyReactionDetails: PullRequestReaction[] | undefined;
+  bodyReactionDetailsState: ReactionDetailsState | undefined;
   bodyReactionProgress: ReactionReadProgress | undefined;
   comments: PullRequestComment[];
   reviewComments: PullRequestComment[];
@@ -277,7 +273,10 @@ interface SnapshotReactions {
  * for "no reactions", and an unchanged summary count over known details means the stored
  * details still describe the target. The residual blind spot is a swap that leaves every
  * count identical - one `heart` replaced by another actor's `heart` between two refreshes -
- * which the summary cannot express and only a per-target read would reveal.
+ * which the summary cannot express and only a per-target read would reveal. Reused details
+ * are recorded as `borrowed` for exactly that reason: no read backs them, so the
+ * transactional merge settles them against the state the write lands on instead of taking
+ * them for an observation of their own.
  * A failed or internally inconsistent read leaves that target unknown. Its current summary
  * counts still advance, but the absent details force the next refresh to read the target
  * again. Unknown details also let the transactional merge preserve reaction knowledge that
@@ -300,8 +299,10 @@ async function snapshotReactions(
   const plan = (reactions: ReactionCounts, path: string, prior: ReactionState | undefined): number => {
     const slot = slots.push({ reactions }) - 1;
     if (reactionTotal(reactions) === 0) slots[slot].reactionDetails = [];
-    else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) slots[slot].reactionDetails = prior.reactionDetails;
-    else {
+    else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) {
+      slots[slot].reactionDetails = prior.reactionDetails;
+      slots[slot].reactionDetailsState = "borrowed";
+    } else {
       if (prior?.reactionProgress && sameReactionCounts(prior.reactions, reactions)) {
         slots[slot].reactionProgress = prior.reactionProgress;
       }
@@ -353,14 +354,19 @@ async function snapshotReactions(
   for (const [position, read] of reads.entries()) slots[read.slot] = states[position];
 
   const attach = (comment: PullRequestComment, slot: number): PullRequestComment => {
-    const { reactions, reactionDetails, reactionProgress } = slots[slot];
-    if (reactionDetails !== undefined) return { ...comment, reactions, reactionDetails };
+    const { reactions, reactionDetails, reactionDetailsState, reactionProgress } = slots[slot];
+    if (reactionDetails !== undefined) {
+      return reactionDetailsState
+        ? { ...comment, reactions, reactionDetails, reactionDetailsState }
+        : { ...comment, reactions, reactionDetails };
+    }
     if (reactionProgress !== undefined) return { ...comment, reactions, reactionProgress };
     return reactions === comment.reactions ? comment : { ...comment, reactions };
   };
   return {
     bodyReactions: slots[bodySlot].reactions,
     bodyReactionDetails: slots[bodySlot].reactionDetails,
+    bodyReactionDetailsState: slots[bodySlot].reactionDetailsState,
     bodyReactionProgress: slots[bodySlot].reactionProgress,
     comments: comments.map((comment, position) => attach(comment, commentSlots[position])),
     reviewComments: reviewComments.map((comment, position) => attach(comment, reviewCommentSlots[position])),
@@ -626,6 +632,7 @@ export async function pullRequestSnapshot(
     fetchedAt: new Date().toISOString(),
     bodyReactions: reactions.bodyReactions,
     bodyReactionDetails: reactions.bodyReactionDetails,
+    bodyReactionDetailsState: reactions.bodyReactionDetailsState,
     bodyReactionProgress: reactions.bodyReactionProgress,
     comments: reactions.comments,
     reviews: reviews.map(normalizeReview),

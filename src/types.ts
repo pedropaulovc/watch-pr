@@ -103,6 +103,15 @@ export interface ReactionReadProgress {
   nextUrl: string;
 }
 
+/**
+ * Where a snapshot's `reactionDetails` came from while a refresh is in flight. `borrowed`
+ * is reuse without a read: the summary counts had not moved, so the previous snapshot's
+ * details were carried over unverified. Absence is the resolved form the hub persists -
+ * details a read produced, or none at all - because the transactional merge settles every
+ * borrowed target against the state its write lands on.
+ */
+export type ReactionDetailsState = "borrowed";
+
 export interface PullRequestComment {
   id: number;
   author: string | null;
@@ -112,6 +121,8 @@ export interface PullRequestComment {
   reactions: ReactionCounts;
   /** Undefined is unknown, not empty: persisted before individual reactions, or unread. */
   reactionDetails?: PullRequestReaction[];
+  /** Provenance of `reactionDetails`; absent once the transactional merge has resolved it. */
+  reactionDetailsState?: ReactionDetailsState;
   /** Partial pages retained when one refresh exhausts its reaction request budget. */
   reactionProgress?: ReactionReadProgress;
   path?: string;
@@ -169,6 +180,8 @@ export interface PullRequestSnapshot {
   bodyReactions: ReactionCounts;
   /** Undefined is unknown, not empty: persisted before individual reactions, or unread. */
   bodyReactionDetails?: PullRequestReaction[];
+  /** Body counterpart of `PullRequestComment.reactionDetailsState`. */
+  bodyReactionDetailsState?: ReactionDetailsState;
   /** Partial pages retained when one refresh exhausts its reaction request budget. */
   bodyReactionProgress?: ReactionReadProgress;
   comments: PullRequestComment[];

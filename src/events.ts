@@ -4,6 +4,9 @@ import type {
   PullRequestReaction,
   PullRequestReview,
   PullRequestSnapshot,
+  ReactionCounts,
+  ReactionDetailsState,
+  ReactionReadProgress,
   WatchEvent,
 } from "./types";
 
@@ -256,7 +259,9 @@ function commentsKey(comments: PullRequestComment[]): string {
   return JSON.stringify(
     comments,
     (key, value: unknown) =>
-      key === "reactionDetails" || key === "reactionProgress" ? undefined : value,
+      key === "reactionDetails" || key === "reactionDetailsState" || key === "reactionProgress"
+        ? undefined
+        : value,
   );
 }
 
@@ -322,6 +327,92 @@ export function reactionKnowledgeAdvanced(
     learnedComment(previous.reviewComments, current.reviewComments);
 }
 
+/** Aggregate reaction counts are compared key by key, never by property order. */
+export function sameReactionCounts(previous: ReactionCounts, current: ReactionCounts): boolean {
+  for (const key of new Set([...Object.keys(previous), ...Object.keys(current)])) {
+    if (previous[key] !== current[key]) return false;
+  }
+  return true;
+}
+
+/**
+ * What one snapshot knows about one reaction target: the aggregate counts it observed, and
+ * whatever stands behind them - complete details, a resumable cursor partway through them,
+ * or nothing. `PullRequestComment` is one of these; the PR body is assembled into one.
+ */
+interface ReactionKnowledge {
+  reactions: ReactionCounts;
+  reactionDetails?: PullRequestReaction[];
+  reactionDetailsState?: ReactionDetailsState;
+  reactionProgress?: ReactionReadProgress;
+}
+
+/**
+ * Resolves one target against the state the write lands on, returning undefined when `base`
+ * already holds the best knowledge and needs no rewrite. Three rules decide it.
+ *
+ * Details `base` actually read are never replaced: they are this writer's evidence, and the
+ * merge only ever fills what it does not know.
+ *
+ * Details `base` only borrowed - reused unread because the summary counts had not moved -
+ * are not evidence of anything. Anything the committed state learned outranks them, and
+ * counts the committed state disagrees with mean the borrow describes a reaction state this
+ * write never observed, so the committed pair stands and the next refresh reads the target
+ * again rather than the borrow overwriting it or passing as current.
+ *
+ * Between a cursor and complete details the later observation wins, which both callers order
+ * by `fetchedAt`: they commit the newer of the two snapshots and bail out otherwise. Pairing
+ * details with counts a later read contradicts strands the target - the next refresh drops
+ * the mismatched knowledge and restarts at page one, only to be overwritten again - so a
+ * cursor opened against counts `source` does not share is the only route to the reactions
+ * those older details predate.
+ */
+function resolveReactionKnowledge(
+  base: ReactionKnowledge,
+  source: ReactionKnowledge | undefined,
+  sourceObservedLater: boolean,
+): ReactionKnowledge | undefined {
+  const agrees = source !== undefined && sameReactionCounts(base.reactions, source.reactions);
+  if (base.reactionDetails !== undefined) {
+    if (base.reactionDetailsState !== "borrowed") return undefined;
+    if (source !== undefined) {
+      const outranks = agrees
+        ? source.reactionDetails !== undefined && source.reactionDetailsState !== "borrowed"
+        : source.reactionDetails !== undefined || source.reactionProgress !== undefined;
+      if (outranks) {
+        return {
+          reactions: source.reactions,
+          reactionDetails: source.reactionDetails,
+          reactionProgress: source.reactionProgress,
+        };
+      }
+      // Counts disagree and the committed state has nothing to keep: unread stays unknown,
+      // so the next refresh reads the target instead of inheriting the borrow again.
+      if (!agrees) return { reactions: base.reactions };
+    }
+    // Nothing committed contradicts the borrow: keep it as the baseline, now confirmed
+    // against the state the write lands on.
+    return { reactions: base.reactions, reactionDetails: base.reactionDetails };
+  }
+  if (source === undefined) return undefined;
+  const supersedes = agrees || sourceObservedLater;
+  if (
+    source.reactionDetails !== undefined &&
+    (source.reactionDetailsState !== "borrowed" || agrees) &&
+    (!base.reactionProgress || supersedes)
+  ) {
+    return { reactions: source.reactions, reactionDetails: source.reactionDetails };
+  }
+  if (
+    source.reactionProgress &&
+    (!base.reactionProgress ||
+      supersedes && source.reactionProgress.records.length > base.reactionProgress.records.length)
+  ) {
+    return { reactions: source.reactions, reactionProgress: source.reactionProgress };
+  }
+  return undefined;
+}
+
 /**
  * Returns `base` with every reaction target it does not know filled in from `source`, and
  * nothing else: each non-reaction field, `fetchedAt` included, comes from `base` alone. Two
@@ -335,60 +426,49 @@ export function reactionKnowledgeAdvanced(
  *
  * A filled target also takes `source`'s aggregate counts, because the counts are what the
  * next refresh compares against: details from one refresh beside counts from another would
- * either hide a real change or force a pointless re-read. Known details are never
- * overwritten, so the merge only ever adds knowledge, and `base` is returned untouched when
- * there was nothing to add.
+ * either hide a real change or force a pointless re-read. Details `base` read itself are
+ * never overwritten, so the merge only ever adds knowledge, and `base` is returned untouched
+ * when there was nothing to add. Borrowed details are resolved here and never persist:
+ * `resolveReactionKnowledge` settles each one against the committed state.
  */
 export function mergeReactionKnowledge(
   base: PullRequestSnapshot,
   source: PullRequestSnapshot,
 ): PullRequestSnapshot {
+  const baseTime = Date.parse(base.fetchedAt);
+  const sourceTime = Date.parse(source.fetchedAt);
+  const sourceObservedLater = Number.isFinite(baseTime) && Number.isFinite(sourceTime) &&
+    sourceTime > baseTime;
   let merged = false;
-  let bodyReactions = base.bodyReactions;
-  let bodyReactionDetails = base.bodyReactionDetails;
-  let bodyReactionProgress = base.bodyReactionProgress;
-  if (bodyReactionDetails === undefined && source.bodyReactionDetails !== undefined) {
-    bodyReactions = source.bodyReactions;
-    bodyReactionDetails = source.bodyReactionDetails;
-    bodyReactionProgress = undefined;
-    merged = true;
-  } else if (
-    bodyReactionDetails === undefined &&
-    source.bodyReactionProgress &&
-    (!bodyReactionProgress ||
-      source.bodyReactionProgress.records.length > bodyReactionProgress.records.length)
-  ) {
-    bodyReactions = source.bodyReactions;
-    bodyReactionProgress = source.bodyReactionProgress;
-    merged = true;
-  }
+  const body = resolveReactionKnowledge(
+    {
+      reactions: base.bodyReactions,
+      reactionDetails: base.bodyReactionDetails,
+      reactionDetailsState: base.bodyReactionDetailsState,
+      reactionProgress: base.bodyReactionProgress,
+    },
+    {
+      reactions: source.bodyReactions,
+      reactionDetails: source.bodyReactionDetails,
+      reactionDetailsState: source.bodyReactionDetailsState,
+      reactionProgress: source.bodyReactionProgress,
+    },
+    sourceObservedLater,
+  );
+  if (body) merged = true;
   const fill = (targets: PullRequestComment[], known: PullRequestComment[]): PullRequestComment[] => {
     const knownById = new Map(known.map((comment) => [comment.id, comment] as const));
     return targets.map((comment) => {
-      if (comment.reactionDetails !== undefined) return comment;
-      const learned = knownById.get(comment.id);
-      if (learned?.reactionDetails !== undefined) {
-        merged = true;
-        return {
-          ...comment,
-          reactions: learned.reactions,
-          reactionDetails: learned.reactionDetails,
-          reactionProgress: undefined,
-        };
-      }
-      if (
-        learned?.reactionProgress &&
-        (!comment.reactionProgress ||
-          learned.reactionProgress.records.length > comment.reactionProgress.records.length)
-      ) {
-        merged = true;
-        return {
-          ...comment,
-          reactions: learned.reactions,
-          reactionProgress: learned.reactionProgress,
-        };
-      }
-      return comment;
+      const resolved = resolveReactionKnowledge(comment, knownById.get(comment.id), sourceObservedLater);
+      if (!resolved) return comment;
+      merged = true;
+      return {
+        ...comment,
+        reactions: resolved.reactions,
+        reactionDetails: resolved.reactionDetails,
+        reactionDetailsState: undefined,
+        reactionProgress: resolved.reactionProgress,
+      };
     });
   };
   const comments = fill(base.comments, source.comments);
@@ -396,9 +476,10 @@ export function mergeReactionKnowledge(
   if (!merged) return base;
   return {
     ...base,
-    bodyReactions,
-    bodyReactionDetails,
-    bodyReactionProgress,
+    bodyReactions: body ? body.reactions : base.bodyReactions,
+    bodyReactionDetails: body ? body.reactionDetails : base.bodyReactionDetails,
+    bodyReactionDetailsState: undefined,
+    bodyReactionProgress: body ? body.reactionProgress : base.bodyReactionProgress,
     comments,
     reviewComments,
   };

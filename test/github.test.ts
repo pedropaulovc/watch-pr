@@ -235,6 +235,10 @@ describe("GitHub API adapter", () => {
     expect(resumed.bodyReactionDetails).toHaveLength(1);
     expect(resumed.comments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
     expect(resumed.reviewComments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
+    // Details reused without a read carry that provenance; the seventeen targets this wave
+    // actually read do not.
+    expect(resumed.comments.every((entry) => entry.reactionDetailsState === "borrowed")).toBe(true);
+    expect(resumed.reviewComments.filter((entry) => entry.reactionDetailsState === undefined)).toHaveLength(17);
   });
 
   it("resumes a single reaction collection across request budgets", async () => {
@@ -293,6 +297,8 @@ describe("GitHub API adapter", () => {
     // The minute poll costs nothing for a target GitHub still summarises the same way.
     expect(requested.some((url) => url.includes("/reactions"))).toBe(false);
     expect(second.bodyReactionDetails).toEqual(first.bodyReactionDetails);
+    expect(first.bodyReactionDetailsState).toBeUndefined();
+    expect(second.bodyReactionDetailsState).toBe("borrowed");
     expect(second.title).toBe("second");
 
     requested.length = 0;
@@ -305,6 +311,7 @@ describe("GitHub API adapter", () => {
     const third = await pullRequestSnapshot("token", "owner/repo", 7, second);
     expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
     expect(third.bodyReactionDetails).toHaveLength(2);
+    expect(third.bodyReactionDetailsState).toBeUndefined();
   });
 
   it("retries reaction details that disagree with their aggregate counts", async () => {

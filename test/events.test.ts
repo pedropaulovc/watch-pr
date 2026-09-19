@@ -747,7 +747,9 @@ describe("watch-pr event contracts", () => {
     expect(reactionKnowledgeAdvanced(unknown, partial)).toBe(true);
     expect(mergeReactionKnowledge(unknown, partial).bodyReactionProgress).toEqual(firstPage);
 
+    // A later refresh that finished the read supersedes the cursor it started from.
     const complete = snapshot({
+      fetchedAt: "2026-09-03T00:05:00.000Z",
       bodyReactions: { heart: 1, total_count: 1 },
       bodyReactionDetails: firstPage.records,
     });
@@ -755,6 +757,117 @@ describe("watch-pr event contracts", () => {
     expect(reactionKnowledgeAdvanced(partial, complete)).toBe(true);
     expect(completed.bodyReactionDetails).toEqual(firstPage.records);
     expect(completed.bodyReactionProgress).toBeUndefined();
+  });
+
+  it("keeps a live reaction cursor over stored details the newer read contradicts", () => {
+    const heart = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "now" };
+    const stored = snapshot({
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [heart],
+    });
+    const cursor = {
+      records: [heart],
+      nextUrl: "https://api.github.com/repos/owner/repo/issues/7/reactions?per_page=100&page=2",
+    };
+    // The target outgrew one refresh's request budget, so this refresh holds only a cursor
+    // into counts the stored details predate.
+    const refreshed = snapshot({
+      fetchedAt: "2026-09-03T00:05:00.000Z",
+      bodyReactions: { heart: 6_500, total_count: 6_500 },
+      bodyReactionDetails: undefined,
+      bodyReactionProgress: cursor,
+    });
+
+    const merged = mergeReactionKnowledge(refreshed, stored);
+    expect(merged.bodyReactionProgress).toEqual(cursor);
+    expect(merged.bodyReactionDetails).toBeUndefined();
+    expect(merged.bodyReactions).toEqual({ heart: 6_500, total_count: 6_500 });
+    // Copying the stored pair back would erase the cursor and report no change, so the
+    // write would be dropped and every later refresh would restart at page one.
+    expect(snapshotChanges(stored, merged)).toEqual(["reactions"]);
+  });
+
+  it("never lets borrowed reaction details overwrite what a concurrent write learned", () => {
+    const heart = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:01:00.000Z" };
+    const rocket = { id: 2, content: "rocket", author: "dave", authorId: 12, createdAt: "2026-09-03T00:02:00.000Z" };
+    const comment = {
+      id: 21,
+      author: "bob",
+      body: "Top-level note",
+      createdAt: "2026-09-03T00:00:00.000Z",
+      updatedAt: "2026-09-03T00:00:00.000Z",
+      reactions: { heart: 1, total_count: 1 },
+      htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
+    };
+    const both = { heart: 1, rocket: 1, total_count: 2 };
+    // Another refresh read the added reaction and committed it first.
+    const committed = snapshot({
+      bodyReactions: both,
+      bodyReactionDetails: [heart, rocket],
+      comments: [{ ...comment, reactions: both, reactionDetails: [heart, rocket] }],
+    });
+    // This refresh saw the counts it started with, so it reused its details unread: nothing
+    // it carries is evidence that the reaction the other writer read is gone.
+    const borrowed = snapshot({
+      fetchedAt: "2026-09-03T00:03:00.000Z",
+      title: "renamed while a refresh was in flight",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [heart],
+      bodyReactionDetailsState: "borrowed",
+      comments: [{ ...comment, reactionDetails: [heart], reactionDetailsState: "borrowed" }],
+    });
+
+    const merged = mergeReactionKnowledge(borrowed, committed);
+    expect(merged.title).toBe("renamed while a refresh was in flight");
+    expect(merged.bodyReactionDetails).toEqual([heart, rocket]);
+    expect(merged.bodyReactions).toEqual(both);
+    expect(merged.comments[0].reactionDetails).toEqual([heart, rocket]);
+    expect(merged.comments[0].reactions).toEqual(both);
+    // No false deletion, and the borrow is resolved rather than persisted.
+    expect(snapshotChanges(committed, merged)).toEqual(["description"]);
+    expect(monitorEventDetails(committed, merged).some((line) => line.startsWith("reaction"))).toBe(false);
+    expect(merged.bodyReactionDetailsState).toBeUndefined();
+    expect(merged.comments[0].reactionDetailsState).toBeUndefined();
+
+    // The same holds when the concurrent writer is still paginating that target: borrowed
+    // details must not erase a cursor either.
+    const cursor = { records: [heart], nextUrl: "https://api.github.com/reactions?page=2" };
+    const paginating = snapshot({
+      bodyReactions: both,
+      bodyReactionDetails: undefined,
+      bodyReactionProgress: cursor,
+    });
+    const resumable = mergeReactionKnowledge(borrowed, paginating);
+    expect(resumable.bodyReactionProgress).toEqual(cursor);
+    expect(resumable.bodyReactionDetails).toBeUndefined();
+  });
+
+  it("resolves borrowed reaction details against the counts the write lands on", () => {
+    const heart = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "now" };
+    const borrowed = snapshot({
+      fetchedAt: "2026-09-03T00:03:00.000Z",
+      title: "still moving",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [heart],
+      bodyReactionDetailsState: "borrowed",
+    });
+
+    // Counts the committed state agrees with confirm the borrow, so the baseline stands.
+    const agreeing = snapshot({ bodyReactions: { heart: 1, total_count: 1 }, bodyReactionDetails: [heart] });
+    const confirmed = mergeReactionKnowledge(borrowed, agreeing);
+    expect(confirmed.bodyReactionDetails).toEqual([heart]);
+    expect(confirmed.bodyReactionDetailsState).toBeUndefined();
+
+    // Counts it disagrees with do not, and there is nothing read to fall back on: the target
+    // goes back to unknown so the next refresh reads it instead of inheriting the borrow.
+    const contradicting = snapshot({
+      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
+      bodyReactionDetails: undefined,
+    });
+    const unresolved = mergeReactionKnowledge(borrowed, contradicting);
+    expect(unresolved.bodyReactionDetails).toBeUndefined();
+    expect(unresolved.bodyReactionDetailsState).toBeUndefined();
+    expect(monitorEventDetails(contradicting, unresolved).some((line) => line.startsWith("reaction"))).toBe(false);
   });
 
   it("verifies GitHub's HMAC signature and rejects tampering", async () => {
