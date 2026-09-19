@@ -123,6 +123,15 @@ export interface PullRequestComment {
   reactionDetails?: PullRequestReaction[];
   /** Provenance of `reactionDetails`; absent once the transactional merge has resolved it. */
   reactionDetailsState?: ReactionDetailsState;
+  /**
+   * When the read behind this target's reaction knowledge last returned: the request that
+   * completed `reactionDetails`, or the last page behind `reactionProgress`. Two refreshes
+   * overlap target by target, so the snapshot that commits second routinely carries the
+   * older read of any one target and its `fetchedAt` cannot order them; this can. A borrowed
+   * copy keeps the time of the read it descends from, never the time it was reused. Absent
+   * on targets persisted before per-target read times, which lose to any timestamped read.
+   */
+  reactionDetailsReadAt?: string;
   /** Partial pages retained when one refresh exhausts its reaction request budget. */
   reactionProgress?: ReactionReadProgress;
   path?: string;
@@ -182,6 +191,8 @@ export interface PullRequestSnapshot {
   bodyReactionDetails?: PullRequestReaction[];
   /** Body counterpart of `PullRequestComment.reactionDetailsState`. */
   bodyReactionDetailsState?: ReactionDetailsState;
+  /** Body counterpart of `PullRequestComment.reactionDetailsReadAt`. */
+  bodyReactionDetailsReadAt?: string;
   /** Partial pages retained when one refresh exhausts its reaction request budget. */
   bodyReactionProgress?: ReactionReadProgress;
   comments: PullRequestComment[];

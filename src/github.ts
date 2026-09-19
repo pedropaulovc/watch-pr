@@ -213,6 +213,8 @@ async function mapBounded<T, R>(
 interface ReactionPageResult {
   reactionDetails?: PullRequestReaction[];
   reactionProgress?: ReactionReadProgress;
+  /** Set only when this call actually fetched a page, so reuse never restamps a target. */
+  reactionDetailsReadAt?: string;
 }
 
 async function reactionRecords(
@@ -222,11 +224,12 @@ async function reactionRecords(
   progress?: ReactionReadProgress,
 ): Promise<ReactionPageResult> {
   const records = progress ? [...progress.records] : [];
+  let readAt: string | undefined;
   let nextUrl: string | null = progress?.nextUrl ??
     `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
   while (nextUrl) {
     if (budget.remaining === 0) {
-      return { reactionProgress: { records, nextUrl } };
+      return { reactionProgress: { records, nextUrl }, reactionDetailsReadAt: readAt };
     }
     budget.remaining -= 1;
     const response = await githubResponse(token, nextUrl);
@@ -238,9 +241,10 @@ async function reactionRecords(
       .filter((record): record is GithubRecord => Boolean(record && typeof record === "object"))
       .map(normalizeReaction)
       .filter((reaction) => reaction.id > 0 && reaction.content !== ""));
+    readAt = new Date().toISOString();
     nextUrl = nextLink(response.headers.get("link"));
   }
-  return { reactionDetails: records };
+  return { reactionDetails: records, reactionDetailsReadAt: readAt };
 }
 
 interface ReactionState {
@@ -248,6 +252,8 @@ interface ReactionState {
   reactionDetails?: PullRequestReaction[];
   /** `borrowed` when details were reused from `previous` on unchanged counts, never read. */
   reactionDetailsState?: ReactionDetailsState;
+  /** When this target's own read last returned, independent of the snapshot's `fetchedAt`. */
+  reactionDetailsReadAt?: string;
   reactionProgress?: ReactionReadProgress;
 }
 
@@ -261,6 +267,7 @@ interface SnapshotReactions {
   bodyReactions: ReactionCounts;
   bodyReactionDetails: PullRequestReaction[] | undefined;
   bodyReactionDetailsState: ReactionDetailsState | undefined;
+  bodyReactionDetailsReadAt: string | undefined;
   bodyReactionProgress: ReactionReadProgress | undefined;
   comments: PullRequestComment[];
   reviewComments: PullRequestComment[];
@@ -276,12 +283,17 @@ interface SnapshotReactions {
  * which the summary cannot express and only a per-target read would reveal. Reused details
  * are recorded as `borrowed` for exactly that reason: no read backs them, so the
  * transactional merge settles them against the state the write lands on instead of taking
- * them for an observation of their own.
+ * them for an observation of their own, and they keep the time of the read they descend
+ * from rather than passing as read now.
  * A failed or internally inconsistent read leaves that target unknown. Its current summary
  * counts still advance, but the absent details force the next refresh to read the target
  * again. Unknown details also let the transactional merge preserve reaction knowledge that
  * another concurrent refresh committed while this request was in flight. Every other
  * snapshot field still advances.
+ *
+ * Each target that is read carries the time its own read returned. Two refreshes overlap
+ * one target at a time, so the snapshot that commits second often holds the older read of
+ * some target and the newer read of another; only a per-target time can order them.
  */
 async function snapshotReactions(
   token: string,
@@ -296,15 +308,21 @@ async function snapshotReactions(
   // counts GitHub returned, and details only once they are known.
   const slots: ReactionState[] = [];
   const reads: ReactionTargetRead[] = [];
+  const summarisedAt = new Date().toISOString();
   const plan = (reactions: ReactionCounts, path: string, prior: ReactionState | undefined): number => {
     const slot = slots.push({ reactions }) - 1;
-    if (reactionTotal(reactions) === 0) slots[slot].reactionDetails = [];
-    else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) {
+    if (reactionTotal(reactions) === 0) {
+      // The summary this refresh just read is authoritative for "no reactions".
+      slots[slot].reactionDetails = [];
+      slots[slot].reactionDetailsReadAt = summarisedAt;
+    } else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) {
       slots[slot].reactionDetails = prior.reactionDetails;
       slots[slot].reactionDetailsState = "borrowed";
+      slots[slot].reactionDetailsReadAt = prior.reactionDetailsReadAt;
     } else {
       if (prior?.reactionProgress && sameReactionCounts(prior.reactions, reactions)) {
         slots[slot].reactionProgress = prior.reactionProgress;
+        slots[slot].reactionDetailsReadAt = prior.reactionDetailsReadAt;
       }
       reads.push({ slot, path });
     }
@@ -319,6 +337,7 @@ async function snapshotReactions(
     previous ? {
       reactions: previous.bodyReactions,
       reactionDetails: previous.bodyReactionDetails,
+      reactionDetailsReadAt: previous.bodyReactionDetailsReadAt,
       reactionProgress: previous.bodyReactionProgress,
     } : undefined,
   );
@@ -346,7 +365,12 @@ async function snapshotReactions(
       if (page.reactionDetails && !reactionDetailsMatchCounts(page.reactionDetails, reactions)) {
         throw new Error(`GitHub returned reaction details inconsistent with ${read.path}`);
       }
-      return { reactions, ...page };
+      return {
+        reactions,
+        ...page,
+        // A resumed read that never got a page back keeps the time of the pages it inherited.
+        reactionDetailsReadAt: page.reactionDetailsReadAt ?? slots[read.slot].reactionDetailsReadAt,
+      };
     } catch {
       return slots[read.slot];
     }
@@ -354,19 +378,20 @@ async function snapshotReactions(
   for (const [position, read] of reads.entries()) slots[read.slot] = states[position];
 
   const attach = (comment: PullRequestComment, slot: number): PullRequestComment => {
-    const { reactions, reactionDetails, reactionDetailsState, reactionProgress } = slots[slot];
+    const { reactions, reactionDetails, reactionDetailsState, reactionDetailsReadAt, reactionProgress } = slots[slot];
     if (reactionDetails !== undefined) {
       return reactionDetailsState
-        ? { ...comment, reactions, reactionDetails, reactionDetailsState }
-        : { ...comment, reactions, reactionDetails };
+        ? { ...comment, reactions, reactionDetails, reactionDetailsState, reactionDetailsReadAt }
+        : { ...comment, reactions, reactionDetails, reactionDetailsReadAt };
     }
-    if (reactionProgress !== undefined) return { ...comment, reactions, reactionProgress };
+    if (reactionProgress !== undefined) return { ...comment, reactions, reactionProgress, reactionDetailsReadAt };
     return reactions === comment.reactions ? comment : { ...comment, reactions };
   };
   return {
     bodyReactions: slots[bodySlot].reactions,
     bodyReactionDetails: slots[bodySlot].reactionDetails,
     bodyReactionDetailsState: slots[bodySlot].reactionDetailsState,
+    bodyReactionDetailsReadAt: slots[bodySlot].reactionDetailsReadAt,
     bodyReactionProgress: slots[bodySlot].reactionProgress,
     comments: comments.map((comment, position) => attach(comment, commentSlots[position])),
     reviewComments: reviewComments.map((comment, position) => attach(comment, reviewCommentSlots[position])),
@@ -633,6 +658,7 @@ export async function pullRequestSnapshot(
     bodyReactions: reactions.bodyReactions,
     bodyReactionDetails: reactions.bodyReactionDetails,
     bodyReactionDetailsState: reactions.bodyReactionDetailsState,
+    bodyReactionDetailsReadAt: reactions.bodyReactionDetailsReadAt,
     bodyReactionProgress: reactions.bodyReactionProgress,
     comments: reactions.comments,
     reviews: reviews.map(normalizeReview),

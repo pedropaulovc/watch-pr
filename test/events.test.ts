@@ -743,20 +743,24 @@ describe("watch-pr event contracts", () => {
       bodyReactions: unknown.bodyReactions,
       bodyReactionDetails: undefined,
       bodyReactionProgress: firstPage,
+      bodyReactionDetailsReadAt: "2026-09-03T00:01:00.000Z",
     });
     expect(reactionKnowledgeAdvanced(unknown, partial)).toBe(true);
     expect(mergeReactionKnowledge(unknown, partial).bodyReactionProgress).toEqual(firstPage);
 
-    // A later refresh that finished the read supersedes the cursor it started from.
+    // A later read of the same target supersedes the cursor it started from, and the merge
+    // carries that read's time so the next overlapping refresh can still be ordered.
     const complete = snapshot({
       fetchedAt: "2026-09-03T00:05:00.000Z",
       bodyReactions: { heart: 1, total_count: 1 },
       bodyReactionDetails: firstPage.records,
+      bodyReactionDetailsReadAt: "2026-09-03T00:04:00.000Z",
     });
     const completed = mergeReactionKnowledge(partial, complete);
     expect(reactionKnowledgeAdvanced(partial, complete)).toBe(true);
     expect(completed.bodyReactionDetails).toEqual(firstPage.records);
     expect(completed.bodyReactionProgress).toBeUndefined();
+    expect(completed.bodyReactionDetailsReadAt).toBe("2026-09-03T00:04:00.000Z");
   });
 
   it("keeps a live reaction cursor over stored details the newer read contradicts", () => {
@@ -764,6 +768,7 @@ describe("watch-pr event contracts", () => {
     const stored = snapshot({
       bodyReactions: { heart: 1, total_count: 1 },
       bodyReactionDetails: [heart],
+      bodyReactionDetailsReadAt: "2026-09-03T00:01:00.000Z",
     });
     const cursor = {
       records: [heart],
@@ -776,6 +781,7 @@ describe("watch-pr event contracts", () => {
       bodyReactions: { heart: 6_500, total_count: 6_500 },
       bodyReactionDetails: undefined,
       bodyReactionProgress: cursor,
+      bodyReactionDetailsReadAt: "2026-09-03T00:04:00.000Z",
     });
 
     const merged = mergeReactionKnowledge(refreshed, stored);
@@ -785,6 +791,70 @@ describe("watch-pr event contracts", () => {
     // Copying the stored pair back would erase the cursor and report no change, so the
     // write would be dropped and every later refresh would restart at page one.
     expect(snapshotChanges(stored, merged)).toEqual(["reactions"]);
+  });
+
+  it("orders reaction details by each target's own read, not by the snapshot around it", () => {
+    const heart = { id: 1, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:00:30.000Z" };
+    const rocket = { id: 2, content: "rocket", author: "dave", authorId: 12, createdAt: "2026-09-03T00:02:30.000Z" };
+    const eyes = { id: 3, content: "eyes", author: "erin", authorId: 13, createdAt: "2026-09-03T00:04:30.000Z" };
+    const comment = {
+      id: 21,
+      author: "bob",
+      body: "Top-level note",
+      createdAt: "2026-09-03T00:00:00.000Z",
+      updatedAt: "2026-09-03T00:00:00.000Z",
+      reactions: { heart: 1, total_count: 1 },
+      htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
+    };
+    const both = { heart: 1, rocket: 1, total_count: 2 };
+    // A refresh whose wave ended at 00:04 read the body at 00:03 and the comment at 00:02,
+    // and committed first.
+    const committed = snapshot({
+      fetchedAt: "2026-09-03T00:04:00.000Z",
+      bodyReactions: both,
+      bodyReactionDetails: [heart, rocket],
+      bodyReactionDetailsReadAt: "2026-09-03T00:03:00.000Z",
+      comments: [{ ...comment, reactionDetails: [heart], reactionDetailsReadAt: "2026-09-03T00:02:00.000Z" }],
+    });
+    // This refresh's wave ended later, at 00:06, but its body read succeeded back at 00:01,
+    // before the rocket existed. Only its comment read, at 00:05, is the newer one.
+    const commentBoth = { ...comment, reactions: both, reactionDetails: [heart, eyes] };
+    const overlapping = snapshot({
+      fetchedAt: "2026-09-03T00:06:00.000Z",
+      title: "renamed while a refresh was in flight",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [heart],
+      bodyReactionDetailsReadAt: "2026-09-03T00:01:00.000Z",
+      comments: [{
+        ...commentBoth,
+        reactions: { heart: 1, eyes: 1, total_count: 2 },
+        reactionDetailsReadAt: "2026-09-03T00:05:00.000Z",
+      }],
+    });
+
+    const merged = mergeReactionKnowledge(overlapping, committed);
+    // The body keeps the read that returned later even though it arrived in the older wave.
+    expect(merged.bodyReactionDetails).toEqual([heart, rocket]);
+    expect(merged.bodyReactions).toEqual(both);
+    expect(merged.bodyReactionDetailsReadAt).toBe("2026-09-03T00:03:00.000Z");
+    // The same snapshot still contributes the comment read that did return later.
+    expect(merged.comments[0].reactionDetails).toEqual([heart, eyes]);
+    expect(merged.comments[0].reactionDetailsReadAt).toBe("2026-09-03T00:05:00.000Z");
+    // Ordering by `fetchedAt` would drop the rocket and publish it as a deletion.
+    expect(merged.title).toBe("renamed while a refresh was in flight");
+    // The comment's summary counts moved with its newer read, hence `comments` too.
+    expect(snapshotChanges(committed, merged)).toEqual(["description", "comments", "reactions"]);
+    // Exactly one reaction line, for the reaction the newer read found: no deletion of the
+    // rocket the older body read predates.
+    expect(monitorEventDetails(committed, merged)).toEqual([
+      "reaction created: @erin EYES on comment #21 @bob https://github.com/owner/repo/pull/7#issuecomment-21",
+    ]);
+
+    // With the stored snapshot as the base - the silent enrichment that announces nothing -
+    // neither read moves: the older body read must not regress what is committed, and the
+    // newer comment read is left to the refresh that can publish the reaction it found
+    // rather than being folded in behind an event nobody receives.
+    expect(mergeReactionKnowledge(committed, overlapping)).toBe(committed);
   });
 
   it("never lets borrowed reaction details overwrite what a concurrent write learned", () => {

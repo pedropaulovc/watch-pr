@@ -42,6 +42,7 @@ const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -218,6 +219,7 @@ describe("GitHub API adapter", () => {
     ];
     expect(knownTargets.filter((details) => details !== undefined)).toHaveLength(64);
 
+    const secondWaveStart = Date.now();
     reactionRequests = 0;
     peakInFlight = 0;
     settled = false;
@@ -239,6 +241,13 @@ describe("GitHub API adapter", () => {
     // actually read do not.
     expect(resumed.comments.every((entry) => entry.reactionDetailsState === "borrowed")).toBe(true);
     expect(resumed.reviewComments.filter((entry) => entry.reactionDetailsState === undefined)).toHaveLength(17);
+    // A borrow is dated by the read it descends from, so it cannot pass for this wave's
+    // knowledge; only the targets this wave read are stamped by it.
+    expect(resumed.comments.map((entry) => entry.reactionDetailsReadAt))
+      .toEqual(result.comments.map((entry) => entry.reactionDetailsReadAt));
+    expect(resumed.comments.every((entry) => entry.reactionDetailsReadAt !== undefined)).toBe(true);
+    const freshlyRead = resumed.reviewComments.filter((entry) => entry.reactionDetailsState === undefined);
+    expect(freshlyRead.every((entry) => Date.parse(entry.reactionDetailsReadAt ?? "") >= secondWaveStart)).toBe(true);
   });
 
   it("resumes a single reaction collection across request budgets", async () => {
@@ -282,11 +291,15 @@ describe("GitHub API adapter", () => {
 
   it("reuses stored reaction details while the summary counts are unchanged", async () => {
     const requested: string[] = [];
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:01:00.000Z");
     stubPullRequest({ title: "first", bodyReactions: { heart: 1, total_count: 1 }, reactions: () => Response.json([HEART]), requested });
     const first = await pullRequestSnapshot("token", "owner/repo", 7);
     expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
+    expect(first.bodyReactionDetailsReadAt).toBe("2026-09-03T00:01:00.000Z");
 
     requested.length = 0;
+    vi.setSystemTime("2026-09-03T00:02:00.000Z");
     stubPullRequest({
       title: "second",
       bodyReactions: { heart: 1, total_count: 1 },
@@ -299,9 +312,13 @@ describe("GitHub API adapter", () => {
     expect(second.bodyReactionDetails).toEqual(first.bodyReactionDetails);
     expect(first.bodyReactionDetailsState).toBeUndefined();
     expect(second.bodyReactionDetailsState).toBe("borrowed");
+    // Reuse is not a read: the borrow is still dated by the read it descends from, so it
+    // cannot outrank a read another refresh took in between.
+    expect(second.bodyReactionDetailsReadAt).toBe("2026-09-03T00:01:00.000Z");
     expect(second.title).toBe("second");
 
     requested.length = 0;
+    vi.setSystemTime("2026-09-03T00:03:00.000Z");
     stubPullRequest({
       title: "third",
       bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
@@ -312,6 +329,7 @@ describe("GitHub API adapter", () => {
     expect(requested.filter((url) => url.includes("/reactions"))).toHaveLength(1);
     expect(third.bodyReactionDetails).toHaveLength(2);
     expect(third.bodyReactionDetailsState).toBeUndefined();
+    expect(third.bodyReactionDetailsReadAt).toBe("2026-09-03T00:03:00.000Z");
   });
 
   it("retries reaction details that disagree with their aggregate counts", async () => {

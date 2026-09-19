@@ -252,16 +252,21 @@ function isPullRequestIssue(value: unknown): boolean {
 }
 
 /**
- * Comment content, without the reaction details that ride along on the same record: those
- * are compared as reactions so an unknown-to-known reaction read is not read as an edit.
+ * Comment content, without the reaction bookkeeping that rides along on the same record:
+ * details are compared as reactions so an unknown-to-known reaction read is not read as an
+ * edit, and their provenance and read time describe the read rather than the comment.
  */
+const REACTION_BOOKKEEPING = new Set([
+  "reactionDetails",
+  "reactionDetailsState",
+  "reactionDetailsReadAt",
+  "reactionProgress",
+]);
+
 function commentsKey(comments: PullRequestComment[]): string {
   return JSON.stringify(
     comments,
-    (key, value: unknown) =>
-      key === "reactionDetails" || key === "reactionDetailsState" || key === "reactionProgress"
-        ? undefined
-        : value,
+    (key, value: unknown) => REACTION_BOOKKEEPING.has(key) ? undefined : value,
   );
 }
 
@@ -344,45 +349,82 @@ interface ReactionKnowledge {
   reactions: ReactionCounts;
   reactionDetails?: PullRequestReaction[];
   reactionDetailsState?: ReactionDetailsState;
+  reactionDetailsReadAt?: string;
   reactionProgress?: ReactionReadProgress;
+}
+
+/**
+ * Whether `candidate`'s read of this target returned after `incumbent`'s. Overlapping
+ * refreshes read one target at a time, so neither snapshot is wholly newer than the other
+ * and `fetchedAt` cannot decide this: the refresh that commits second may well hold the
+ * older read of this particular target. Knowledge persisted before per-target read times
+ * carries none, and loses to any timestamped read, because a copy whose age cannot be
+ * established must not outrank one whose age can.
+ */
+function readIsNewer(candidate: ReactionKnowledge, incumbent: ReactionKnowledge): boolean {
+  const candidateTime = Date.parse(candidate.reactionDetailsReadAt ?? "");
+  if (!Number.isFinite(candidateTime)) return false;
+  const incumbentTime = Date.parse(incumbent.reactionDetailsReadAt ?? "");
+  return !Number.isFinite(incumbentTime) || candidateTime > incumbentTime;
 }
 
 /**
  * Resolves one target against the state the write lands on, returning undefined when `base`
  * already holds the best knowledge and needs no rewrite. Three rules decide it.
  *
- * Details `base` actually read are never replaced: they are this writer's evidence, and the
- * merge only ever fills what it does not know.
+ * Details `base` read itself stand, except where `basePublishes` and the committed state
+ * holds a read of the same target that returned later. Two refreshes overlap, so the one
+ * committing second can be carrying the older read of this target while carrying the newer
+ * view of everything else; publishing that older read would overwrite details another
+ * writer already committed and announce the difference as reaction activity that never
+ * happened. A silent enrichment takes the opposite base and reports nothing, so there a
+ * newer read is left for the refresh that can announce what it found.
  *
  * Details `base` only borrowed - reused unread because the summary counts had not moved -
- * are not evidence of anything. Anything the committed state learned outranks them, and
- * counts the committed state disagrees with mean the borrow describes a reaction state this
- * write never observed, so the committed pair stands and the next refresh reads the target
- * again rather than the borrow overwriting it or passing as current.
+ * are not a read at all. Anything the committed state read outranks them, and counts the
+ * committed state disagrees with mean the borrow describes a reaction state this write never
+ * observed, so the committed pair stands and the next refresh reads the target again rather
+ * than the borrow overwriting it or passing as current.
  *
- * Between a cursor and complete details the later observation wins, which both callers order
- * by `fetchedAt`: they commit the newer of the two snapshots and bail out otherwise. Pairing
- * details with counts a later read contradicts strands the target - the next refresh drops
- * the mismatched knowledge and restarts at page one, only to be overwritten again - so a
- * cursor opened against counts `source` does not share is the only route to the reactions
- * those older details predate.
+ * Between a cursor and complete details the later read wins. Pairing details with counts a
+ * later read contradicts strands the target - the next refresh drops the mismatched
+ * knowledge and restarts at page one, only to be overwritten again - so a cursor opened
+ * against counts `source` does not share is the only route to the reactions those older
+ * details predate.
  */
 function resolveReactionKnowledge(
   base: ReactionKnowledge,
   source: ReactionKnowledge | undefined,
-  sourceObservedLater: boolean,
+  basePublishes: boolean,
 ): ReactionKnowledge | undefined {
   const agrees = source !== undefined && sameReactionCounts(base.reactions, source.reactions);
   if (base.reactionDetails !== undefined) {
-    if (base.reactionDetailsState !== "borrowed") return undefined;
+    if (base.reactionDetailsState !== "borrowed") {
+      if (
+        basePublishes &&
+        source?.reactionDetails !== undefined &&
+        source.reactionDetailsState !== "borrowed" &&
+        readIsNewer(source, base)
+      ) {
+        return {
+          reactions: source.reactions,
+          reactionDetails: source.reactionDetails,
+          reactionDetailsReadAt: source.reactionDetailsReadAt,
+        };
+      }
+      return undefined;
+    }
     if (source !== undefined) {
       const outranks = agrees
-        ? source.reactionDetails !== undefined && source.reactionDetailsState !== "borrowed"
+        ? source.reactionDetails !== undefined &&
+          source.reactionDetailsState !== "borrowed" &&
+          !readIsNewer(base, source)
         : source.reactionDetails !== undefined || source.reactionProgress !== undefined;
       if (outranks) {
         return {
           reactions: source.reactions,
           reactionDetails: source.reactionDetails,
+          reactionDetailsReadAt: source.reactionDetailsReadAt,
           reactionProgress: source.reactionProgress,
         };
       }
@@ -390,25 +432,37 @@ function resolveReactionKnowledge(
       // so the next refresh reads the target instead of inheriting the borrow again.
       if (!agrees) return { reactions: base.reactions };
     }
-    // Nothing committed contradicts the borrow: keep it as the baseline, now confirmed
-    // against the state the write lands on.
-    return { reactions: base.reactions, reactionDetails: base.reactionDetails };
+    // Nothing committed contradicts the borrow: keep it as the baseline, still dated by the
+    // read it descends from rather than by the refresh that reused it.
+    return {
+      reactions: base.reactions,
+      reactionDetails: base.reactionDetails,
+      reactionDetailsReadAt: base.reactionDetailsReadAt,
+    };
   }
   if (source === undefined) return undefined;
-  const supersedes = agrees || sourceObservedLater;
+  const supersedes = agrees || readIsNewer(source, base);
   if (
     source.reactionDetails !== undefined &&
     (source.reactionDetailsState !== "borrowed" || agrees) &&
     (!base.reactionProgress || supersedes)
   ) {
-    return { reactions: source.reactions, reactionDetails: source.reactionDetails };
+    return {
+      reactions: source.reactions,
+      reactionDetails: source.reactionDetails,
+      reactionDetailsReadAt: source.reactionDetailsReadAt,
+    };
   }
   if (
     source.reactionProgress &&
     (!base.reactionProgress ||
       supersedes && source.reactionProgress.records.length > base.reactionProgress.records.length)
   ) {
-    return { reactions: source.reactions, reactionProgress: source.reactionProgress };
+    return {
+      reactions: source.reactions,
+      reactionDetailsReadAt: source.reactionDetailsReadAt,
+      reactionProgress: source.reactionProgress,
+    };
   }
   return undefined;
 }
@@ -426,10 +480,17 @@ function resolveReactionKnowledge(
  *
  * A filled target also takes `source`'s aggregate counts, because the counts are what the
  * next refresh compares against: details from one refresh beside counts from another would
- * either hide a real change or force a pointless re-read. Details `base` read itself are
- * never overwritten, so the merge only ever adds knowledge, and `base` is returned untouched
- * when there was nothing to add. Borrowed details are resolved here and never persist:
- * `resolveReactionKnowledge` settles each one against the committed state.
+ * either hide a real change or force a pointless re-read. `base` is returned untouched when
+ * there was nothing to add. Borrowed details are resolved here and never persist:
+ * `resolveReactionKnowledge` settles each one against the committed state. The read time of
+ * whichever knowledge wins travels with it, since it is what orders the next overlapping
+ * pair of reads.
+ *
+ * Which of the two is publishing follows from the same ordering both callers already apply:
+ * each commits the snapshot whose wave ended no earlier than the other's and bails out
+ * otherwise, so an older `base` is the stored snapshot of a silent enrichment. That decides
+ * only whose view is being announced, never which read of a target is newer - a wave's
+ * `fetchedAt` is stamped after all of its reads, so it cannot order them.
  */
 export function mergeReactionKnowledge(
   base: PullRequestSnapshot,
@@ -437,29 +498,30 @@ export function mergeReactionKnowledge(
 ): PullRequestSnapshot {
   const baseTime = Date.parse(base.fetchedAt);
   const sourceTime = Date.parse(source.fetchedAt);
-  const sourceObservedLater = Number.isFinite(baseTime) && Number.isFinite(sourceTime) &&
-    sourceTime > baseTime;
+  const basePublishes = !(Number.isFinite(baseTime) && Number.isFinite(sourceTime) && baseTime < sourceTime);
   let merged = false;
   const body = resolveReactionKnowledge(
     {
       reactions: base.bodyReactions,
       reactionDetails: base.bodyReactionDetails,
       reactionDetailsState: base.bodyReactionDetailsState,
+      reactionDetailsReadAt: base.bodyReactionDetailsReadAt,
       reactionProgress: base.bodyReactionProgress,
     },
     {
       reactions: source.bodyReactions,
       reactionDetails: source.bodyReactionDetails,
       reactionDetailsState: source.bodyReactionDetailsState,
+      reactionDetailsReadAt: source.bodyReactionDetailsReadAt,
       reactionProgress: source.bodyReactionProgress,
     },
-    sourceObservedLater,
+    basePublishes,
   );
   if (body) merged = true;
   const fill = (targets: PullRequestComment[], known: PullRequestComment[]): PullRequestComment[] => {
     const knownById = new Map(known.map((comment) => [comment.id, comment] as const));
     return targets.map((comment) => {
-      const resolved = resolveReactionKnowledge(comment, knownById.get(comment.id), sourceObservedLater);
+      const resolved = resolveReactionKnowledge(comment, knownById.get(comment.id), basePublishes);
       if (!resolved) return comment;
       merged = true;
       return {
@@ -467,6 +529,7 @@ export function mergeReactionKnowledge(
         reactions: resolved.reactions,
         reactionDetails: resolved.reactionDetails,
         reactionDetailsState: undefined,
+        reactionDetailsReadAt: resolved.reactionDetailsReadAt,
         reactionProgress: resolved.reactionProgress,
       };
     });
@@ -479,6 +542,7 @@ export function mergeReactionKnowledge(
     bodyReactions: body ? body.reactions : base.bodyReactions,
     bodyReactionDetails: body ? body.reactionDetails : base.bodyReactionDetails,
     bodyReactionDetailsState: undefined,
+    bodyReactionDetailsReadAt: body ? body.reactionDetailsReadAt : base.bodyReactionDetailsReadAt,
     bodyReactionProgress: body ? body.reactionProgress : base.bodyReactionProgress,
     comments,
     reviewComments,
