@@ -397,6 +397,7 @@ function isPullRequestThread(value: unknown): value is PullRequestThread {
 function isWatchEventSummary(value: unknown): value is WatchEventSummary {
   if (!isObjectRecord(value)) return false;
   const summary = value as Partial<WatchEventSummary>;
+  const legacyDetails = value.details;
   return typeof summary.id === "string" &&
     typeof summary.deliveryId === "string" &&
     typeof summary.receivedAt === "string" &&
@@ -406,7 +407,7 @@ function isWatchEventSummary(value: unknown): value is WatchEventSummary {
     Number.isSafeInteger(summary.pullRequestNumber) &&
     typeof summary.resourceUri === "string" &&
     isStringArray(summary.changes) &&
-    (summary.details === undefined || isStringArray(summary.details));
+    (legacyDetails === undefined || isStringArray(legacyDetails));
 }
 
 function isSidecarPayloadRef(value: unknown): value is SidecarPayloadRef {
@@ -514,7 +515,7 @@ function chunkedRecordKeys(recordKey: string, chunkCount: number): string[] {
   return keys;
 }
 
-function eventSummary(event: WatchEvent): WatchEventSummary {
+function eventSummary(event: WatchEvent | WatchEventSummary): WatchEventSummary {
   return {
     id: event.id,
     deliveryId: event.deliveryId,
@@ -525,7 +526,6 @@ function eventSummary(event: WatchEvent): WatchEventSummary {
     pullRequestNumber: event.pullRequestNumber,
     resourceUri: event.resourceUri,
     changes: event.changes,
-    details: event.details ?? [],
   };
 }
 
@@ -843,7 +843,7 @@ function isStoredWatchEvent(value: unknown): value is WatchEvent {
 
 function matchesSidecarEvent(value: unknown, summary: WatchEventSummary): value is WatchEvent {
   return isStoredWatchEvent(value) &&
-    JSON.stringify(eventSummary(value)) === JSON.stringify(summary);
+    JSON.stringify(eventSummary(value)) === JSON.stringify(eventSummary(summary));
 }
 
 async function readSidecarPayloads(
@@ -900,7 +900,7 @@ export async function readStoredWatchState(storage: WatchStorage, storageKey: st
 
 /**
  * Snapshot plus per-event metadata without touching any payload row. Webhook routing,
- * polling, monitor replay and registration lists read watches through this projection.
+ * polling, and registration lists read watches through this projection.
  */
 export async function readWatchStateMetadata(storage: WatchStorage, storageKey: string): Promise<WatchStateMetadata> {
   const index = await readSidecarIndex(storage, storageKey);
@@ -1007,10 +1007,13 @@ export async function openWatchStateMutation(
       let chunkCount = payloadWrite.chunkCount;
       let incomingRows = payloadWrite.puts;
 
-      const windowed: SidecarEventRef[] = [...refs, {
-        meta: eventSummary(event),
-        payload: { source: "sidecar", sequence, chunkCount: payloadWrite.chunkCount },
-      }];
+      const windowed: SidecarEventRef[] = [
+        ...refs.map((ref) => ({ ...ref, meta: eventSummary(ref.meta) })),
+        {
+          meta: eventSummary(event),
+          payload: { source: "sidecar", sequence, chunkCount: payloadWrite.chunkCount },
+        },
+      ];
       const evicted = windowed.splice(0, Math.max(windowed.length - MAX_EVENTS, 0));
       const rootReferences = windowed.filter((ref) => ref.payload.source === "root").length;
       const retirements: SidecarCleanupJob[] = [];
@@ -1226,7 +1229,7 @@ function resumesClosedWatch(event: WatchEvent, snapshot: PullRequestSnapshot | n
   );
 }
 
-function compactMonitorEvent(event: WatchEventSummary, state: MonitorTerminalState): PrMonitorEvent {
+function compactMonitorEvent(event: WatchEvent, state: MonitorTerminalState): PrMonitorEvent {
   return {
     id: event.id,
     repository: event.repository,
@@ -1241,7 +1244,7 @@ function compactMonitorEvent(event: WatchEventSummary, state: MonitorTerminalSta
 }
 
 function reconciliationMonitorEvent(
-  state: WatchStateMetadata,
+  state: StoredWatchState,
   action: "cursor_miss" | "terminal_snapshot",
   repository: string,
   pullRequestNumber: number,
@@ -1335,15 +1338,17 @@ export class WatchPrHub {
       return this.monitorError(400, "invalid_cursor", `monitor cursor must not exceed ${MAX_MONITOR_CURSOR_LENGTH} characters`);
     }
 
-    const watchState = await this.watchStateMetadata(record.userId, key);
+    const watchState = await this.watchStateFull(record.userId, key);
     const currentTerminalState = terminalState(watchState.snapshot);
+    const compactEvents = (selected: WatchEvent[]): PrMonitorEvent[] =>
+      selected.map((event) => compactMonitorEvent(event, terminalState(event.snapshot)));
     let events: PrMonitorEvent[];
     if (!cursor) {
-      events = watchState.events.map((event) => compactMonitorEvent(event, event.terminalState));
+      events = compactEvents(watchState.events);
     } else {
       const cursorIndex = watchState.events.findIndex((event) => event.id === cursor);
       events = cursorIndex >= 0
-        ? watchState.events.slice(cursorIndex + 1).map((event) => compactMonitorEvent(event, event.terminalState))
+        ? compactEvents(watchState.events.slice(cursorIndex + 1))
         : [reconciliationMonitorEvent(watchState, "cursor_miss", record.repository, record.pullRequestNumber)];
     }
     if (currentTerminalState !== "watching" && events.length === 0) {

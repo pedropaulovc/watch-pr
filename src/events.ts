@@ -455,8 +455,14 @@ function mergeabilityDetails(
   const currentNeedsRebase = currentState === "BEHIND" || currentState === "DIRTY";
   if (currentNeedsRebase && previousState !== currentState) {
     lines.push(`rebase: ${currentState}`);
-  } else if (previous && previousNeedsRebase && previousState !== currentState) {
-    lines.push(`rebase: ${currentState ?? "UNKNOWN"}`);
+  } else if (
+    previous &&
+    previousNeedsRebase &&
+    currentState !== undefined &&
+    currentState !== "UNKNOWN" &&
+    previousState !== currentState
+  ) {
+    lines.push(`rebase: ${currentState}`);
   }
   return lines;
 }

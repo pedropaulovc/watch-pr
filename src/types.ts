@@ -163,8 +163,9 @@ export interface WatchEvent {
   snapshot: PullRequestSnapshot | null;
   changes: string[];
   /**
-   * Compact, event-specific lines that let monitor clients act without fetching the
-   * complete snapshot. Optional for persisted events written before this field existed.
+   * Size-bounded, event-specific lines that let monitor clients act without fetching
+   * the complete snapshot. Optional for persisted events written before this field
+   * existed.
    */
   details?: string[];
 }
@@ -175,11 +176,10 @@ export interface StoredWatchState {
 }
 
 /**
- * Every `WatchEvent` field except the two unbounded ones. Hot paths (webhook routing,
- * polling, monitor replay, registration lists) only ever need this projection, so it is
- * what the sidecar index persists inline.
+ * Bounded event metadata. Payloads, snapshots, and monitor details stay in immutable
+ * event records so the frequently rewritten sidecar index remains compact.
  */
-export type WatchEventSummary = Omit<WatchEvent, "payload" | "snapshot">;
+export type WatchEventSummary = Omit<WatchEvent, "payload" | "snapshot" | "details">;
 
 export interface WatchEventMetadata extends WatchEventSummary {
   /** Terminal state implied by the snapshot this event carries in a full read. */

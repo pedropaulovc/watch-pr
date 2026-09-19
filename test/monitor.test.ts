@@ -1367,7 +1367,9 @@ describe("native monitor feed", () => {
     await internals.publishEvent(userId, watch, appended, { snapshot: appendedSnapshot });
 
     const storageKey = watchStorageKey(userId, repository, number);
-    await expect(storage.get(watchSidecarIndexKey(storageKey))).resolves.toBeDefined();
+    const storedIndex = await storage.get<unknown>(watchSidecarIndexKey(storageKey));
+    expect(storedIndex).toBeDefined();
+    expect(JSON.stringify(storedIndex)).not.toContain("\"details\"");
     const state = await internals.readWatch(active, repository, number);
     expect(state.snapshot).toMatchObject({ headSha: "appended" });
     // The predecessor payload is still served from the untouched root record, and only the
@@ -1378,7 +1380,7 @@ describe("native monitor feed", () => {
     ]);
   });
 
-  it("keeps hot read paths off sidecar payload rows", async () => {
+  it("hydrates monitor replay while keeping other hot paths off sidecar payload rows", async () => {
     const { hub, pending, storage } = hubFixture();
     const record = sessionRecord();
     const seeded = event("event-seeded", snapshot(), { payload: { seeded: "x".repeat(20_000) } });
@@ -1407,6 +1409,8 @@ describe("native monitor feed", () => {
       )));
       await expect(nextMonitorEvent(feed)).resolves.toMatchObject({ id: "event-appended" });
       await feed.reader.cancel();
+      expect(storage.getKeys).toContain(watchSidecarEventKey(storageKey, 0));
+      storage.getKeys.length = 0;
 
       await expect(internals.listWatches(active)).resolves.toMatchObject([{ key: watch }]);
 

@@ -339,6 +339,10 @@ describe("watch-pr event contracts", () => {
       "feedback [PRRT_thread] #41 deleted",
       "thread PRRT_thread: reopened",
     ]);
+    expect(monitorEventDetails(
+      snapshot({ mergeableState: "dirty" }),
+      snapshot({ mergeableState: "unknown" }),
+    )).toEqual([]);
   });
 
   it("omits unavailable head references and bounds persisted monitor details", () => {
