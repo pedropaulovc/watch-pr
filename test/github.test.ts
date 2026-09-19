@@ -332,6 +332,112 @@ describe("GitHub API adapter", () => {
     expect(third.bodyReactionDetailsReadAt).toBe("2026-09-03T00:03:00.000Z");
   });
 
+  it("dates a zero reaction summary when its own response returned, not when the wave ended", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:00:00.000Z");
+    // Every response is held until the test releases it, and stamps the clock as it returns,
+    // so each aggregate lands at a different point of one slow wave.
+    const pending: (() => void)[] = [];
+    const staged = (time: string, body: unknown, nextPage?: string): Promise<Response> =>
+      new Promise<Response>((resolve) => {
+        pending.push(() => {
+          vi.setSystemTime(time);
+          resolve(Response.json(body, nextPage ? { headers: { link: `<${nextPage}>; rel="next"` } } : undefined));
+        });
+      });
+    const listedComment = (id: number, author: string, body: string) => ({
+      id,
+      user: { login: author },
+      body,
+      created_at: "2026-09-03T00:00:00.000Z",
+      updated_at: "2026-09-03T00:00:00.000Z",
+      reactions: { total_count: 0 },
+      html_url: `https://github.com/owner/repo/pull/7#issuecomment-${id}`,
+    });
+    const noReactions = { total_count: 0 };
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/7")) {
+        return staged("2026-09-03T00:00:30.000Z", {
+          number: 7,
+          html_url: "https://github.com/owner/repo/pull/7",
+          title: "slow wave",
+          state: "open",
+          user: { login: "author" },
+          head: { ref: "feature", sha: null },
+          base: { ref: "main" },
+        });
+      }
+      if (url.endsWith("/issues/7")) return staged("2026-09-03T00:01:00.000Z", { reactions: noReactions });
+      // Two pages of one list, minutes apart: a comment is only as fresh as its own page.
+      if (url.endsWith("/issues/7/comments?per_page=100")) {
+        return staged(
+          "2026-09-03T00:02:00.000Z",
+          [listedComment(21, "bob", "Top-level note")],
+          "https://api.github.com/repos/owner/repo/issues/7/comments?per_page=100&page=2",
+        );
+      }
+      if (url.endsWith("/issues/7/comments?per_page=100&page=2")) {
+        return staged("2026-09-03T00:08:00.000Z", [listedComment(22, "bob", "Later note")]);
+      }
+      if (url.endsWith("/pulls/7/reviews?per_page=100")) return staged("2026-09-03T00:03:00.000Z", []);
+      if (url.endsWith("/pulls/7/comments?per_page=100")) {
+        return staged("2026-09-03T00:04:00.000Z", [{
+          id: 31,
+          user: { login: "carol" },
+          body: "Inline note",
+          created_at: "2026-09-03T00:00:00.000Z",
+          updated_at: "2026-09-03T00:00:00.000Z",
+          reactions: noReactions,
+          html_url: "https://github.com/owner/repo/pull/7#discussion_r31",
+        }]);
+      }
+      if (url.endsWith("/graphql")) {
+        return staged("2026-09-03T00:06:00.000Z", {
+          data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } },
+        });
+      }
+      throw new Error(`unexpected GitHub URL ${url}`);
+    }) as typeof fetch;
+
+    let settled = false;
+    const wave = pullRequestSnapshot("token", "owner/repo", 7).finally(() => { settled = true; });
+    for (let round = 0; !settled; round += 1) {
+      if (round > 100) throw new Error("snapshot never settled");
+      for (let drain = 0; drain < 50; drain += 1) await Promise.resolve();
+      pending.shift()?.();
+    }
+    const stale = await wave;
+
+    // The wave ends minutes after the summaries it is built from, and no target inherits
+    // that end time: each zero is only as authoritative as the response that reported it.
+    expect(stale.fetchedAt).toBe("2026-09-03T00:08:00.000Z");
+    expect(stale.bodyReactionDetails).toEqual([]);
+    expect(stale.bodyReactionDetailsReadAt).toBe("2026-09-03T00:01:00.000Z");
+    expect(stale.comments.map((comment) => [comment.id, comment.reactionDetailsReadAt])).toEqual([
+      [21, "2026-09-03T00:02:00.000Z"],
+      [22, "2026-09-03T00:08:00.000Z"],
+    ]);
+    expect(stale.reviewComments[0].reactionDetailsReadAt).toBe("2026-09-03T00:04:00.000Z");
+
+    // A concurrent refresh read the body at 00:03 and committed the heart added at 00:02:30.
+    const heart = { id: 901, content: "heart", author: "alice", authorId: 11, createdAt: "2026-09-03T00:02:30.000Z" };
+    const committed = {
+      ...stale,
+      fetchedAt: "2026-09-03T00:03:30.000Z",
+      bodyReactions: { heart: 1, total_count: 1 },
+      bodyReactionDetails: [heart],
+      bodyReactionDetailsReadAt: "2026-09-03T00:03:00.000Z",
+    };
+    const merged = mergeReactionKnowledge(stale, committed);
+    // Stamped at the end of the wave the zero would outrank that read and publish the heart
+    // as a deletion; dated by its own response it loses, as a stale observation should.
+    expect(merged.bodyReactionDetails).toEqual([heart]);
+    expect(merged.bodyReactions).toEqual({ heart: 1, total_count: 1 });
+    expect(merged.bodyReactionDetailsReadAt).toBe("2026-09-03T00:03:00.000Z");
+    expect(monitorEventDetails(committed, merged).some((line) => line.startsWith("reaction"))).toBe(false);
+  });
+
   it("retries reaction details that disagree with their aggregate counts", async () => {
     const requested: string[] = [];
     stubPullRequest({

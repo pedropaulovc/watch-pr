@@ -56,25 +56,45 @@ async function githubResponse(
   return fetch(apiUrl(path), { ...init, headers });
 }
 
+/** A GitHub response and the moment it actually returned, which dates what it says. */
+interface Observed<T> {
+  value: T;
+  observedAt: string;
+}
+
+async function githubJsonObserved<T>(
+  token: string,
+  path: string,
+  init: RequestInit = {},
+): Promise<Observed<T>> {
+  const response = await githubResponse(token, path, init);
+  const text = await response.text();
+  const observedAt = new Date().toISOString();
+  if (!response.ok) throw new GithubApiError(response.status, text, path);
+  return { value: text ? JSON.parse(text) as T : {} as T, observedAt };
+}
+
 export async function githubJson<T>(
   token: string,
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
-  const response = await githubResponse(token, path, init);
-  const text = await response.text();
-  if (!response.ok) throw new GithubApiError(response.status, text, path);
-  if (!text) return {} as T;
-  return JSON.parse(text) as T;
+  return (await githubJsonObserved<T>(token, path, init)).value;
 }
 
-async function githubPaginated<T>(token: string, path: string, field?: string): Promise<T[]> {
-  const values: T[] = [];
+/**
+ * Each page separately, with the time it returned. A list response dates every summary it
+ * carries - including the reaction counts riding on each comment - and pages of one list can
+ * be minutes apart on a wide PR, so a record is only ever as fresh as its own page.
+ */
+async function githubPages<T>(token: string, path: string, field?: string): Promise<Observed<T[]>[]> {
+  const pages: Observed<T[]>[] = [];
   let nextUrl: string | null = `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
 
   while (nextUrl) {
     const response = await githubResponse(token, nextUrl);
     const text = await response.text();
+    const observedAt = new Date().toISOString();
     if (!response.ok) throw new GithubApiError(response.status, text, path);
     const payload: unknown = text ? JSON.parse(text) : [];
     const page = field
@@ -85,11 +105,16 @@ async function githubPaginated<T>(token: string, path: string, field?: string): 
         ? payload as T[]
         : null;
     if (!page) throw new Error(`GitHub returned a non-array page for ${path}`);
-    values.push(...page);
+    pages.push({ value: page, observedAt });
     nextUrl = nextLink(response.headers.get("link"));
   }
 
-  return values;
+  return pages;
+}
+
+async function githubPaginated<T>(token: string, path: string, field?: string): Promise<T[]> {
+  const pages = await githubPages<T>(token, path, field);
+  return pages.flatMap((page) => page.value);
 }
 
 function nextLink(linkHeader: string | null): string | null {
@@ -277,10 +302,11 @@ interface SnapshotReactions {
  * One wave for the whole snapshot: every target that still needs a read, across the PR body,
  * top-level comments, and inline review comments, shares a single `REACTION_CONCURRENCY`
  * budget. Two kinds of target never spend a request: a zero summary count is authoritative
- * for "no reactions", and an unchanged summary count over known details means the stored
- * details still describe the target. The residual blind spot is a swap that leaves every
- * count identical - one `heart` replaced by another actor's `heart` between two refreshes -
- * which the summary cannot express and only a per-target read would reveal. Reused details
+ * for "no reactions" as of the moment that summary response returned, and an unchanged
+ * summary count over known details means the stored details still describe the target. The
+ * residual blind spot is a swap that leaves every count identical - one `heart` replaced by
+ * another actor's `heart` between two refreshes - which the summary cannot express and only
+ * a per-target read would reveal. Reused details
  * are recorded as `borrowed` for exactly that reason: no read backs them, so the
  * transactional merge settles them against the state the write lands on instead of taking
  * them for an observation of their own, and they keep the time of the read they descend
@@ -291,30 +317,36 @@ interface SnapshotReactions {
  * another concurrent refresh committed while this request was in flight. Every other
  * snapshot field still advances.
  *
- * Each target that is read carries the time its own read returned. Two refreshes overlap
- * one target at a time, so the snapshot that commits second often holds the older read of
- * some target and the newer read of another; only a per-target time can order them.
+ * Each target that is read carries the time its own read returned, and each target the
+ * summary settled carries the time that summary response returned - never the end of the
+ * wave, which can be minutes later on a wide PR and would let a zero observed early outrank
+ * a reaction another refresh read in the meantime. Two refreshes overlap one target at a
+ * time, so the snapshot that commits second often holds the older observation of some
+ * target and the newer one of another; only a per-target time can order them.
  */
 async function snapshotReactions(
   token: string,
   repository: string,
   number: number,
-  bodyReactions: ReactionCounts,
-  comments: PullRequestComment[],
-  reviewComments: PullRequestComment[],
+  bodyReactions: Observed<ReactionCounts>,
+  comments: Observed<PullRequestComment>[],
+  reviewComments: Observed<PullRequestComment>[],
   previous: PullRequestSnapshot | null,
 ): Promise<SnapshotReactions> {
   // One slot per reaction target, seeded with what this refresh already knows: the summary
   // counts GitHub returned, and details only once they are known.
   const slots: ReactionState[] = [];
   const reads: ReactionTargetRead[] = [];
-  const summarisedAt = new Date().toISOString();
-  const plan = (reactions: ReactionCounts, path: string, prior: ReactionState | undefined): number => {
+  const plan = (
+    summary: Observed<ReactionCounts>,
+    path: string,
+    prior: ReactionState | undefined,
+  ): number => {
+    const reactions = summary.value;
     const slot = slots.push({ reactions }) - 1;
     if (reactionTotal(reactions) === 0) {
-      // The summary this refresh just read is authoritative for "no reactions".
       slots[slot].reactionDetails = [];
-      slots[slot].reactionDetailsReadAt = summarisedAt;
+      slots[slot].reactionDetailsReadAt = summary.observedAt;
     } else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) {
       slots[slot].reactionDetails = prior.reactionDetails;
       slots[slot].reactionDetailsState = "borrowed";
@@ -342,14 +374,14 @@ async function snapshotReactions(
     } : undefined,
   );
   const commentSlots = comments.map((comment) => plan(
-    comment.reactions,
-    `/repos/${repository}/issues/comments/${comment.id}/reactions`,
-    previousComments.get(comment.id),
+    { value: comment.value.reactions, observedAt: comment.observedAt },
+    `/repos/${repository}/issues/comments/${comment.value.id}/reactions`,
+    previousComments.get(comment.value.id),
   ));
   const reviewCommentSlots = reviewComments.map((comment) => plan(
-    comment.reactions,
-    `/repos/${repository}/pulls/comments/${comment.id}/reactions`,
-    previousReviewComments.get(comment.id),
+    { value: comment.value.reactions, observedAt: comment.observedAt },
+    `/repos/${repository}/pulls/comments/${comment.value.id}/reactions`,
+    previousReviewComments.get(comment.value.id),
   ));
 
   const budget: RequestBudget = { remaining: REACTION_REQUEST_BUDGET };
@@ -393,8 +425,8 @@ async function snapshotReactions(
     bodyReactionDetailsState: slots[bodySlot].reactionDetailsState,
     bodyReactionDetailsReadAt: slots[bodySlot].reactionDetailsReadAt,
     bodyReactionProgress: slots[bodySlot].reactionProgress,
-    comments: comments.map((comment, position) => attach(comment, commentSlots[position])),
-    reviewComments: reviewComments.map((comment, position) => attach(comment, reviewCommentSlots[position])),
+    comments: comments.map((comment, position) => attach(comment.value, commentSlots[position])),
+    reviewComments: reviewComments.map((comment, position) => attach(comment.value, reviewCommentSlots[position])),
   };
 }
 
@@ -610,30 +642,38 @@ export async function pullRequestSnapshot(
 ): Promise<PullRequestSnapshot> {
   const [pull, issue] = await Promise.all([
     githubJson<GithubRecord>(token, `/repos/${repository}/pulls/${number}`),
-    githubJson<GithubRecord>(token, `/repos/${repository}/issues/${number}`),
+    // The body's reaction summary is only as fresh as the response that carried it, which is
+    // also where the wave's slowest work has not happened yet.
+    githubJsonObserved<GithubRecord>(token, `/repos/${repository}/issues/${number}`),
   ]);
   const head = pull.head && typeof pull.head === "object" ? pull.head as GithubRecord : {};
   const base = pull.base && typeof pull.base === "object" ? pull.base as GithubRecord : {};
   const headSha = stringValue(head, "sha");
-  const [comments, reviews, reviewComments, checkRuns, statuses, threads] = await Promise.all([
-    githubPaginated<GithubRecord>(token, `/repos/${repository}/issues/${number}/comments`),
+  const [commentPages, reviews, reviewCommentPages, checkRuns, statuses, threads] = await Promise.all([
+    githubPages<GithubRecord>(token, `/repos/${repository}/issues/${number}/comments`),
     githubPaginated<GithubRecord>(token, `/repos/${repository}/pulls/${number}/reviews`),
-    githubPaginated<GithubRecord>(token, `/repos/${repository}/pulls/${number}/comments`),
+    githubPages<GithubRecord>(token, `/repos/${repository}/pulls/${number}/comments`),
     headSha ? githubPaginated<GithubRecord>(token, `/repos/${repository}/commits/${headSha}/check-runs`, "check_runs") : Promise.resolve([]),
     headSha ? githubPaginated<GithubRecord>(token, `/repos/${repository}/commits/${headSha}/statuses`) : Promise.resolve([]),
     reviewThreads(token, repository, number),
   ]);
+  const observedComments = (pages: Observed<GithubRecord[]>[]): Observed<PullRequestComment>[] =>
+    pages.flatMap((page) => page.value.map((record) => ({
+      value: normalizeComment(record),
+      observedAt: page.observedAt,
+    })));
+  const comments = observedComments(commentPages);
+  const reviewComments = observedComments(reviewCommentPages);
 
   // Individual reactions need the comment IDs from the first wave. A target whose read fails
   // keeps its previous counts too, so the next refresh sees the same delta and retries.
-  const bodyReactions = reactionCounts(issue.reactions);
   const reactions = await snapshotReactions(
     token,
     repository,
     number,
-    bodyReactions,
-    comments.map(normalizeComment),
-    reviewComments.map(normalizeComment),
+    { value: reactionCounts(issue.value.reactions), observedAt: issue.observedAt },
+    comments,
+    reviewComments,
     previous,
   );
 
