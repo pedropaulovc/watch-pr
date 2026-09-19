@@ -76,6 +76,8 @@ interface ActiveMonitorFeed {
   controller: ReadableStreamDefaultController<Uint8Array>;
   heartbeat: number;
   expiration: number;
+  ready: boolean;
+  pending: PrMonitorEvent[];
   closed: boolean;
 }
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -1387,6 +1389,49 @@ export class WatchPrHub {
       }
     }
 
+    let activeFeed: ActiveMonitorFeed | undefined;
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        streamController = controller;
+        if (currentTerminalState !== "watching") return;
+        for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) {
+          this.closeMonitorFeed(feed);
+        }
+        const heartbeat = setInterval(() => {
+          if (!activeFeed || activeFeed.closed || !activeFeed.ready) return;
+          try {
+            controller.enqueue(monitorEncoder.encode(": heartbeat\n\n"));
+          } catch {
+            this.closeMonitorFeed(activeFeed);
+          }
+        }, MONITOR_HEARTBEAT_MS);
+        const expiration = setTimeout(() => {
+          if (!activeFeed || activeFeed.closed) return;
+          this.closeMonitorFeed(activeFeed);
+          this.state.waitUntil(this.revokeMonitorCapability(capability, record));
+        }, Math.max(0, Math.min(record.expiresAt, record.createdAt + MONITOR_TTL_MS) - Date.now()));
+        activeFeed = {
+          capability,
+          userId: record.userId,
+          sessionToken: record.sessionToken,
+          key,
+          controller,
+          heartbeat,
+          expiration,
+          ready: false,
+          pending: [],
+          closed: false,
+        };
+        const feeds = this.activeMonitorFeeds.get(capability) ?? new Set<ActiveMonitorFeed>();
+        feeds.add(activeFeed);
+        this.activeMonitorFeeds.set(capability, feeds);
+      },
+      cancel: () => {
+        if (activeFeed) this.closeMonitorFeed(activeFeed, false);
+      },
+    });
+
     const hydrated = await readStoredWatchEvents(
       this.state.storage,
       watchStorageKey(record.userId, record.repository, record.pullRequestNumber),
@@ -1404,47 +1449,6 @@ export class WatchPrHub {
       )];
     }
 
-    let activeFeed: ActiveMonitorFeed | undefined;
-    const body = new ReadableStream<Uint8Array>({
-      start: (controller) => {
-        controller.enqueue(monitorEncoder.encode(": connected\n\n"));
-        for (const event of events) controller.enqueue(monitorFrame(event));
-        if (currentTerminalState !== "watching") {
-          controller.close();
-          return;
-        }
-        const heartbeat = setInterval(() => {
-          if (!activeFeed || activeFeed.closed) return;
-          try {
-            controller.enqueue(monitorEncoder.encode(": heartbeat\n\n"));
-          } catch {
-            this.closeMonitorFeed(activeFeed);
-          }
-        }, MONITOR_HEARTBEAT_MS);
-        for (const feed of [...(this.activeMonitorFeeds.get(capability) ?? [])]) this.closeMonitorFeed(feed);
-        const expiration = setTimeout(() => {
-          if (!activeFeed || activeFeed.closed) return;
-          this.closeMonitorFeed(activeFeed);
-          this.state.waitUntil(this.revokeMonitorCapability(capability, record));
-        }, Math.max(0, Math.min(record.expiresAt, record.createdAt + MONITOR_TTL_MS) - Date.now()));
-        activeFeed = {
-          capability,
-          userId: record.userId,
-          sessionToken: record.sessionToken,
-          key,
-          controller,
-          heartbeat,
-          expiration,
-          closed: false,
-        };
-        const feeds = this.activeMonitorFeeds.get(capability) ?? new Set<ActiveMonitorFeed>();
-        feeds.add(activeFeed);
-        this.activeMonitorFeeds.set(capability, feeds);
-      },
-      cancel: () => {
-        if (activeFeed) this.closeMonitorFeed(activeFeed, false);
-      },
-    });
     const confirmed = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
     if (
       !confirmed ||
@@ -1456,6 +1460,28 @@ export class WatchPrHub {
     ) {
       if (activeFeed) this.closeMonitorFeed(activeFeed);
       return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+    }
+    if (!activeFeed?.closed) {
+      streamController.enqueue(monitorEncoder.encode(": connected\n\n"));
+      for (const event of events) streamController.enqueue(monitorFrame(event));
+      if (activeFeed) {
+        activeFeed.ready = true;
+        const pending = activeFeed.pending.splice(0);
+        for (const event of pending) {
+          try {
+            streamController.enqueue(monitorFrame(event));
+          } catch {
+            this.closeMonitorFeed(activeFeed);
+            break;
+          }
+          if (event.terminalState !== "watching") {
+            this.closeMonitorFeed(activeFeed);
+            break;
+          }
+        }
+      } else {
+        streamController.close();
+      }
     }
     return new Response(body, {
       headers: {
@@ -1487,6 +1513,10 @@ export class WatchPrHub {
     for (const feeds of this.activeMonitorFeeds.values()) {
       for (const feed of [...feeds]) {
         if (feed.userId !== userId || feed.key !== key || feed.closed) continue;
+        if (!feed.ready) {
+          feed.pending.push(event);
+          continue;
+        }
         try {
           feed.controller.enqueue(monitorFrame(event));
         } catch {

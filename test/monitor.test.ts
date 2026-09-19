@@ -34,10 +34,12 @@ class MemoryStorage {
   async get<T>(key: string | string[]): Promise<T | undefined | Map<string, T>> {
     if (Array.isArray(key)) {
       this.getKeys.push(...key);
-      return new Map(key.flatMap((entry) => {
+      const entries = new Map(key.flatMap((entry) => {
         const value = this.values.get(entry);
         return value === undefined ? [] : [[entry, value as T]];
       }));
+      for (const entry of key) await this.afterGet?.(entry);
+      return entries;
     }
     this.getKeys.push(key);
     const value = this.values.get(key) as T | undefined;
@@ -1440,6 +1442,73 @@ describe("native monitor feed", () => {
     const payloadKeys = [0, 1, 2, 3].map((sequence) => watchSidecarEventKey(storageKey, sequence));
     expect(storage.getKeys.filter((key) => payloadKeys.includes(key))).toEqual([]);
     expect(storage.getKeys).not.toContain(storageKey);
+  });
+
+  it("buffers live terminal events published while replay payloads hydrate", async () => {
+    const { hub, storage } = hubFixture();
+    const record = sessionRecord();
+    const seeded = event("event-seeded", snapshot(), { payload: { seeded: "x".repeat(20_000) } });
+    await storeMonitor(storage, { snapshot: seeded.snapshot, events: [seeded] }, record);
+    const internals = hub as unknown as HubInternals;
+    const appendedSnapshot = snapshot({
+      headSha: "appended",
+      fetchedAt: "2026-09-10T12:05:00.000Z",
+    });
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-appended", appendedSnapshot, { payload: { appended: true } }),
+      { snapshot: appendedSnapshot },
+    );
+
+    let hydrationStartedResolve!: () => void;
+    let releaseHydration!: () => void;
+    const hydrationStarted = new Promise<void>((resolve) => {
+      hydrationStartedResolve = resolve;
+    });
+    const hydrationGate = new Promise<void>((resolve) => {
+      releaseHydration = resolve;
+    });
+    const payloadKey = watchSidecarEventKey(
+      watchStorageKey(userId, repository, number),
+      0,
+    );
+    storage.afterGet = async (key) => {
+      if (key !== payloadKey) return;
+      storage.afterGet = undefined;
+      hydrationStartedResolve();
+      await hydrationGate;
+    };
+
+    const responsePromise = hub.fetch(new Request(
+      `https://watch-pr.test/monitor/${capability}?cursor=event-seeded`,
+    ));
+    await hydrationStarted;
+    const mergedSnapshot = snapshot({
+      state: "closed",
+      merged: true,
+      mergedAt: "2026-09-10T12:06:00.000Z",
+      fetchedAt: "2026-09-10T12:06:00.000Z",
+    });
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-merged", mergedSnapshot, { action: "closed" }),
+      { snapshot: mergedSnapshot },
+    );
+    releaseHydration();
+
+    const feed = feedReader(await responsePromise);
+    await expect(nextMonitorEvent(feed)).resolves.toMatchObject({
+      id: "event-appended",
+      terminalState: "watching",
+    });
+    await expect(nextMonitorEvent(feed)).resolves.toMatchObject({
+      id: "event-merged",
+      terminalState: "merged",
+    });
+    await expect(feed.reader.read()).resolves.toMatchObject({ done: true });
+    expect(internals.activeMonitorFeeds.size).toBe(0);
   });
 
   it("stores distinct deliveries that carry no snapshot change", async () => {
