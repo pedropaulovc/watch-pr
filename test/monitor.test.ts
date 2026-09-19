@@ -1805,6 +1805,30 @@ describe("native monitor feed", () => {
     expect(stored.events.map((storedEvent) => storedEvent.changes)).toEqual([[], []]);
   });
 
+  it("stores a webhook delivery emptied by concurrent reconciliation", async () => {
+    const { hub, storage } = hubFixture();
+    const current = snapshot({ headSha: "concurrently-stored" });
+    await storeMonitor(storage, { snapshot: current, events: [] });
+    const internals = hub as unknown as HubInternals;
+    await internals.publishEvent(
+      userId,
+      watch,
+      event("event-webhook-reconciled", current, {
+        deliveryId: "delivery-webhook-reconciled",
+        changes: ["mergeability"],
+      }),
+      { snapshot: current },
+    );
+
+    const stored = await readStoredWatchState(
+      storage as unknown as DurableObjectStorage,
+      watchStorageKey(userId, repository, number),
+    );
+    expect(stored.events).toHaveLength(1);
+    expect(stored.events[0].deliveryId).toBe("delivery-webhook-reconciled");
+    expect(stored.events[0].changes).toEqual([]);
+  });
+
   it("drops a comment-reaction event emptied by transactional fallback", async () => {
     const { hub, storage } = hubFixture();
     const reactedComment = {
@@ -1838,6 +1862,7 @@ describe("native monitor feed", () => {
       watch,
       event("event-reaction-fallback", unknownIncoming, {
         deliveryId: "delivery-reaction-fallback",
+        githubEvent: "snapshot",
         changes: ["comments"],
       }),
       { snapshot: unknownIncoming },
