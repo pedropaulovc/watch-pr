@@ -380,6 +380,28 @@ describe("watch-pr event contracts", () => {
       const code = character.charCodeAt(0);
       return character.length === 1 && code >= 0xd800 && code <= 0xdfff;
     })).toBe(false);
+    const failedCheck = (id: number, name: string) => ({
+      id,
+      name,
+      status: "completed",
+      conclusion: "failure",
+      completedAt: "2026-09-19T12:01:00.000Z",
+      startedAt: "2026-09-19T12:00:00.000Z",
+      url: null,
+      kind: "check_run" as const,
+    });
+    expect(monitorEventDetails(
+      snapshot(),
+      snapshot({ checks: [failedCheck(1, "\u001b[31mCI\u001b[0m\nspoof")] }),
+    )).toEqual(["check CIspoof: fail"]);
+    const sharedPrefix = "x".repeat(600);
+    const duplicateAfterTruncation = monitorEventDetails(snapshot(), snapshot({
+      checks: [
+        failedCheck(2, `${sharedPrefix}A`),
+        failedCheck(3, `${sharedPrefix}B`),
+      ],
+    }));
+    expect(duplicateAfterTruncation).toHaveLength(1);
   });
 
   it("emits only the changed comment body after a PR accumulates many comments", () => {

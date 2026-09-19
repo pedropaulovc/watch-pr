@@ -38,8 +38,20 @@ function truncate(value: string, maximumLength: number): string {
   return `${prefix}…`;
 }
 
+function sanitizeDetail(value: string): string {
+  return value
+    .replace(ANSI_ESCAPE_SEQUENCE_RE, "")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, "")
+    .trim();
+}
+
 function boundedDetails(lines: string[]): string[] {
-  const candidates = [...new Set(lines)].map((line) => truncate(line, MAX_MONITOR_DETAIL_LENGTH));
+  const candidates = [...new Set(
+    lines
+      .map(sanitizeDetail)
+      .filter(Boolean)
+      .map((line) => truncate(line, MAX_MONITOR_DETAIL_LENGTH)),
+  )];
   const details: string[] = [];
   let length = 0;
   let index = 0;
