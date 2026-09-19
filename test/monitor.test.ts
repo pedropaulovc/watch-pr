@@ -1638,23 +1638,32 @@ describe("native monitor feed", () => {
     expect(stored.events.map((storedEvent) => storedEvent.changes)).toEqual([[], []]);
   });
 
-  it("drops a reaction event emptied by transactional fallback", async () => {
+  it("drops a comment-reaction event emptied by transactional fallback", async () => {
     const { hub, storage } = hubFixture();
-    const storedSnapshot = snapshot({
-      bodyReactions: { heart: 1, total_count: 1 },
-      bodyReactionDetails: [{
+    const reactedComment = {
+      id: 11,
+      author: "bob",
+      body: "note",
+      createdAt: "2026-09-10T12:00:00.000Z",
+      updatedAt: "2026-09-10T12:00:00.000Z",
+      reactions: { heart: 1, total_count: 1 },
+      reactionDetails: [{
         id: 901,
         content: "heart",
         author: "alice",
         authorId: 11,
         createdAt: "2026-09-10T12:00:00.000Z",
       }],
-    });
+    };
+    const storedSnapshot = snapshot({ comments: [reactedComment] });
     await storeMonitor(storage, { snapshot: storedSnapshot, events: [] });
     const unknownIncoming = snapshot({
       fetchedAt: "2026-09-10T12:05:00.000Z",
-      bodyReactions: { heart: 1, rocket: 1, total_count: 2 },
-      bodyReactionDetails: undefined,
+      comments: [{
+        ...reactedComment,
+        reactions: { heart: 1, rocket: 1, total_count: 2 },
+        reactionDetails: undefined,
+      }],
     });
     const internals = hub as unknown as HubInternals;
     await internals.publishEvent(
@@ -1662,7 +1671,7 @@ describe("native monitor feed", () => {
       watch,
       event("event-reaction-fallback", unknownIncoming, {
         deliveryId: "delivery-reaction-fallback",
-        changes: ["reactions"],
+        changes: ["comments"],
       }),
       { snapshot: unknownIncoming },
     );
@@ -1671,7 +1680,7 @@ describe("native monitor feed", () => {
       watchStorageKey(userId, repository, number),
     );
     expect(stored.events).toEqual([]);
-    expect(stored.snapshot?.bodyReactionDetails).toEqual(storedSnapshot.bodyReactionDetails);
+    expect(stored.snapshot?.comments[0].reactionDetails).toEqual(reactedComment.reactionDetails);
   });
 
   it("writes nothing when a polled refresh finds no snapshot change", async () => {

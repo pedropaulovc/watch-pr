@@ -2514,7 +2514,7 @@ export class WatchPrHub {
             recomputedChanges = true;
           }
         }
-        if (recomputedChanges && event.changes.includes("reactions") && changes.length === 0) return;
+        if (recomputedChanges && event.changes.length > 0 && changes.length === 0) return;
         if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
         const details = snapshot
           ? monitorEventDetails(current.snapshot, snapshot, event)
