@@ -30,6 +30,7 @@ const snapshot = (overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnap
   author: "author",
   fetchedAt: "2026-09-03T00:00:00.000Z",
   bodyReactions: {},
+  bodyReactionDetails: [],
   comments: [],
   reviews: [],
   reviewComments: [],
@@ -294,6 +295,7 @@ describe("watch-pr event contracts", () => {
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: {},
+      reactionDetails: [],
       path: "src/retry.ts",
       line: 9,
     };
@@ -330,6 +332,7 @@ describe("watch-pr event contracts", () => {
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: {},
+      reactionDetails: [],
     };
     const review = {
       id: 31,
@@ -373,6 +376,7 @@ describe("watch-pr event contracts", () => {
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: {},
+      reactionDetails: [],
       path: "src/retry.ts",
       line: id,
     }));
@@ -435,6 +439,7 @@ describe("watch-pr event contracts", () => {
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: {},
+      reactionDetails: [],
     }));
     const details = monitorEventDetails(snapshot(), snapshot({ comments }));
 
@@ -480,6 +485,7 @@ describe("watch-pr event contracts", () => {
       createdAt: "2026-09-18T12:00:00.000Z",
       updatedAt: "2026-09-18T12:00:00.000Z",
       reactions: {},
+      reactionDetails: [],
       htmlUrl: `https://github.com/owner/repo/pull/7#issuecomment-${index + 1}`,
     }));
     const newComment = {
@@ -489,6 +495,7 @@ describe("watch-pr event contracts", () => {
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: {},
+      reactionDetails: [],
       htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
     };
 
@@ -508,6 +515,7 @@ describe("watch-pr event contracts", () => {
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: {},
+      reactionDetails: [],
       path: "src/retry.ts",
       line: 44,
       startLine: 42,
@@ -521,6 +529,103 @@ describe("watch-pr event contracts", () => {
     expect(monitorEventDetails(snapshot(), after)).toEqual([
       "active comments: +1, now 1",
       "feedback [PRRT_thread] #21 src/retry.ts:42-44 @reviewer https://github.com/owner/repo/pull/7#discussion_r21: This retry can race the cancellation path.",
+    ]);
+  });
+
+  it("attributes reactions added to and removed from the PR body, comments, and inline feedback", () => {
+    const comment = {
+      id: 21,
+      author: "bob",
+      body: "Top-level note",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      reactionDetails: [],
+      htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
+    };
+    const reviewComment = {
+      ...comment,
+      id: 41,
+      author: "carol",
+      path: "src/retry.ts",
+      line: 12,
+      htmlUrl: "https://github.com/owner/repo/pull/7#discussion_r41",
+    };
+    const before = snapshot({ comments: [comment], reviewComments: [reviewComment] });
+    const after = snapshot({
+      bodyReactions: { "+1": 1, total_count: 1 },
+      bodyReactionDetails: [{ id: 900, content: "+1", author: "alice", createdAt: "2026-09-19T12:05:00.000Z" }],
+      comments: [{
+        ...comment,
+        reactions: { heart: 1, total_count: 1 },
+        reactionDetails: [{ id: 901, content: "heart", author: "alice", createdAt: "2026-09-19T12:06:00.000Z" }],
+      }],
+      reviewComments: [{
+        ...reviewComment,
+        reactions: { eyes: 1, total_count: 1 },
+        reactionDetails: [{ id: 902, content: "eyes", author: "dave", createdAt: "2026-09-19T12:07:00.000Z" }],
+      }],
+    });
+
+    expect(monitorEventDetails(before, after)).toEqual([
+      "reaction created: @alice THUMBS_UP on PR #7 @author https://github.com/owner/repo/pull/7",
+      "reaction created: @alice HEART on comment #21 @bob https://github.com/owner/repo/pull/7#issuecomment-21",
+      "reaction created: @dave EYES on feedback #41 @carol https://github.com/owner/repo/pull/7#discussion_r41",
+    ]);
+    expect(monitorEventDetails(after, before)).toEqual([
+      "reaction deleted: @alice THUMBS_UP from PR #7 @author https://github.com/owner/repo/pull/7",
+      "reaction deleted: @alice HEART from comment #21 @bob https://github.com/owner/repo/pull/7#issuecomment-21",
+      "reaction deleted: @dave EYES from feedback #41 @carol https://github.com/owner/repo/pull/7#discussion_r41",
+    ]);
+    expect(snapshotChanges(before, after)).toEqual(["comments", "review_comments", "reactions"]);
+  });
+
+  it("suppresses reaction history only for reconciliation, not for targets new to a watch", () => {
+    const reacted = {
+      id: 21,
+      author: "bob",
+      body: "Top-level note",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: { rocket: 1, total_count: 1 },
+      reactionDetails: [{ id: 903, content: "rocket", author: "alice", createdAt: "2026-09-19T12:08:00.000Z" }],
+      htmlUrl: "https://github.com/owner/repo/pull/7#issuecomment-21",
+    };
+    const current = snapshot({
+      bodyReactions: { hooray: 1, total_count: 1 },
+      bodyReactionDetails: [{ id: 904, content: "hooray", author: "alice", createdAt: "2026-09-19T12:09:00.000Z" }],
+      comments: [reacted],
+    });
+
+    expect(monitorReconciliationDetails(current).some((line) => line.startsWith("reaction"))).toBe(false);
+    expect(monitorEventDetails(null, current).some((line) => line.startsWith("reaction"))).toBe(false);
+    // Within an ongoing watch the comment and the reaction it already carries are both news.
+    expect(monitorEventDetails(snapshot(), current)).toEqual([
+      "comment #21 @bob https://github.com/owner/repo/pull/7#issuecomment-21: Top-level note",
+      "reaction created: @alice HOORAY on PR #7 @author https://github.com/owner/repo/pull/7",
+      "reaction created: @alice ROCKET on comment #21 @bob https://github.com/owner/repo/pull/7#issuecomment-21",
+    ]);
+    // A target that disappeared is reported by its own deletion line, not by its reactions.
+    expect(monitorEventDetails(current, snapshot())).toEqual([
+      "comment #21 deleted",
+      "reaction deleted: @alice HOORAY from PR #7 @author https://github.com/owner/repo/pull/7",
+    ]);
+  });
+
+  it("reports a reaction swap on one target as a removal and an addition", () => {
+    const laugh = { id: 905, content: "laugh", author: "alice", createdAt: "2026-09-19T12:10:00.000Z" };
+    const before = snapshot({
+      bodyReactions: { laugh: 1, total_count: 1 },
+      bodyReactionDetails: [laugh],
+    });
+    const after = snapshot({
+      bodyReactions: { confused: 1, total_count: 1 },
+      bodyReactionDetails: [{ id: 906, content: "confused", author: "erin", createdAt: "2026-09-19T12:11:00.000Z" }],
+    });
+
+    expect(monitorEventDetails(before, after)).toEqual([
+      "reaction created: @erin CONFUSED on PR #7 @author https://github.com/owner/repo/pull/7",
+      "reaction deleted: @alice LAUGH from PR #7 @author https://github.com/owner/repo/pull/7",
     ]);
   });
 

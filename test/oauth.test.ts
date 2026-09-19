@@ -145,6 +145,7 @@ function pullRequestSnapshot(body: string, fetchedAt: string): PullRequestSnapsh
     author: "owner",
     fetchedAt,
     bodyReactions: {},
+    bodyReactionDetails: [],
     comments: [],
     reviews: [],
     reviewComments: [],

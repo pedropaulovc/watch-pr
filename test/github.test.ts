@@ -10,9 +10,11 @@ afterEach(() => {
 
 describe("GitHub API adapter", () => {
   it("normalizes pull state, comments, reviews, checks, reactions, and threads", async () => {
+    const requested: string[] = [];
     let graphqlCalls = 0;
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      requested.push(url);
       if (url.endsWith("/pulls/7")) {
         return Response.json({
           number: 7,
@@ -31,7 +33,21 @@ describe("GitHub API adapter", () => {
         });
       }
       if (url.endsWith("/issues/7") && !url.includes("comments")) return Response.json({ reactions: { eyes: 2, total_count: 2 } });
-      if (url.endsWith("/issues/7/comments?per_page=100")) return Response.json([{ id: 1, user: { login: "reviewer" }, body: "top-level", reactions: { "+1": 1 }, created_at: "now", updated_at: "now" }]);
+      if (url.endsWith("/issues/7/comments?per_page=100")) {
+        return Response.json([
+          { id: 1, user: { login: "reviewer" }, body: "top-level", reactions: { "+1": 1 }, created_at: "now", updated_at: "now" },
+          { id: 2, user: { login: "reviewer" }, body: "quiet", reactions: { total_count: 0 }, created_at: "now", updated_at: "now" },
+        ]);
+      }
+      if (url.endsWith("/issues/7/reactions?per_page=100")) {
+        return Response.json([{ id: 900, content: "eyes", user: { login: "alice" }, created_at: "2026-09-19T12:00:00.000Z" }]);
+      }
+      if (url.endsWith("/issues/comments/1/reactions?per_page=100")) {
+        return Response.json([{ id: 901, content: "+1", user: { login: "bob" }, created_at: "2026-09-19T12:01:00.000Z" }]);
+      }
+      if (url.endsWith("/pulls/comments/3/reactions?per_page=100")) {
+        return Response.json([{ id: 902, content: "heart", user: { login: "carol" }, created_at: "2026-09-19T12:02:00.000Z" }]);
+      }
       if (url.endsWith("/pulls/7/reviews?per_page=100")) return Response.json([{ id: 2, user: { login: "reviewer" }, state: "APPROVED", body: "looks good", submitted_at: "now" }]);
       if (url.endsWith("/pulls/7/comments?per_page=100")) return Response.json([{ id: 3, user: { login: "reviewer" }, body: "inline", path: "src/index.ts", line: 4, diff_hunk: "@@", reactions: { heart: 1 }, created_at: "now", updated_at: "now" }]);
       if (url.endsWith("/commits/abc/check-runs?per_page=100")) {
@@ -64,9 +80,21 @@ describe("GitHub API adapter", () => {
     expect(result.mergeableState).toBe("dirty");
     expect(result.headRepository).toBe("fork/repo");
     expect(result.bodyReactions).toEqual({ eyes: 2, total_count: 2 });
+    expect(result.bodyReactionDetails).toEqual([
+      { id: 900, content: "eyes", author: "alice", createdAt: "2026-09-19T12:00:00.000Z" },
+    ]);
     expect(result.comments[0]).toMatchObject({ id: 1, author: "reviewer", reactions: { "+1": 1 } });
+    expect(result.comments[0].reactionDetails).toEqual([
+      { id: 901, content: "+1", author: "bob", createdAt: "2026-09-19T12:01:00.000Z" },
+    ]);
+    // A target whose summary count is zero is never read individually.
+    expect(result.comments[1].reactionDetails).toEqual([]);
+    expect(requested.some((url) => url.includes("/issues/comments/2/reactions"))).toBe(false);
     expect(result.reviews[0]).toMatchObject({ state: "APPROVED", author: "reviewer" });
     expect(result.reviewComments[0]).toMatchObject({ path: "src/index.ts", reactions: { heart: 1 } });
+    expect(result.reviewComments[0].reactionDetails).toEqual([
+      { id: 902, content: "heart", author: "carol", createdAt: "2026-09-19T12:02:00.000Z" },
+    ]);
     expect(result.checks[0]).toMatchObject({ name: "CI", conclusion: "failure", kind: "check_run" });
     expect(result.checks.filter((check) => check.kind === "commit_status")).toEqual([
       expect.objectContaining({ id: 10, name: "buildkite/build", conclusion: "success" }),
@@ -76,6 +104,78 @@ describe("GitHub API adapter", () => {
       { id: "thread-1", isResolved: false, commentIds: [8] },
       { id: "thread-2", isResolved: true, commentIds: [9] },
     ]);
+  });
+
+  it("caps every reaction read of one snapshot under a single concurrency budget", async () => {
+    const comment = (id: number, path?: string) => ({
+      id,
+      user: { login: "reviewer" },
+      body: `comment ${id}`,
+      reactions: { heart: 1, total_count: 1 },
+      created_at: "now",
+      updated_at: "now",
+      ...(path ? { path, line: 1, diff_hunk: "@@" } : {}),
+    });
+    // Every reaction response is held open until the test releases it, so the peak is the
+    // real concurrency the adapter asked for rather than a timing artifact.
+    const pending: (() => void)[] = [];
+    let peakInFlight = 0;
+    let reactionRequests = 0;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (!url.includes("/reactions")) {
+        if (url.endsWith("/pulls/7")) {
+          return Response.json({
+            number: 7,
+            html_url: "https://github.com/owner/repo/pull/7",
+            state: "open",
+            user: { login: "author" },
+            head: { ref: "feature", sha: null },
+            base: { ref: "main" },
+          });
+        }
+        if (url.endsWith("/issues/7")) return Response.json({ reactions: { eyes: 3, total_count: 3 } });
+        if (url.endsWith("/issues/7/comments?per_page=100")) {
+          return Response.json(Array.from({ length: 9 }, (_, index) => comment(index + 1)));
+        }
+        if (url.endsWith("/pulls/7/comments?per_page=100")) {
+          return Response.json(Array.from({ length: 9 }, (_, index) => comment(index + 100, "src/index.ts")));
+        }
+        if (url.endsWith("/pulls/7/reviews?per_page=100")) return Response.json([]);
+        if (url.endsWith("/graphql")) {
+          return Response.json({ data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } });
+        }
+        throw new Error(`unexpected GitHub URL ${url}`);
+      }
+
+      reactionRequests += 1;
+      const reactionId = 900 + reactionRequests;
+      // The project targets ES2022, which has no Promise.withResolvers.
+      let release = () => {};
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      pending.push(release);
+      await held;
+      return Response.json([{ id: reactionId, content: "heart", user: { login: "alice" }, created_at: "now" }]);
+    });
+
+    let settled = false;
+    const snapshot = pullRequestSnapshot("token", "owner/repo", 7)
+      .finally(() => { settled = true; });
+    for (let round = 0; !settled; round += 1) {
+      if (round > 100) throw new Error("snapshot never settled");
+      // Drain microtasks so every request this wave will start has registered.
+      for (let drain = 0; drain < 50; drain += 1) await Promise.resolve();
+      peakInFlight = Math.max(peakInFlight, pending.length);
+      for (const release of pending.splice(0, pending.length)) release();
+    }
+
+    const result = await snapshot;
+    // Body plus eighteen reacted comments, all sharing one budget rather than one per group.
+    expect(reactionRequests).toBe(19);
+    expect(peakInFlight).toBe(8);
+    expect(result.bodyReactionDetails).toHaveLength(1);
+    expect(result.comments.every((entry) => entry.reactionDetails.length === 1)).toBe(true);
+    expect(result.reviewComments.every((entry) => entry.reactionDetails.length === 1)).toBe(true);
   });
 
   it("reads the authenticated GitHub user profile", async () => {

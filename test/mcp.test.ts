@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "../src/mcp";
+import { snapshotReactions } from "../src/events";
 import {
   openWatchStateMutation,
   readStoredWatchState,
   writeStoredWatchState,
   type WatchStorage,
 } from "../src/hub";
-import type { PullRequestSnapshot, StoredWatchState, WatchEvent } from "../src/types";
+import type { PullRequestComment, PullRequestSnapshot, StoredWatchState, WatchEvent } from "../src/types";
 import { watchStorageKey } from "../src/types";
 
 function memoryStorage(): WatchStorage {
@@ -52,6 +53,7 @@ const snapshot: PullRequestSnapshot = {
   author: "author",
   fetchedAt: "2026-09-05T00:00:00.000Z",
   bodyReactions: { eyes: 2, total_count: 2 },
+  bodyReactionDetails: [{ id: 900, content: "eyes", author: "alice", createdAt: "2026-09-05T00:00:00.000Z" }],
   comments: [{
     id: 1,
     author: "reviewer",
@@ -59,6 +61,10 @@ const snapshot: PullRequestSnapshot = {
     createdAt: "2026-09-05T00:00:00.000Z",
     updatedAt: "2026-09-05T00:00:00.000Z",
     reactions: { "+1": 1 },
+    reactionDetails: [
+      { id: 901, content: "+1", author: "pedropaulovc", createdAt: "2026-09-05T00:00:00.000Z" },
+      { id: 903, content: "rocket", author: "dave", createdAt: "2026-09-05T00:01:00.000Z" },
+    ],
   }],
   reviews: [{
     id: 2,
@@ -74,6 +80,7 @@ const snapshot: PullRequestSnapshot = {
     createdAt: "2026-09-05T00:00:00.000Z",
     updatedAt: "2026-09-05T00:00:00.000Z",
     reactions: { heart: 1 },
+    reactionDetails: [{ id: 902, content: "heart", author: "carol", createdAt: "2026-09-05T00:00:00.000Z" }],
     path: "src/index.ts",
     line: 4,
   }],
@@ -215,8 +222,11 @@ describe("MCP output modes", () => {
     expect(brief).toContain("review reviewer: APPROVED @2026-09-05T00:00:00.000Z");
     expect(brief).toContain("comments: 1");
     expect(brief).toContain("review-comments: 1");
-    expect(brief).toContain("reaction EYES: 2");
-    expect(brief).toContain("comment-reaction THUMBS_UP: 1");
+    expect(brief).toContain("reaction @alice EYES on PR #7 @author https://github.com/owner/repo/pull/7");
+    expect(brief).toContain("reaction @dave ROCKET on comment #1 @reviewer");
+    expect(brief).toContain("reaction @carol HEART on feedback #3 @reviewer");
+    // The authenticated account's own reaction is its own activity, not a notification.
+    expect(brief).not.toContain("@pedropaulovc");
     expect(brief).toContain("feedback [thread-1] src/index.ts:4 @reviewer inline feedback");
     expect(brief).not.toContain('"snapshot"');
 
@@ -283,5 +293,36 @@ describe("MCP output modes", () => {
       number: 7,
       events: [{ ...predecessor, snapshot: null }, appended],
     });
+  });
+
+  it("reads snapshots persisted before attributed reactions as empty reaction lists", async () => {
+    const storage = memoryStorage();
+    const storageKey = watchStorageKey(42, "owner/repo", 7);
+    // A predecessor record has no reaction-detail keys at all, not keys set to undefined.
+    const withoutDetails = ({ reactionDetails, ...comment }: PullRequestComment) => comment;
+    const { bodyReactionDetails, ...body } = snapshot;
+    const legacySnapshot = {
+      ...body,
+      comments: snapshot.comments.map(withoutDetails),
+      reviewComments: snapshot.reviewComments.map(withoutDetails),
+    } as unknown as PullRequestSnapshot;
+    const legacyEvent: WatchEvent = { ...event, snapshot: legacySnapshot };
+    await writeStoredWatchState(storage, storageKey, { snapshot: legacySnapshot, events: [legacyEvent] });
+
+    const stored = await readStoredWatchState(storage, storageKey);
+    expect(stored.snapshot?.bodyReactionDetails).toEqual([]);
+    expect(stored.snapshot?.comments[0].reactionDetails).toEqual([]);
+    expect(stored.snapshot?.reviewComments[0].reactionDetails).toEqual([]);
+    expect(stored.events[0].snapshot?.bodyReactionDetails).toEqual([]);
+    // Reaction-free legacy state stays a no-op for the delta: nothing was added or removed.
+    expect(snapshotReactions(stored.snapshot as PullRequestSnapshot)).toEqual([]);
+
+    const brief = await callTool(
+      "get_pr",
+      { repository: "owner/repo", number: 7 },
+      snapshot,
+      { ...context(), readWatch: async () => readStoredWatchState(storage, storageKey) },
+    );
+    expect(brief).not.toContain("reaction @");
   });
 });

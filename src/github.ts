@@ -2,6 +2,7 @@ import type {
   GithubUser,
   PullRequestCheck,
   PullRequestComment,
+  PullRequestReaction,
   PullRequestReview,
   PullRequestSnapshot,
   PullRequestThread,
@@ -11,6 +12,8 @@ import { normalizeRepository } from "./events";
 
 const API_ROOT = "https://api.github.com";
 const API_VERSION = "2022-11-28";
+/** Individual reactions are read per target, so a wide PR cannot open one request per comment. */
+const REACTION_CONCURRENCY = 8;
 
 type GithubRecord = Record<string, unknown>;
 
@@ -130,6 +133,93 @@ function reactionCounts(value: unknown): ReactionCounts {
   return result;
 }
 
+/**
+ * Reaction totals decide whether a target is worth a request at all: the summary GitHub
+ * already returned with the comment is authoritative for "has no reactions".
+ */
+function reactionTotal(counts: ReactionCounts): number {
+  const total = counts.total_count;
+  if (typeof total === "number") return total;
+  let sum = 0;
+  for (const [content, count] of Object.entries(counts)) {
+    if (content !== "total_count" && typeof count === "number" && count > 0) sum += count;
+  }
+  return sum;
+}
+
+function normalizeReaction(record: GithubRecord): PullRequestReaction {
+  return {
+    id: numberValue(record, "id"),
+    content: stringValue(record, "content") ?? "",
+    author: userLogin(record),
+    createdAt: stringValue(record, "created_at"),
+  };
+}
+
+async function mapBounded<T, R>(
+  values: readonly T[],
+  limit: number,
+  map: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, async () => {
+    while (cursor < values.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await map(values[index]);
+    }
+  }));
+  return results;
+}
+
+async function reactionRecords(token: string, path: string): Promise<PullRequestReaction[]> {
+  const records = await githubPaginated<unknown>(token, path);
+  return records
+    .filter((record): record is GithubRecord => Boolean(record && typeof record === "object"))
+    .map(normalizeReaction)
+    .filter((reaction) => reaction.id > 0 && reaction.content !== "");
+}
+
+interface SnapshotReactions {
+  bodyReactionDetails: PullRequestReaction[];
+  comments: PullRequestComment[];
+  reviewComments: PullRequestComment[];
+}
+
+/**
+ * One wave for the whole snapshot: every reacted target across the PR body, top-level
+ * comments, and inline review comments shares a single `REACTION_CONCURRENCY` budget.
+ * Targets whose summary count is zero never enter the wave, so they cost no request.
+ */
+async function snapshotReactions(
+  token: string,
+  repository: string,
+  number: number,
+  bodyReactions: ReactionCounts,
+  comments: PullRequestComment[],
+  reviewComments: PullRequestComment[],
+): Promise<SnapshotReactions> {
+  const paths: string[] = [];
+  const requestIndex = (counts: ReactionCounts, path: string): number =>
+    (reactionTotal(counts) > 0 ? paths.push(path) - 1 : -1);
+  const bodyIndex = requestIndex(bodyReactions, `/repos/${repository}/issues/${number}/reactions`);
+  const commentIndexes = comments.map((comment) =>
+    requestIndex(comment.reactions, `/repos/${repository}/issues/comments/${comment.id}/reactions`));
+  const reviewCommentIndexes = reviewComments.map((comment) =>
+    requestIndex(comment.reactions, `/repos/${repository}/pulls/comments/${comment.id}/reactions`));
+  if (paths.length === 0) return { bodyReactionDetails: [], comments, reviewComments };
+
+  const details = await mapBounded(paths, REACTION_CONCURRENCY, (path) => reactionRecords(token, path));
+  const attach = (comment: PullRequestComment, index: number): PullRequestComment =>
+    (index < 0 ? comment : { ...comment, reactionDetails: details[index] });
+  return {
+    bodyReactionDetails: bodyIndex < 0 ? [] : details[bodyIndex],
+    comments: comments.map((comment, position) => attach(comment, commentIndexes[position])),
+    reviewComments: reviewComments.map((comment, position) => attach(comment, reviewCommentIndexes[position])),
+  };
+}
+
 function normalizeComment(record: GithubRecord): PullRequestComment {
   return {
     id: numberValue(record, "id"),
@@ -138,6 +228,7 @@ function normalizeComment(record: GithubRecord): PullRequestComment {
     createdAt: stringValue(record, "created_at"),
     updatedAt: stringValue(record, "updated_at"),
     reactions: reactionCounts(record.reactions),
+    reactionDetails: [],
     path: stringValue(record, "path") ?? undefined,
     line: typeof record.line === "number" ? record.line : null,
     startLine: typeof record.start_line === "number" ? record.start_line : null,
@@ -350,6 +441,17 @@ export async function pullRequestSnapshot(
     reviewThreads(token, repository, number),
   ]);
 
+  // Individual reactions need the comment IDs from the first wave.
+  const bodyReactions = reactionCounts(issue.reactions);
+  const reactions = await snapshotReactions(
+    token,
+    repository,
+    number,
+    bodyReactions,
+    comments.map(normalizeComment),
+    reviewComments.map(normalizeComment),
+  );
+
   return {
     repository,
     number,
@@ -368,10 +470,11 @@ export async function pullRequestSnapshot(
     headSha,
     author: userLogin(pull, "user"),
     fetchedAt: new Date().toISOString(),
-    bodyReactions: reactionCounts(issue.reactions),
-    comments: comments.map(normalizeComment),
+    bodyReactions,
+    bodyReactionDetails: reactions.bodyReactionDetails,
+    comments: reactions.comments,
     reviews: reviews.map(normalizeReview),
-    reviewComments: reviewComments.map(normalizeComment),
+    reviewComments: reactions.reviewComments,
     checks: [
       ...checkRuns
         .filter((check): check is GithubRecord => Boolean(check && typeof check === "object"))

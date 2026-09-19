@@ -1,6 +1,7 @@
 import type {
   PullRequestCheck,
   PullRequestComment,
+  PullRequestReaction,
   PullRequestReview,
   PullRequestSnapshot,
   WatchEvent,
@@ -271,7 +272,10 @@ export function snapshotChanges(
   if (JSON.stringify(previous.reviews) !== JSON.stringify(current.reviews)) changes.push("reviews");
   if (JSON.stringify(previous.reviewComments) !== JSON.stringify(current.reviewComments)) changes.push("review_comments");
   if (JSON.stringify(previous.checks) !== JSON.stringify(current.checks)) changes.push("checks");
-  if (JSON.stringify(previous.bodyReactions) !== JSON.stringify(current.bodyReactions)) changes.push("reactions");
+  if (
+    JSON.stringify(previous.bodyReactions) !== JSON.stringify(current.bodyReactions) ||
+    JSON.stringify(previous.bodyReactionDetails) !== JSON.stringify(current.bodyReactionDetails)
+  ) changes.push("reactions");
   if (JSON.stringify(previous.threads) !== JSON.stringify(current.threads)) changes.push("review_threads");
   return changes;
 }
@@ -481,6 +485,133 @@ function threadDetails(previous: PullRequestSnapshot, current: PullRequestSnapsh
   });
 }
 
+const REACTION_DISPLAY_NAMES: Record<string, string> = {
+  "+1": "THUMBS_UP",
+  "-1": "THUMBS_DOWN",
+  confused: "CONFUSED",
+  eyes: "EYES",
+  heart: "HEART",
+  hooray: "HOORAY",
+  laugh: "LAUGH",
+  rocket: "ROCKET",
+};
+
+function reactionContentName(content: string): string {
+  return REACTION_DISPLAY_NAMES[content] ?? content.toUpperCase();
+}
+
+/** Identity of whatever a reaction is attached to, so a line never needs the snapshot again. */
+export interface ReactionTarget {
+  /** Target type plus its ID where GitHub has one, for example `comment #123`. */
+  label: string;
+  author: string | null;
+  url?: string;
+}
+
+export interface AttributedReaction {
+  reaction: PullRequestReaction;
+  target: ReactionTarget;
+}
+
+function commentReactionTarget(comment: PullRequestComment, kind: "comment" | "feedback"): ReactionTarget {
+  return { label: `${kind} #${comment.id}`, author: comment.author, url: comment.htmlUrl };
+}
+
+interface ReactionGroup {
+  target: ReactionTarget;
+  reactions: PullRequestReaction[];
+}
+
+/** Every reaction target the snapshot knows, including the ones carrying no reactions. */
+function reactionGroups(snapshot: PullRequestSnapshot): Map<string, ReactionGroup> {
+  const groups = new Map<string, ReactionGroup>();
+  const pullRequest: ReactionTarget = {
+    label: `PR #${snapshot.number}`,
+    author: snapshot.author,
+    url: snapshot.url,
+  };
+  groups.set(pullRequest.label, { target: pullRequest, reactions: snapshot.bodyReactionDetails });
+  for (const comment of snapshot.comments) {
+    const target = commentReactionTarget(comment, "comment");
+    groups.set(target.label, { target, reactions: comment.reactionDetails });
+  }
+  for (const comment of snapshot.reviewComments) {
+    const target = commentReactionTarget(comment, "feedback");
+    groups.set(target.label, { target, reactions: comment.reactionDetails });
+  }
+  return groups;
+}
+
+export function snapshotReactions(snapshot: PullRequestSnapshot): AttributedReaction[] {
+  return [...reactionGroups(snapshot).values()]
+    .flatMap(({ target, reactions }) => reactions.map((reaction) => ({ reaction, target })));
+}
+
+function reactionTargetDescription(target: ReactionTarget): string {
+  return `${target.label} @${target.author ?? "unknown"}${target.url ? ` ${target.url}` : ""}`;
+}
+
+/** Current-state line: who reacted with what, and to whose content. */
+export function reactionStateLine(entry: AttributedReaction): string {
+  return `reaction @${entry.reaction.author ?? "unknown"} ${reactionContentName(entry.reaction.content)} on ${reactionTargetDescription(entry.target)}`;
+}
+
+function reactionChangeLine(
+  action: "created" | "deleted",
+  reaction: PullRequestReaction,
+  target: ReactionTarget,
+): string {
+  const preposition = action === "created" ? "on" : "from";
+  return `reaction ${action}: @${reaction.author ?? "unknown"} ${reactionContentName(reaction.content)} ${preposition} ${reactionTargetDescription(target)}`;
+}
+
+function reactionIdentity(reaction: PullRequestReaction): string {
+  return `${reaction.content}\u0000${reaction.author ?? ""}`;
+}
+
+function reactionTargetDetails(
+  previous: PullRequestReaction[],
+  current: PullRequestReaction[],
+  target: ReactionTarget,
+): string[] {
+  const previousById = new Map(previous.map((reaction) => [reaction.id, reaction]));
+  const currentById = new Map(current.map((reaction) => [reaction.id, reaction]));
+  return [
+    ...current
+      .filter((reaction) => {
+        const prior = previousById.get(reaction.id);
+        return !prior || reactionIdentity(prior) !== reactionIdentity(reaction);
+      })
+      .map((reaction) => reactionChangeLine("created", reaction, target)),
+    ...previous
+      .filter((reaction) => {
+        const next = currentById.get(reaction.id);
+        return !next || reactionIdentity(next) !== reactionIdentity(reaction);
+      })
+      .map((reaction) => reactionChangeLine("deleted", reaction, target)),
+  ];
+}
+
+/**
+ * Within an ongoing watch every reaction the current snapshot carries is news, including
+ * the ones on a target this refresh reveals for the first time. Only the initial
+ * reconciliation suppresses reaction history, and it never reaches here: `monitorEventDetails`
+ * routes a null predecessor to `monitorReconciliationDetails`. A target that disappeared is
+ * reported by its own deletion line, so its reactions are not repeated here.
+ */
+function reactionDetails(previous: PullRequestSnapshot, current: PullRequestSnapshot): string[] {
+  const previousGroups = reactionGroups(previous);
+  const lines: string[] = [];
+  for (const [label, group] of reactionGroups(current)) {
+    lines.push(...reactionTargetDetails(
+      previousGroups.get(label)?.reactions ?? [],
+      group.reactions,
+      group.target,
+    ));
+  }
+  return lines;
+}
+
 function activeReviewComments(snapshot: PullRequestSnapshot): PullRequestComment[] {
   if (snapshot.threads.length === 0) return snapshot.reviewComments;
   const knownThreadCommentIds = new Set(
@@ -570,6 +701,7 @@ export function monitorEventDetails(
         return `feedback [${thread?.id ?? "-"}] #${comment.id} deleted`;
       }),
     ...threadDetails(previous, current),
+    ...reactionDetails(previous, current),
   ];
   if (previous.state !== current.state || previous.draft !== current.draft) {
     lines.unshift(`PR state: ${current.state.toUpperCase()}${current.draft ? " DRAFT" : ""}`);

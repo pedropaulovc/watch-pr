@@ -25,6 +25,7 @@ import type {
   PrMonitorRegistration,
   PullRequestCheck,
   PullRequestComment,
+  PullRequestReaction,
   PullRequestReview,
   PullRequestSnapshot,
   PullRequestThread,
@@ -260,10 +261,35 @@ function emptyWatchState(): StoredWatchState {
   return { snapshot: null, events: [] };
 }
 
-/** Adds the fork-routing field introduced after predecessor records already existed. */
+/**
+ * The one read boundary that repairs persisted snapshots written before a field existed:
+ * fork routing, and the per-reaction detail arrays that replaced aggregate-only reactions.
+ * Every stored snapshot reaches a caller through here, so nothing downstream re-checks.
+ */
 function normalizePullRequestSnapshot(snapshot: PullRequestSnapshot | null): PullRequestSnapshot | null {
-  if (snapshot === null || snapshot.headRepository !== undefined) return snapshot;
-  return { ...snapshot, headRepository: null };
+  if (snapshot === null) return snapshot;
+  const comments = normalizeCommentReactions(snapshot.comments);
+  const reviewComments = normalizeCommentReactions(snapshot.reviewComments);
+  if (
+    snapshot.headRepository !== undefined &&
+    snapshot.bodyReactionDetails !== undefined &&
+    comments === snapshot.comments &&
+    reviewComments === snapshot.reviewComments
+  ) return snapshot;
+  return {
+    ...snapshot,
+    headRepository: snapshot.headRepository ?? null,
+    bodyReactionDetails: snapshot.bodyReactionDetails ?? [],
+    comments,
+    reviewComments,
+  };
+}
+
+function normalizeCommentReactions(comments: PullRequestComment[]): PullRequestComment[] {
+  if (comments.every((comment) => comment.reactionDetails !== undefined)) return comments;
+  return comments.map((comment) => (
+    comment.reactionDetails === undefined ? { ...comment, reactionDetails: [] } : comment
+  ));
 }
 
 function normalizeStoredWatchState(state: StoredWatchState): StoredWatchState {
@@ -351,6 +377,19 @@ function isReactionCounts(value: unknown): value is ReactionCounts {
   return true;
 }
 
+function isPullRequestReaction(value: unknown): value is PullRequestReaction {
+  if (!isObjectRecord(value)) return false;
+  return Number.isSafeInteger(value.id) &&
+    typeof value.content === "string" &&
+    isNullableString(value.author) &&
+    isNullableString(value.createdAt);
+}
+
+/** Snapshots stored before attributed reactions omitted this persisted field. */
+function isOptionalReactionDetails(value: unknown): boolean {
+  return value === undefined || isArrayOf(value, isPullRequestReaction);
+}
+
 function isPullRequestComment(value: unknown): value is PullRequestComment {
   if (!isObjectRecord(value)) return false;
   return Number.isSafeInteger(value.id) &&
@@ -359,6 +398,7 @@ function isPullRequestComment(value: unknown): value is PullRequestComment {
     isNullableString(value.createdAt) &&
     isNullableString(value.updatedAt) &&
     isReactionCounts(value.reactions) &&
+    isOptionalReactionDetails(value.reactionDetails) &&
     isOptionalString(value, "path") &&
     isOptionalNullableSafeInteger(value, "line") &&
     isOptionalNullableSafeInteger(value, "startLine") &&
@@ -461,6 +501,7 @@ function isPullRequestSnapshot(value: unknown): value is PullRequestSnapshot {
     isNullableString(snapshot.author) &&
     typeof snapshot.fetchedAt === "string" &&
     isReactionCounts(snapshot.bodyReactions) &&
+    isOptionalReactionDetails(snapshot.bodyReactionDetails) &&
     isArrayOf(snapshot.comments, isPullRequestComment) &&
     isArrayOf(snapshot.reviews, isPullRequestReview) &&
     isArrayOf(snapshot.reviewComments, isPullRequestComment) &&

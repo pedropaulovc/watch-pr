@@ -83,6 +83,18 @@ export interface ReactionCounts {
   [name: string]: number | undefined;
 }
 
+/**
+ * One individual GitHub reaction. The stable `id` lets a refresh tell an added reaction
+ * from a removed one without relying on aggregate counts, which cannot attribute either.
+ */
+export interface PullRequestReaction {
+  id: number;
+  /** GitHub reaction content key, for example `+1` or `heart`. */
+  content: string;
+  author: string | null;
+  createdAt: string | null;
+}
+
 export interface PullRequestComment {
   id: number;
   author: string | null;
@@ -90,6 +102,7 @@ export interface PullRequestComment {
   createdAt: string | null;
   updatedAt: string | null;
   reactions: ReactionCounts;
+  reactionDetails: PullRequestReaction[];
   path?: string;
   line?: number | null;
   startLine?: number | null;
@@ -143,6 +156,7 @@ export interface PullRequestSnapshot {
   author: string | null;
   fetchedAt: string;
   bodyReactions: ReactionCounts;
+  bodyReactionDetails: PullRequestReaction[];
   comments: PullRequestComment[];
   reviews: PullRequestReview[];
   reviewComments: PullRequestComment[];

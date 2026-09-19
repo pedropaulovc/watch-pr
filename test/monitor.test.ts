@@ -111,6 +111,7 @@ function snapshot(overrides: Partial<PullRequestSnapshot> = {}): PullRequestSnap
     author: "author",
     fetchedAt: "2026-09-10T12:00:00.000Z",
     bodyReactions: {},
+    bodyReactionDetails: [],
     comments: [],
     reviews: [],
     reviewComments: [],

@@ -2,7 +2,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { ReadResourceRequestSchema, SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
-import { parseResourceUri, resourceUri, watchKey } from "./events";
+import { parseResourceUri, reactionStateLine, resourceUri, snapshotReactions, watchKey } from "./events";
 import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestComment, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
 
 export type McpOutputMode = "brief" | "full";
@@ -49,17 +49,6 @@ function textResult(value: unknown, mode: McpOutputMode, briefLines: string[]) {
   };
 }
 
-const reactionNames: Record<string, string> = {
-  "+1": "THUMBS_UP",
-  "-1": "THUMBS_DOWN",
-  eyes: "EYES",
-  laugh: "LAUGH",
-  hooray: "HOORAY",
-  confused: "CONFUSED",
-  heart: "HEART",
-  rocket: "ROCKET",
-};
-
 function checkBucket(check: PullRequestCheck): string {
   if (check.status?.toLowerCase() !== "completed") return "pending";
   switch (check.conclusion?.toLowerCase()) {
@@ -84,25 +73,6 @@ function checkLines(checks: PullRequestCheck[]): string[] {
     const completedAt = bucket === "pending" ? "" : check.completedAt ?? "";
     return `check ${check.name}: ${bucket}${completedAt ? ` @${completedAt}` : ""}`;
   });
-}
-
-function reactionLines(reactions: Record<string, number | undefined>, prefix: string): string[] {
-  return Object.entries(reactions)
-    .filter(([content, count]) => content !== "total_count" && typeof count === "number" && count > 0)
-    .map(([content, count]) => `${prefix} ${reactionNames[content] ?? content}: ${count}`);
-}
-
-function commentReactionLines(comments: PullRequestComment[]): string[] {
-  const counts = new Map<string, number>();
-  for (const comment of comments) {
-    for (const [content, count] of Object.entries(comment.reactions)) {
-      if (content === "total_count" || typeof count !== "number" || count <= 0) continue;
-      counts.set(content, (counts.get(content) ?? 0) + count);
-    }
-  }
-  return [...counts.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([content, count]) => `comment-reaction ${reactionNames[content] ?? content}: ${count}`);
 }
 
 function commentLocation(comment: PullRequestComment): string {
@@ -141,8 +111,10 @@ function briefSnapshotLines(snapshot: PullRequestSnapshot, login: string): strin
     `head: ${snapshot.headRefName}@${snapshot.headSha}`,
     `mergeable: ${mergeable}${mergeableState ? ` (${mergeableState})` : ""}`,
     ...checkLines(snapshot.checks),
-    ...reactionLines(snapshot.bodyReactions, "reaction"),
-    ...commentReactionLines(comments),
+    // Reactions the watcher left are their own activity; everyone else's is the signal.
+    ...snapshotReactions(snapshot)
+      .filter((entry) => entry.reaction.author !== login)
+      .map(reactionStateLine),
     ...reviews.map((review) => `review ${review.author ?? "unknown"}: ${review.state}${review.submittedAt ? ` @${review.submittedAt}` : ""}`),
     `reviews: ${reviews.length}`,
     `comments: ${comments.length}`,
