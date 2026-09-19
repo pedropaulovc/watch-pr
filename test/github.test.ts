@@ -144,7 +144,7 @@ describe("GitHub API adapter", () => {
     ]);
   });
 
-  it("caps every reaction read of one snapshot under a single concurrency budget", async () => {
+  it("caps concurrent and total reaction reads, then resumes unknown targets next refresh", async () => {
     const comment = (id: number, path?: string) => ({
       id,
       user: { login: "reviewer" },
@@ -174,10 +174,10 @@ describe("GitHub API adapter", () => {
         }
         if (url.endsWith("/issues/7")) return Response.json({ reactions: { heart: 1, total_count: 1 } });
         if (url.endsWith("/issues/7/comments?per_page=100")) {
-          return Response.json(Array.from({ length: 9 }, (_, index) => comment(index + 1)));
+          return Response.json(Array.from({ length: 40 }, (_, index) => comment(index + 1)));
         }
         if (url.endsWith("/pulls/7/comments?per_page=100")) {
-          return Response.json(Array.from({ length: 9 }, (_, index) => comment(index + 100, "src/index.ts")));
+          return Response.json(Array.from({ length: 40 }, (_, index) => comment(index + 100, "src/index.ts")));
         }
         if (url.endsWith("/pulls/7/reviews?per_page=100")) return Response.json([]);
         if (url.endsWith("/graphql")) {
@@ -208,12 +208,33 @@ describe("GitHub API adapter", () => {
     }
 
     const result = await snapshot;
-    // Body plus eighteen reacted comments, all sharing one budget rather than one per group.
-    expect(reactionRequests).toBe(19);
+    // Eight requests may run together and at most sixty-four pages are read in this refresh.
+    expect(reactionRequests).toBe(64);
     expect(peakInFlight).toBe(8);
-    expect(result.bodyReactionDetails).toHaveLength(1);
-    expect(result.comments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
-    expect(result.reviewComments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
+    const knownTargets = [
+      result.bodyReactionDetails,
+      ...result.comments.map((entry) => entry.reactionDetails),
+      ...result.reviewComments.map((entry) => entry.reactionDetails),
+    ];
+    expect(knownTargets.filter((details) => details !== undefined)).toHaveLength(64);
+
+    reactionRequests = 0;
+    peakInFlight = 0;
+    settled = false;
+    const resumedSnapshot = pullRequestSnapshot("token", "owner/repo", 7, result)
+      .finally(() => { settled = true; });
+    for (let round = 0; !settled; round += 1) {
+      if (round > 100) throw new Error("resumed snapshot never settled");
+      for (let drain = 0; drain < 50; drain += 1) await Promise.resolve();
+      peakInFlight = Math.max(peakInFlight, pending.length);
+      for (const release of pending.splice(0, pending.length)) release();
+    }
+    const resumed = await resumedSnapshot;
+    expect(reactionRequests).toBe(17);
+    expect(peakInFlight).toBe(8);
+    expect(resumed.bodyReactionDetails).toHaveLength(1);
+    expect(resumed.comments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
+    expect(resumed.reviewComments.every((entry) => entry.reactionDetails?.length === 1)).toBe(true);
   });
 
   it("reuses stored reaction details while the summary counts are unchanged", async () => {

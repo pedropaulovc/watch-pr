@@ -14,6 +14,13 @@ const API_ROOT = "https://api.github.com";
 const API_VERSION = "2022-11-28";
 /** Individual reactions are read per target, so a wide PR cannot open one request per comment. */
 const REACTION_CONCURRENCY = 8;
+/** Total paginated REST calls allowed for individual reaction details in one snapshot. */
+const REACTION_REQUEST_BUDGET = 64;
+
+interface RequestBudget {
+  remaining: number;
+}
+
 
 type GithubRecord = Record<string, unknown>;
 
@@ -59,11 +66,20 @@ export async function githubJson<T>(
   return JSON.parse(text) as T;
 }
 
-async function githubPaginated<T>(token: string, path: string, field?: string): Promise<T[]> {
+async function githubPaginated<T>(
+  token: string,
+  path: string,
+  field?: string,
+  budget?: RequestBudget,
+): Promise<T[]> {
   const values: T[] = [];
   let nextUrl: string | null = `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
 
   while (nextUrl) {
+    if (budget) {
+      if (budget.remaining === 0) throw new Error("GitHub reaction request budget exhausted");
+      budget.remaining -= 1;
+    }
     const response = await githubResponse(token, nextUrl);
     const text = await response.text();
     if (!response.ok) throw new GithubApiError(response.status, text, path);
@@ -192,7 +208,6 @@ function reactionDetailsMatchCounts(
   return byContent.size === 0;
 }
 
-
 async function mapBounded<T, R>(
   values: readonly T[],
   limit: number,
@@ -210,8 +225,12 @@ async function mapBounded<T, R>(
   return results;
 }
 
-async function reactionRecords(token: string, path: string): Promise<PullRequestReaction[]> {
-  const records = await githubPaginated<unknown>(token, path);
+async function reactionRecords(
+  token: string,
+  path: string,
+  budget: RequestBudget,
+): Promise<PullRequestReaction[]> {
+  const records = await githubPaginated<unknown>(token, path, undefined, budget);
   return records
     .filter((record): record is GithubRecord => Boolean(record && typeof record === "object"))
     .map(normalizeReaction)
@@ -289,10 +308,11 @@ async function snapshotReactions(
     previousReviewComments.get(comment.id),
   ));
 
+  const budget: RequestBudget = { remaining: REACTION_REQUEST_BUDGET };
   const states = await mapBounded(reads, REACTION_CONCURRENCY, async (read): Promise<ReactionState> => {
     try {
       const reactions = slots[read.slot].reactions;
-      const reactionDetails = await reactionRecords(token, read.path);
+      const reactionDetails = await reactionRecords(token, read.path, budget);
       if (!reactionDetailsMatchCounts(reactionDetails, reactions)) {
         throw new Error(`GitHub returned reaction details inconsistent with ${read.path}`);
       }
