@@ -489,6 +489,9 @@ function threadDetails(previous: PullRequestSnapshot, current: PullRequestSnapsh
 }
 
 export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): string[] {
+  const knownThreadCommentIds = new Set(
+    snapshot.threads.flatMap((thread) => thread.commentIds),
+  );
   const unresolvedCommentIds = new Set(
     snapshot.threads
       .filter((thread) => !thread.isResolved)
@@ -496,7 +499,8 @@ export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): str
   );
   const reviewComments = snapshot.threads.length === 0
     ? snapshot.reviewComments
-    : snapshot.reviewComments.filter((comment) => unresolvedCommentIds.has(comment.id));
+    : snapshot.reviewComments.filter((comment) =>
+      unresolvedCommentIds.has(comment.id) || !knownThreadCommentIds.has(comment.id));
   return boundedDetails([
     ...mergeabilityDetails(null, snapshot),
     ...reconciliationCheckDetails(snapshot.checks),

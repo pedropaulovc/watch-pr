@@ -296,15 +296,21 @@ describe("watch-pr event contracts", () => {
       path: "src/retry.ts",
       line: 9,
     };
+    const resolvedFeedback = { ...feedback, id: 23, body: "Already resolved." };
+    const unknownThreadFeedback = { ...feedback, id: 24, body: "Membership was truncated." };
 
     expect(monitorReconciliationDetails(snapshot({
       checks: [pending],
-      reviewComments: [feedback],
-      threads: [],
+      reviewComments: [feedback, resolvedFeedback, unknownThreadFeedback],
+      threads: [
+        { id: "thread-open", isResolved: false, commentIds: [22] },
+        { id: "thread-resolved", isResolved: true, commentIds: [23] },
+      ],
     }))).toEqual([
       "head: feature@abc",
       "checks: pending (CI)",
-      "feedback [-] #22 src/retry.ts:9 @reviewer: Please keep this visible.",
+      "feedback [thread-open] #22 src/retry.ts:9 @reviewer: Please keep this visible.",
+      "feedback [-] #24 src/retry.ts:9 @reviewer: Membership was truncated.",
     ]);
     expect(monitorReconciliationDetails(snapshot({
       checks: [{ ...pending, status: "completed", conclusion: "success" }],
