@@ -1,6 +1,6 @@
 # watch-pr
 
-`watch-pr` is a hosted MCP server for monitoring GitHub pull requests. Its Streamable HTTP endpoint is `https://watch-pr.vza.net/mcp`, on the `/mcp` route.
+`watch-pr` is a hosted MCP server for monitoring GitHub pull requests. Its Streamable HTTP endpoint is `https://watch-pr.vza.net/mcp`.
 
 The server combines GitHub App webhooks with a once-per-minute refresh. The refresh covers state without a dedicated webhook, including reactions, review-thread resolution, check rollups, and changes to `mergeable` and `mergeable_state`.
 
@@ -19,9 +19,9 @@ Authenticate with the OAuth 2.0 authorization-code flow advertised at `/.well-kn
 - `get_pr`: Read the latest durable pull request snapshot.
 - `list_pr_events`: Read up to 100 recent webhook and snapshot events.
 
-Tool outputs default to `mode: "brief"`. This mode returns newline-delimited lifecycle lines for PR state, head revision, mergeability, checks, reviews, comments, reactions, and feedback. Reaction lines identify the actor and target, for example: `reaction @actor THUMBS_UP on comment #123 @author https://...`.
+Tool outputs default to `mode: "brief"`. This mode returns newline-delimited lifecycle lines for PR state, head revision, mergeability, checks, reviews, comments, reactions, and feedback. Reaction lines cover every current reaction left by someone other than the authenticated account and identify the actor and target: `reaction @actor THUMBS_UP on comment #123 @author https://...`.
 
-The server matches the authenticated account by GitHub user ID, so renamed or recased logins still count as the account's own activity. A snapshot contributes at most 12 reaction lines and 1,000 reaction characters to a listing. Additional entries appear as `+N more reactions`; retained lines use stable sorted order. Pass `mode: "full"` to `get_pr` for the complete snapshot or to `list_pr_events` for event payloads. Resource reads always return full snapshots.
+Own activity is matched by GitHub user ID, so a renamed or recased login is still excluded. A snapshot contributes at most 12 reaction lines and 1,000 reaction characters to a listing. Lines are sorted and the first that fit are kept, so the listing is stable between refreshes. Additional entries appear as `+N more reactions`. Pass `mode: "full"` to `get_pr` for the complete snapshot or to `list_pr_events` for event payloads. Resource reads always return full snapshots.
 
 ## Resources
 
@@ -49,9 +49,11 @@ Snapshots include PR lifecycle and mergeability, base and head refs, checks and 
 - Request read-only access to repository metadata, pull requests, issues, checks, commit statuses, deployments, and merge queues.
 - Subscribe to `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `status`, `push`, `deployment`, `deployment_status`, `merge_group`, and `commit_comment`.
 
-The webhook handler verifies `X-Hub-Signature-256`. A manual GitHub redelivery can resume a partial fanout without duplicating completed watches. GitHub does not automatically redeliver a fanout failure that occurs after the handler returns `202`, so scheduled polling reconciles the snapshot. GitHub has no reaction-specific webhook; the scheduled refresh provides reaction parity.
+The webhook handler verifies `X-Hub-Signature-256`. Manual redelivery safely resumes partial fanout. Scheduled polling reconciles failures after GitHub accepts a delivery and supplies reaction updates, which have no dedicated webhook.
 
 ## Cloudflare environments
+
+The environment files pin both the account ID and Worker name:
 
 | Environment | Account | Worker | Config |
 |---|---|---|---|
@@ -62,9 +64,9 @@ Both Workers run a one-minute cron trigger. Production receives the GitHub webho
 
 ## Observability
 
-Production and PPE export invocation logs and automatic traces to Azure Monitor Application Insights through account-scoped Cloudflare Observability destinations. Native logs and traces use 100% head sampling, redact query strings, and are not persisted in Cloudflare. The telemetry gateway does not persist payloads or log raw payloads, bearer values, or Azure tokens.
+Production and PPE export invocation logs and automatic traces to Azure Monitor Application Insights through account-scoped Cloudflare Observability destinations. Native logs and traces use 100% head sampling, redact query strings, and are not persisted in Cloudflare. The destinations send OTLP to a dedicated gateway Worker, which does not persist payloads or log raw payloads, bearer values, or Azure tokens.
 
-The metrics endpoint returns `404` because the deployment exports logs and traces only. Cloudflare delivery to Azure may take several minutes. To verify production after a request such as `/health`, query both `OTelLogs` and `OTelSpans` over a multi-minute interval.
+The telemetry gateway returns `404` for `/v1/metrics` because the deployment exports logs and traces only. Cloudflare delivery to Azure may take several minutes. To verify production after a request such as `/health`, query both `OTelLogs` and `OTelSpans` over a multi-minute interval.
 
 ## Deployment
 
