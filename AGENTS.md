@@ -45,7 +45,7 @@ Each watch stores event history in versioned sidecar records:
 
 Appending an event writes immutable records instead of rewriting stored payloads. Compact unreferenced records are deleted in the append transaction. Webhook routing, polling, and registration lists read the index and current snapshot without loading event payloads. Monitor replay loads only the referenced payloads needed for event `details`.
 
-A watch created before sidecars keeps its single `watch:<user-id>:<repository>:<number>` record. The first append indexes those events by position without copying them. Once the 100-event window stops referencing the root, it is retired immediately when compact or through the cleanup queue when chunked.
+A watch created before sidecars keeps its single `watch:<user-id>:<repository>:<number>` record. The first append indexes those events by position without copying them. Once the 100-event window stops referencing the root, the root is retired immediately when compact or through the cleanup queue when chunked.
 
 When an existing session first resumes, its `watch:<repository>:<number>` records are copied to `watch:<user-id>:<repository>:<number>` using the session's GitHub user ID. Legacy records remain during migration.
 

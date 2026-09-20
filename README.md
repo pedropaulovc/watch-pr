@@ -49,7 +49,7 @@ Snapshots include PR lifecycle and mergeability, base and head refs, checks and 
 - Request read-only access to repository metadata, pull requests, issues, checks, commit statuses, deployments, and merge queues.
 - Subscribe to `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `status`, `push`, `deployment`, `deployment_status`, `merge_group`, and `commit_comment`.
 
-The webhook handler verifies `X-Hub-Signature-256`. Manual redelivery safely resumes partial fanout. Scheduled polling reconciles failures after GitHub accepts a delivery and supplies reaction updates, which have no dedicated webhook.
+The webhook handler verifies `X-Hub-Signature-256`. A manual GitHub redelivery resumes a partial fanout without duplicating completed watches. GitHub does not automatically redeliver a fanout failure that occurs after the handler returns `202`, so scheduled polling reconciles the snapshot. Reactions have no dedicated webhook, so the scheduled refresh supplies them.
 
 ## Cloudflare environments
 
