@@ -217,7 +217,7 @@ describe("watch-pr event contracts", () => {
     expect(snapshotChanges(snapshot(), snapshot({ merged: true, mergedAt: "2026-09-03T01:00:00.000Z" }))).toEqual(["lifecycle"]);
   });
 
-  it("coalesces a check rerun into one start and one terminal summary", () => {
+  it("coalesces a check rerun into one start and one terminal set of records", () => {
     const pending = (id: number, name: string) => ({
       id,
       name,
@@ -240,11 +240,13 @@ describe("watch-pr event contracts", () => {
     const finished = snapshot({ checks: [completed(1, "CI"), completed(2, "Lint")] });
 
     expect(monitorEventDetails(before, started)).toEqual([
-      "checks: CI -> pending, Lint -> pending",
+      "checks: CI -> pending",
+      "checks: Lint -> pending",
     ]);
     expect(monitorEventDetails(started, partial)).toEqual([]);
     expect(monitorEventDetails(partial, finished)).toEqual([
-      "checks: CI -> pass, Lint -> pass",
+      "checks: CI -> pass",
+      "checks: Lint -> pass",
     ]);
   });
 
@@ -432,7 +434,7 @@ describe("watch-pr event contracts", () => {
     ]);
   });
 
-  it("omits unavailable head references and bounds persisted monitor details", () => {
+  it("keeps full body records outside the bounded non-body detail budget", () => {
     expect(monitorReconciliationDetails(snapshot({ headRefName: null, headSha: null }))).toEqual([]);
     const comments = Array.from({ length: 30 }, (_, index) => ({
       id: index + 1,
@@ -445,16 +447,24 @@ describe("watch-pr event contracts", () => {
     }));
     const details = monitorEventDetails(snapshot(), snapshot({ comments }));
 
-    expect(details.length).toBeLessThanOrEqual(24);
-    expect(details.join("").length).toBeLessThanOrEqual(3_900);
-    expect(details.at(-1)).toMatch(/^\+\d+ more changes$/u);
-    const unicodeDetails = monitorEventDetails(snapshot(), snapshot({
-      comments: [{ ...comments[0], id: 99, body: `${"x".repeat(238)}😀z` }],
-    }));
-    expect([...unicodeDetails.join("")].some((character) => {
-      const code = character.charCodeAt(0);
-      return character.length === 1 && code >= 0xd800 && code <= 0xdfff;
-    })).toBe(false);
+    expect(details).toHaveLength(30);
+    expect(details[0]).toBe(`comment #1 @reviewer: feedback 0 ${"x".repeat(1_000)}`);
+    expect(details[29]).toBe(`comment #30 @reviewer: feedback 29 ${"x".repeat(1_000)}`);
+    const removed = {
+      id: 100,
+      author: "reviewer",
+      body: "removed comment",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      reactionDetails: [],
+    };
+    expect(monitorEventDetails(
+      snapshot({ comments: [removed] }),
+      snapshot({ comments }),
+    )).toContain("comment #100 deleted");
+
+
     const failedCheck = (id: number, name: string) => ({
       id,
       name,
@@ -465,6 +475,37 @@ describe("watch-pr event contracts", () => {
       url: null,
       kind: "check_run" as const,
     });
+    const bounded = monitorEventDetails(
+      snapshot({ comments: [removed] }),
+      snapshot({
+        checks: Array.from({ length: 30 }, (_, index) => failedCheck(index + 1, `CI-${index}`)),
+        comments: [],
+      }),
+    );
+    expect(bounded).toContain("+22 more checks");
+    expect(bounded).toContain("comment #100 deleted");
+    expect(bounded.length).toBeLessThanOrEqual(24);
+    expect(bounded.join("").length).toBeLessThanOrEqual(3_900);
+    const weighted = monitorEventDetails(
+      snapshot({ headRefName: "before" }),
+      snapshot({
+        headRefName: "x".repeat(480),
+        checks: Array.from(
+          { length: 30 },
+          (_, index) => failedCheck(
+            index + 1,
+            `${String(index).padStart(2, "0")}${"x".repeat(466)}`,
+          ),
+        ),
+      }),
+    );
+    expect(weighted.at(-1)).toBe("+24 more changes");
+
+    const unicodeDetails = monitorEventDetails(snapshot(), snapshot({
+      comments: [{ ...comments[0], id: 99, body: `${"x".repeat(238)}😀z` }],
+    }));
+    expect(unicodeDetails[0]).toContain("😀z");
+
     expect(monitorEventDetails(
       snapshot(),
       snapshot({ checks: [failedCheck(1, "\u001b[31mCI\u001b[0m\nspoof")] }),
@@ -479,7 +520,7 @@ describe("watch-pr event contracts", () => {
     expect(duplicateAfterTruncation).toHaveLength(1);
   });
 
-  it("emits only the changed comment body after a PR accumulates many comments", () => {
+  it("emits only the changed comment with its full multiline body and ID", () => {
     const existing = Array.from({ length: 20 }, (_, index) => ({
       id: index + 1,
       author: "reviewer",
@@ -490,10 +531,11 @@ describe("watch-pr event contracts", () => {
       reactionDetails: [],
       htmlUrl: `https://github.com/owner/repo/pull/7#issuecomment-${index + 1}`,
     }));
+    const body = `<!-- hidden -->Please \u001b[2Kcover the retry race\nbefore merging.\n${"long body ".repeat(80)}`;
     const newComment = {
       id: 21,
       author: "reviewer",
-      body: "<!-- hidden -->Please \u001b[2Kcover the retry race\nbefore merging.",
+      body,
       createdAt: "2026-09-19T12:00:00.000Z",
       updatedAt: "2026-09-19T12:00:00.000Z",
       reactions: {},
@@ -505,7 +547,22 @@ describe("watch-pr event contracts", () => {
       snapshot({ comments: existing }),
       snapshot({ comments: [...existing, newComment] }),
     )).toEqual([
-      "comment #21 @reviewer https://github.com/owner/repo/pull/7#issuecomment-21: Please cover the retry race before merging.",
+      `comment #21 @reviewer: ${body}`,
+    ]);
+  });
+
+  it("omits the body delimiter for empty comments", () => {
+    const empty = {
+      id: 22,
+      author: "reviewer",
+      body: " \t",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      reactionDetails: [],
+    };
+    expect(monitorEventDetails(snapshot(), snapshot({ comments: [empty] }))).toEqual([
+      "comment #22 @reviewer",
     ]);
   });
 
@@ -530,9 +587,24 @@ describe("watch-pr event contracts", () => {
 
     expect(monitorEventDetails(snapshot(), after)).toEqual([
       "active comments: +1, now 1",
-      "feedback [PRRT_thread] #21 src/retry.ts:42-44 @reviewer https://github.com/owner/repo/pull/7#discussion_r21: This retry can race the cancellation path.",
+      "feedback [PRRT_thread] #21 src/retry.ts:42-44 @reviewer: This retry can race the cancellation path.",
     ]);
   });
+  it("includes the full review body and omits its URL", () => {
+    const body = `Review line one\n${"review body ".repeat(80)}`;
+    const review = {
+      id: 31,
+      author: "reviewer",
+      body,
+      state: "CHANGES_REQUESTED",
+      submittedAt: "2026-09-19T12:00:00.000Z",
+      htmlUrl: "https://github.com/owner/repo/pull/7#pullrequestreview-31",
+    };
+    expect(monitorEventDetails(snapshot(), snapshot({ reviews: [review] }))).toEqual([
+      `review #31 @reviewer CHANGES_REQUESTED: ${body}`,
+    ]);
+  });
+
 
   it("attributes reactions added to and removed from the PR body, comments, and inline feedback", () => {
     const comment = {
@@ -603,7 +675,7 @@ describe("watch-pr event contracts", () => {
     expect(monitorEventDetails(null, current).some((line) => line.startsWith("reaction"))).toBe(false);
     // Within an ongoing watch the comment and the reaction it already carries are both news.
     expect(monitorEventDetails(snapshot(), current)).toEqual([
-      "comment #21 @bob https://github.com/owner/repo/pull/7#issuecomment-21: Top-level note",
+      "comment #21 @bob: Top-level note",
       "reaction created: @alice HOORAY on PR #7 @author https://github.com/owner/repo/pull/7",
       "reaction created: @alice ROCKET on comment #21 @bob https://github.com/owner/repo/pull/7#issuecomment-21",
     ]);

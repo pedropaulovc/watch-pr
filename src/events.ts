@@ -32,8 +32,18 @@ const supportedEvents = new Set<string>(SUPPORTED_GITHUB_EVENTS);
 const MAX_MONITOR_DETAIL_LINES = 24;
 const MAX_MONITOR_DETAIL_LENGTH = 500;
 const MAX_MONITOR_DETAILS_LENGTH = 3_900;
-const MAX_MONITOR_BODY_LENGTH = 240;
+const MAX_MONITOR_CHECK_LINES = 8;
 const ANSI_ESCAPE_SEQUENCE_RE = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~])/gu;
+
+type MonitorDetail = {
+  value: string;
+  body?: boolean;
+  omittedWeight?: number;
+};
+
+function fullBodyDetail(value: string): MonitorDetail {
+  return { value, body: true };
+}
 
 function truncate(value: string, maximumLength: number): string {
   if (value.length <= maximumLength) return value;
@@ -50,41 +60,79 @@ function sanitizeDetail(value: string): string {
     .trim();
 }
 
-function boundedDetails(lines: string[]): string[] {
-  const candidates = [...new Set(
-    lines
-      .map(sanitizeDetail)
-      .filter(Boolean)
-      .map((line) => truncate(line, MAX_MONITOR_DETAIL_LENGTH)),
-  )];
-  const details: string[] = [];
-  let length = 0;
-  let index = 0;
-  while (index < candidates.length && details.length < MAX_MONITOR_DETAIL_LINES) {
-    const line = candidates[index];
-    if (length + line.length > MAX_MONITOR_DETAILS_LENGTH) break;
-    details.push(line);
-    length += line.length;
-    index += 1;
+/**
+ * Body records are deliberately not part of the bounded budget: clients need the complete
+ * multiline text, while a large body must not hide a later check, state, or deletion record.
+ * Non-body records retain the existing line and aggregate limits.
+ */
+function boundedDetails(lines: readonly (string | MonitorDetail)[]): string[] {
+  const candidates: MonitorDetail[] = [];
+  const seenDetails = new Set<string>();
+  for (const line of lines) {
+    const candidate: MonitorDetail = typeof line === "string" ? { value: line } : line;
+    if (candidate.body) {
+      if (!candidate.value || seenDetails.has(candidate.value)) continue;
+      seenDetails.add(candidate.value);
+      candidates.push(candidate);
+      continue;
+    }
+    const sanitized = sanitizeDetail(candidate.value);
+    if (!sanitized) continue;
+    const value = truncate(sanitized, MAX_MONITOR_DETAIL_LENGTH);
+    if (seenDetails.has(value)) continue;
+    seenDetails.add(value);
+    candidates.push({ ...candidate, value });
   }
-  if (index === candidates.length) return details;
 
-  let omitted = candidates.length - index;
-  let marker = `+${omitted} more changes`;
-  if (details.length >= MAX_MONITOR_DETAIL_LINES) {
-    const removed = details.pop()!;
-    length -= removed.length;
-    omitted += 1;
-    marker = `+${omitted} more changes`;
+  const details: MonitorDetail[] = [];
+  let nonBodyLength = 0;
+  let nonBodyCount = 0;
+  let omitted = 0;
+  for (const candidate of candidates) {
+    if (candidate.body) {
+      details.push(candidate);
+      continue;
+    }
+    if (
+      nonBodyCount >= MAX_MONITOR_DETAIL_LINES ||
+      nonBodyLength + candidate.value.length > MAX_MONITOR_DETAILS_LENGTH
+    ) {
+      omitted += candidate.omittedWeight ?? 1;
+      continue;
+    }
+    details.push(candidate);
+    nonBodyCount += 1;
+    nonBodyLength += candidate.value.length;
   }
-  while (details.length > 0 && length + marker.length > MAX_MONITOR_DETAILS_LENGTH) {
-    const removed = details.pop()!;
-    length -= removed.length;
-    omitted += 1;
-    marker = `+${omitted} more changes`;
+
+  if (omitted > 0) {
+    let marker = `+${omitted} more changes`;
+    const removeLastNonBody = (): boolean => {
+      for (let index = details.length - 1; index >= 0; index -= 1) {
+        if (details[index].body) continue;
+        const [removed] = details.splice(index, 1);
+        nonBodyLength -= removed.value.length;
+        nonBodyCount -= 1;
+        omitted += removed.omittedWeight ?? 1;
+        return true;
+      }
+      return false;
+    };
+    while (
+      (nonBodyCount >= MAX_MONITOR_DETAIL_LINES ||
+        nonBodyLength + marker.length > MAX_MONITOR_DETAILS_LENGTH) &&
+      removeLastNonBody()
+    ) {
+      marker = `+${omitted} more changes`;
+    }
+    if (
+      nonBodyCount < MAX_MONITOR_DETAIL_LINES &&
+      nonBodyLength + marker.length <= MAX_MONITOR_DETAILS_LENGTH
+    ) {
+      details.push({ value: marker });
+    }
   }
-  if (details.length < MAX_MONITOR_DETAIL_LINES) details.push(marker);
-  return details;
+  return details.map((detail) => detail.value);
 }
 
 export function isSupportedGithubEvent(eventName: string): boolean {
@@ -742,18 +790,26 @@ function checkKey(check: PullRequestCheck): string {
     : `${check.kind}:${check.id}`;
 }
 
-function checkSummary(checks: PullRequestCheck[]): string {
+function checkSummary(checks: PullRequestCheck[]): (string | MonitorDetail)[] {
   const details = [...checks]
     .sort((left, right) => left.name.localeCompare(right.name))
     .map((check) => {
       const bucket = checkBucket(check);
       const url = (bucket === "fail" || bucket === "cancel") && check.url ? ` ${check.url}` : "";
-      return `${check.name} -> ${bucket}${url}`;
+      return `checks: ${check.name} -> ${bucket}${url}`;
     });
-  return `checks: ${details.join(", ")}`;
+  if (details.length <= MAX_MONITOR_CHECK_LINES) return details;
+  const omittedWeight = details.length - MAX_MONITOR_CHECK_LINES;
+  return [
+    ...details.slice(0, MAX_MONITOR_CHECK_LINES),
+    { value: `+${omittedWeight} more checks`, omittedWeight },
+  ];
 }
 
-function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[]): string[] {
+function checkDetails(
+  previous: PullRequestCheck[],
+  current: PullRequestCheck[],
+): (string | MonitorDetail)[] {
   const previousByKey = new Map(previous.map((check) => [checkKey(check), check]));
   const previousPending = new Set(
     previous.filter((check) => checkBucket(check) === "pending").map(checkKey),
@@ -781,26 +837,15 @@ function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[])
     currentPending.size === 0 &&
     [...previousPending].every((key) => current.some((check) => checkKey(check) === key))
   ) {
-    return current.length > 0 ? [checkSummary(current)] : [];
+    return checkSummary(current);
   }
-  return selected.size > 0 ? [checkSummary([...selected.values()])] : [];
+  return selected.size > 0 ? checkSummary([...selected.values()]) : [];
 }
 
-function reconciliationCheckDetails(checks: PullRequestCheck[]): string[] {
-  return checks.length > 0 ? [checkSummary(checks)] : [];
+function reconciliationCheckDetails(checks: PullRequestCheck[]): (string | MonitorDetail)[] {
+  return checkSummary(checks);
 }
 
-function compactBody(value: string): string {
-  return truncate(
-    value
-      .replace(ANSI_ESCAPE_SEQUENCE_RE, "")
-      .replace(/<!--[\s\S]*?-->/gu, "")
-      .replace(/\s+/gu, " ")
-      .replace(/[\u0000-\u001f\u007f-\u009f]/gu, "")
-      .trim(),
-    MAX_MONITOR_BODY_LENGTH,
-  );
-}
 
 function commentLocation(comment: PullRequestComment): string {
   if (!comment.path) return "";
@@ -865,20 +910,20 @@ function removedReviews(
 }
 
 function commentDetail(comment: PullRequestComment): string {
-  const body = compactBody(comment.body);
-  return `comment #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+  const prefix = `comment #${comment.id} @${comment.author ?? "unknown"}`;
+  return comment.body.trim() ? `${prefix}: ${comment.body}` : prefix;
 }
 
 function reviewDetail(review: PullRequestReview): string {
-  const body = compactBody(review.body);
-  return `review #${review.id} @${review.author ?? "unknown"} ${review.state}${review.htmlUrl ? ` ${review.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+  const prefix = `review #${review.id} @${review.author ?? "unknown"} ${review.state}`;
+  return review.body.trim() ? `${prefix}: ${review.body}` : prefix;
 }
 
 function reviewCommentDetail(comment: PullRequestComment, snapshot: PullRequestSnapshot): string {
   const thread = snapshot.threads.find((candidate) => candidate.commentIds.includes(comment.id));
   const location = commentLocation(comment);
-  const body = compactBody(comment.body);
-  return `feedback [${thread?.id ?? "-"}] #${comment.id}${location ? ` ${location}` : ""} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}${body ? `: ${body}` : ""}`;
+  const prefix = `feedback [${thread?.id ?? "-"}] #${comment.id}${location ? ` ${location}` : ""} @${comment.author ?? "unknown"}`;
+  return comment.body.trim() ? `${prefix}: ${comment.body}` : prefix;
 }
 
 function mergeabilityDetails(
@@ -996,10 +1041,6 @@ function reactionTargetDescription(target: ReactionTarget): string {
   return `${target.label} @${target.author ?? "unknown"}${target.url ? ` ${target.url}` : ""}`;
 }
 
-/** Current-state line: who reacted with what, and to whose content. */
-export function reactionStateLine(entry: AttributedReaction): string {
-  return `reaction @${entry.reaction.author ?? "unknown"} ${reactionContentName(entry.reaction.content)} on ${reactionTargetDescription(entry.target)}`;
-}
 
 function reactionChangeLine(
   action: "created" | "deleted",
@@ -1160,7 +1201,7 @@ export function monitorReconciliationDetails(snapshot: PullRequestSnapshot): str
     ...mergeabilityDetails(null, snapshot),
     ...reconciliationCheckDetails(snapshot.checks),
     ...(reviewComments.length > 0 ? [`active comments: now ${reviewComments.length}`] : []),
-    ...reviewComments.map((comment) => reviewCommentDetail(comment, snapshot)),
+    ...reviewComments.map((comment) => fullBodyDetail(reviewCommentDetail(comment, snapshot))),
   ]);
 }
 
@@ -1175,14 +1216,16 @@ export function monitorEventDetails(
     ...checkDetails(previous.checks, current.checks),
     ...deploymentDetails(event),
     ...activeCommentDetails(previous, current),
-    ...changedComments(previous.comments, current.comments).map(commentDetail),
+    ...changedComments(previous.comments, current.comments)
+      .map((comment) => fullBodyDetail(commentDetail(comment))),
     ...removedComments(previous.comments, current.comments)
       .map((comment) => `comment #${comment.id} deleted`),
-    ...changedReviews(previous.reviews, current.reviews).map(reviewDetail),
+    ...changedReviews(previous.reviews, current.reviews)
+      .map((review) => fullBodyDetail(reviewDetail(review))),
     ...removedReviews(previous.reviews, current.reviews)
       .map((review) => `review #${review.id} deleted`),
     ...changedComments(previous.reviewComments, current.reviewComments)
-      .map((comment) => reviewCommentDetail(comment, current)),
+      .map((comment) => fullBodyDetail(reviewCommentDetail(comment, current))),
     ...removedComments(previous.reviewComments, current.reviewComments)
       .map((comment) => {
         const thread = previous.threads.find((candidate) => candidate.commentIds.includes(comment.id));
