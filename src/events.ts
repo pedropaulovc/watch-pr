@@ -38,6 +38,7 @@ const ANSI_ESCAPE_SEQUENCE_RE = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?
 type MonitorDetail = {
   value: string;
   body?: boolean;
+  omittedWeight?: number;
 };
 
 function fullBodyDetail(value: string): MonitorDetail {
@@ -80,7 +81,7 @@ function boundedDetails(lines: readonly (string | MonitorDetail)[]): string[] {
     const value = truncate(sanitized, MAX_MONITOR_DETAIL_LENGTH);
     if (seenDetails.has(value)) continue;
     seenDetails.add(value);
-    candidates.push({ value });
+    candidates.push({ ...candidate, value });
   }
 
   const details: MonitorDetail[] = [];
@@ -96,7 +97,7 @@ function boundedDetails(lines: readonly (string | MonitorDetail)[]): string[] {
       nonBodyCount >= MAX_MONITOR_DETAIL_LINES ||
       nonBodyLength + candidate.value.length > MAX_MONITOR_DETAILS_LENGTH
     ) {
-      omitted += 1;
+      omitted += candidate.omittedWeight ?? 1;
       continue;
     }
     details.push(candidate);
@@ -112,7 +113,7 @@ function boundedDetails(lines: readonly (string | MonitorDetail)[]): string[] {
         const [removed] = details.splice(index, 1);
         nonBodyLength -= removed.value.length;
         nonBodyCount -= 1;
-        omitted += 1;
+        omitted += removed.omittedWeight ?? 1;
         return true;
       }
       return false;
@@ -789,7 +790,7 @@ function checkKey(check: PullRequestCheck): string {
     : `${check.kind}:${check.id}`;
 }
 
-function checkSummary(checks: PullRequestCheck[]): string[] {
+function checkSummary(checks: PullRequestCheck[]): (string | MonitorDetail)[] {
   const details = [...checks]
     .sort((left, right) => left.name.localeCompare(right.name))
     .map((check) => {
@@ -798,13 +799,17 @@ function checkSummary(checks: PullRequestCheck[]): string[] {
       return `checks: ${check.name} -> ${bucket}${url}`;
     });
   if (details.length <= MAX_MONITOR_CHECK_LINES) return details;
+  const omittedWeight = details.length - MAX_MONITOR_CHECK_LINES;
   return [
     ...details.slice(0, MAX_MONITOR_CHECK_LINES),
-    `+${details.length - MAX_MONITOR_CHECK_LINES} more checks`,
+    { value: `+${omittedWeight} more checks`, omittedWeight },
   ];
 }
 
-function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[]): string[] {
+function checkDetails(
+  previous: PullRequestCheck[],
+  current: PullRequestCheck[],
+): (string | MonitorDetail)[] {
   const previousByKey = new Map(previous.map((check) => [checkKey(check), check]));
   const previousPending = new Set(
     previous.filter((check) => checkBucket(check) === "pending").map(checkKey),
@@ -837,7 +842,7 @@ function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[])
   return selected.size > 0 ? checkSummary([...selected.values()]) : [];
 }
 
-function reconciliationCheckDetails(checks: PullRequestCheck[]): string[] {
+function reconciliationCheckDetails(checks: PullRequestCheck[]): (string | MonitorDetail)[] {
   return checkSummary(checks);
 }
 

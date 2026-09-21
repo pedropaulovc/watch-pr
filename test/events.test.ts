@@ -486,6 +486,20 @@ describe("watch-pr event contracts", () => {
     expect(bounded).toContain("comment #100 deleted");
     expect(bounded.length).toBeLessThanOrEqual(24);
     expect(bounded.join("").length).toBeLessThanOrEqual(3_900);
+    const weighted = monitorEventDetails(
+      snapshot({ headRefName: "before" }),
+      snapshot({
+        headRefName: "x".repeat(480),
+        checks: Array.from(
+          { length: 30 },
+          (_, index) => failedCheck(
+            index + 1,
+            `${String(index).padStart(2, "0")}${"x".repeat(466)}`,
+          ),
+        ),
+      }),
+    );
+    expect(weighted.at(-1)).toBe("+24 more changes");
 
     const unicodeDetails = monitorEventDetails(snapshot(), snapshot({
       comments: [{ ...comments[0], id: 99, body: `${"x".repeat(238)}😀z` }],
