@@ -32,6 +32,7 @@ const supportedEvents = new Set<string>(SUPPORTED_GITHUB_EVENTS);
 const MAX_MONITOR_DETAIL_LINES = 24;
 const MAX_MONITOR_DETAIL_LENGTH = 500;
 const MAX_MONITOR_DETAILS_LENGTH = 3_900;
+const MAX_MONITOR_CHECK_LINES = 8;
 const ANSI_ESCAPE_SEQUENCE_RE = /\u001b(?:\][^\u0007]*(?:\u0007|\u001b\\)|\[[0-?]*[ -/]*[@-~])/gu;
 
 type MonitorDetail = {
@@ -65,18 +66,20 @@ function sanitizeDetail(value: string): string {
  */
 function boundedDetails(lines: readonly (string | MonitorDetail)[]): string[] {
   const candidates: MonitorDetail[] = [];
-  const seenNonBody = new Set<string>();
+  const seenDetails = new Set<string>();
   for (const line of lines) {
     const candidate: MonitorDetail = typeof line === "string" ? { value: line } : line;
     if (candidate.body) {
-      if (candidate.value) candidates.push(candidate);
+      if (!candidate.value || seenDetails.has(candidate.value)) continue;
+      seenDetails.add(candidate.value);
+      candidates.push(candidate);
       continue;
     }
     const sanitized = sanitizeDetail(candidate.value);
     if (!sanitized) continue;
     const value = truncate(sanitized, MAX_MONITOR_DETAIL_LENGTH);
-    if (seenNonBody.has(value)) continue;
-    seenNonBody.add(value);
+    if (seenDetails.has(value)) continue;
+    seenDetails.add(value);
     candidates.push({ value });
   }
 
@@ -787,13 +790,18 @@ function checkKey(check: PullRequestCheck): string {
 }
 
 function checkSummary(checks: PullRequestCheck[]): string[] {
-  return [...checks]
+  const details = [...checks]
     .sort((left, right) => left.name.localeCompare(right.name))
     .map((check) => {
       const bucket = checkBucket(check);
       const url = (bucket === "fail" || bucket === "cancel") && check.url ? ` ${check.url}` : "";
       return `checks: ${check.name} -> ${bucket}${url}`;
     });
+  if (details.length <= MAX_MONITOR_CHECK_LINES) return details;
+  return [
+    ...details.slice(0, MAX_MONITOR_CHECK_LINES),
+    `+${details.length - MAX_MONITOR_CHECK_LINES} more checks`,
+  ];
 }
 
 function checkDetails(previous: PullRequestCheck[], current: PullRequestCheck[]): string[] {
@@ -897,17 +905,20 @@ function removedReviews(
 }
 
 function commentDetail(comment: PullRequestComment): string {
-  return `comment #${comment.id} @${comment.author ?? "unknown"}: ${comment.body}`;
+  const prefix = `comment #${comment.id} @${comment.author ?? "unknown"}`;
+  return comment.body.trim() ? `${prefix}: ${comment.body}` : prefix;
 }
 
 function reviewDetail(review: PullRequestReview): string {
-  return `review #${review.id} @${review.author ?? "unknown"} ${review.state}: ${review.body}`;
+  const prefix = `review #${review.id} @${review.author ?? "unknown"} ${review.state}`;
+  return review.body.trim() ? `${prefix}: ${review.body}` : prefix;
 }
 
 function reviewCommentDetail(comment: PullRequestComment, snapshot: PullRequestSnapshot): string {
   const thread = snapshot.threads.find((candidate) => candidate.commentIds.includes(comment.id));
   const location = commentLocation(comment);
-  return `feedback [${thread?.id ?? "-"}] #${comment.id}${location ? ` ${location}` : ""} @${comment.author ?? "unknown"}: ${comment.body}`;
+  const prefix = `feedback [${thread?.id ?? "-"}] #${comment.id}${location ? ` ${location}` : ""} @${comment.author ?? "unknown"}`;
+  return comment.body.trim() ? `${prefix}: ${comment.body}` : prefix;
 }
 
 function mergeabilityDetails(
@@ -1025,10 +1036,6 @@ function reactionTargetDescription(target: ReactionTarget): string {
   return `${target.label} @${target.author ?? "unknown"}${target.url ? ` ${target.url}` : ""}`;
 }
 
-/** Current-state line: who reacted with what, and to whose content. */
-export function reactionStateLine(entry: AttributedReaction): string {
-  return `reaction @${entry.reaction.author ?? "unknown"} ${reactionContentName(entry.reaction.content)} on ${reactionTargetDescription(entry.target)}`;
-}
 
 function reactionChangeLine(
   action: "created" | "deleted",

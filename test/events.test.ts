@@ -476,12 +476,16 @@ describe("watch-pr event contracts", () => {
       kind: "check_run" as const,
     });
     const bounded = monitorEventDetails(
-      snapshot(),
-      snapshot({ checks: Array.from({ length: 30 }, (_, index) => failedCheck(index + 1, `CI-${index}`)) }),
+      snapshot({ comments: [removed] }),
+      snapshot({
+        checks: Array.from({ length: 30 }, (_, index) => failedCheck(index + 1, `CI-${index}`)),
+        comments: [],
+      }),
     );
+    expect(bounded).toContain("+22 more checks");
+    expect(bounded).toContain("comment #100 deleted");
     expect(bounded.length).toBeLessThanOrEqual(24);
     expect(bounded.join("").length).toBeLessThanOrEqual(3_900);
-    expect(bounded.at(-1)).toMatch(/^\+\d+ more changes$/u);
 
     const unicodeDetails = monitorEventDetails(snapshot(), snapshot({
       comments: [{ ...comments[0], id: 99, body: `${"x".repeat(238)}😀z` }],
@@ -530,6 +534,21 @@ describe("watch-pr event contracts", () => {
       snapshot({ comments: [...existing, newComment] }),
     )).toEqual([
       `comment #21 @reviewer: ${body}`,
+    ]);
+  });
+
+  it("omits the body delimiter for empty comments", () => {
+    const empty = {
+      id: 22,
+      author: "reviewer",
+      body: " \t",
+      createdAt: "2026-09-19T12:00:00.000Z",
+      updatedAt: "2026-09-19T12:00:00.000Z",
+      reactions: {},
+      reactionDetails: [],
+    };
+    expect(monitorEventDetails(snapshot(), snapshot({ comments: [empty] }))).toEqual([
+      "comment #22 @reviewer",
     ]);
   });
 

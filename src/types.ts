@@ -229,9 +229,9 @@ export interface WatchEvent {
   snapshot: PullRequestSnapshot | null;
   changes: string[];
   /**
-   * Size-bounded, event-specific lines that let monitor clients act without fetching
-   * the complete snapshot. Optional for persisted events written before this field
-   * existed.
+   * Event-specific monitor records. Non-body records are size-bounded; comment, review,
+   * and feedback records retain their complete multiline bodies. Optional for persisted
+   * events written before this field existed.
    */
   details?: string[];
 }
