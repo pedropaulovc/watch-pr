@@ -2,21 +2,8 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
 import { ReadResourceRequestSchema, SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
-import {
-  normalizedLogin,
-  parseResourceUri,
-  reactionStateLine,
-  resourceUri,
-  snapshotReactions,
-  watchKey,
-} from "./events";
-import type { GithubUser, PrMonitorRegistration, PullRequestCheck, PullRequestComment, PullRequestReaction, PullRequestSnapshot, PullRequestThread, StoredWatchState, WatchEvent } from "./types";
-
-export type McpOutputMode = "brief" | "full";
-
-/** A brief snapshot spends at most this many lines, and this many characters, on reactions. */
-const MAX_BRIEF_REACTION_LINES = 12;
-const MAX_BRIEF_REACTION_LENGTH = 1_000;
+import { parseResourceUri, watchKey } from "./events";
+import type { GithubUser, PrMonitorRegistration, PullRequestSnapshot, StoredWatchState } from "./types";
 
 export interface WatchRegistration {
   key: string;
@@ -39,186 +26,10 @@ export interface McpSessionContext {
   unsubscribe(repository: string, number: number): Promise<void>;
 }
 
-const outputModeSchema = z.enum(["brief", "full"]).default("brief").describe("Output detail: watcher-style lines or the full JSON record");
-
 const pullRequestInputSchema = {
   repository: z.string().describe("GitHub repository in owner/name form"),
   number: z.number().int().positive().describe("Pull request number"),
 };
-
-const watchInputSchema = {
-  ...pullRequestInputSchema,
-  mode: outputModeSchema,
-};
-
-function textResult(value: unknown, mode: McpOutputMode, briefLines: string[]) {
-  return {
-    content: [{
-      type: "text" as const,
-      text: mode === "full" ? JSON.stringify(value) : briefLines.join("\n"),
-    }],
-  };
-}
-
-function checkBucket(check: PullRequestCheck): string {
-  if (check.status?.toLowerCase() !== "completed") return "pending";
-  switch (check.conclusion?.toLowerCase()) {
-    case "success":
-    case "neutral":
-      return "pass";
-    case "skipped":
-      return "skipping";
-    case "cancelled":
-    case "canceled":
-      return "cancel";
-    case "pending":
-      return "pending";
-    default:
-      return check.conclusion ? "fail" : "pending";
-  }
-}
-
-function checkLines(checks: PullRequestCheck[]): string[] {
-  return checks.map((check) => {
-    const bucket = checkBucket(check);
-    const completedAt = bucket === "pending" ? "" : check.completedAt ?? "";
-    return `check ${check.name}: ${bucket}${completedAt ? ` @${completedAt}` : ""}`;
-  });
-}
-
-function commentLocation(comment: PullRequestComment): string {
-  if (!comment.path) return "?";
-  const start = comment.startLine ?? comment.line;
-  const end = comment.line ?? start;
-  if (!start) return `${comment.path}:`;
-  return `${comment.path}:${start}${end && end !== start ? `-${end}` : ""}`;
-}
-
-function stripXmlComments(value: string): string {
-  return value.replace(/<!--[\s\S]*?-->/gu, "");
-}
-
-function feedbackLines(threads: PullRequestThread[], comments: PullRequestComment[]): string[] {
-  const commentsById = new Map(comments.map((comment) => [comment.id, comment]));
-  return threads
-    .filter((thread) => !thread.isResolved)
-    .map((thread) => thread.commentIds.map((id) => commentsById.get(id)).find((comment) => comment))
-    .filter((comment): comment is PullRequestComment => Boolean(comment))
-    .map((comment) => {
-      const thread = threads.find((candidate) => candidate.commentIds.includes(comment.id));
-      const title = stripXmlComments(comment.body).split(/\r?\n/u).map((line) => line.trim()).find(Boolean)?.slice(0, 100) ?? "";
-      return `feedback [${thread?.id ?? comment.id}] ${commentLocation(comment)} @${comment.author ?? "unknown"}${title ? ` ${title}` : ""}`;
-    });
-}
-
-function aggregateReactionSummary(counts: PullRequestSnapshot["bodyReactions"]): string {
-  return Object.entries(counts)
-    .filter((entry): entry is [string, number] =>
-      entry[0] !== "total_count" && typeof entry[1] === "number" && entry[1] > 0)
-    .map(([content, count]) => `${content.toUpperCase()}×${count}`)
-    .sort()
-    .join(", ");
-}
-
-function unknownReactionLines(snapshot: PullRequestSnapshot): string[] {
-  const lines: string[] = [];
-  const add = (
-    counts: PullRequestSnapshot["bodyReactions"],
-    details: PullRequestReaction[] | undefined,
-    target: string,
-  ): void => {
-    if (details !== undefined) return;
-    const summary = aggregateReactionSummary(counts);
-    if (summary) lines.push(`reactions: attribution unavailable for ${summary} on ${target}`);
-  };
-  add(
-    snapshot.bodyReactions,
-    snapshot.bodyReactionDetails,
-    `PR #${snapshot.number} @${snapshot.author ?? "unknown"} ${snapshot.url}`,
-  );
-  for (const comment of snapshot.comments) {
-    add(
-      comment.reactions,
-      comment.reactionDetails,
-      `comment #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}`,
-    );
-  }
-  for (const comment of snapshot.reviewComments) {
-    add(
-      comment.reactions,
-      comment.reactionDetails,
-      `feedback #${comment.id} @${comment.author ?? "unknown"}${comment.htmlUrl ? ` ${comment.htmlUrl}` : ""}`,
-    );
-  }
-  return lines;
-}
-
-/**
- * A brief listing summarises many PRs at once, so the attributed reaction lines of one
- * snapshot are bounded; the overflow is reported as a count rather than dropped silently.
- */
-function briefReactionLines(snapshot: PullRequestSnapshot, user: GithubUser): string[] {
-  // Reactions the watcher left are their own activity; everyone else's is the signal.
-  // The actor's numeric ID is the identity: a renamed or recased login must still be theirs.
-  // Records persisted before actor IDs were stored have none - null or absent - and fall
-  // back to the login, compared normalized so at least a recase is still recognised.
-  const lines = [
-    ...snapshotReactions(snapshot)
-      .filter((entry) => (entry.reaction.authorId == null
-        ? normalizedLogin(entry.reaction.author) !== normalizedLogin(user.login)
-        : entry.reaction.authorId !== user.id))
-      .map(reactionStateLine),
-    ...unknownReactionLines(snapshot),
-  ].sort();
-  const kept: string[] = [];
-  let length = 0;
-  for (const line of lines) {
-    if (kept.length === MAX_BRIEF_REACTION_LINES || length + line.length > MAX_BRIEF_REACTION_LENGTH) break;
-    kept.push(line);
-    length += line.length;
-  }
-  if (kept.length < lines.length) kept.push(`+${lines.length - kept.length} more reactions`);
-  return kept;
-}
-
-function briefSnapshotLines(snapshot: PullRequestSnapshot, user: GithubUser): string[] {
-  const comments = snapshot.comments.filter((comment) => comment.author !== user.login);
-  const reviewComments = snapshot.reviewComments.filter((comment) => comment.author !== user.login);
-  const reviews = snapshot.reviews.filter((review) => review.author !== user.login);
-  const mergeableState = snapshot.mergeableState?.toUpperCase();
-  const mergeable = snapshot.mergeable === null ? "unknown" : snapshot.mergeable ? "yes" : "no";
-  const lines = [
-    `PR ${snapshot.number}: ${snapshot.state.toUpperCase()}${snapshot.draft ? " DRAFT" : ""}`,
-    `head: ${snapshot.headRefName}@${snapshot.headSha}`,
-    `mergeable: ${mergeable}${mergeableState ? ` (${mergeableState})` : ""}`,
-    ...checkLines(snapshot.checks),
-    ...briefReactionLines(snapshot, user),
-    ...reviews.map((review) => `review ${review.author ?? "unknown"}: ${review.state}${review.submittedAt ? ` @${review.submittedAt}` : ""}`),
-    `reviews: ${reviews.length}`,
-    `comments: ${comments.length}`,
-    `review-comments: ${reviewComments.length}`,
-  ];
-  if (mergeableState === "BEHIND" || mergeableState === "DIRTY") lines.push(`rebase: ${mergeableState}`);
-  if (snapshot.merged) lines.push(`PR ${snapshot.number} finished: MERGED`);
-  else if (snapshot.state.toUpperCase() === "CLOSED") lines.push(`PR ${snapshot.number} finished: CLOSED`);
-  return [...lines.sort(), ...feedbackLines(snapshot.threads, snapshot.reviewComments)];
-}
-
-
-function briefRegistration(registration: WatchRegistration, user: GithubUser): string[] {
-  const lines = [`watching ${registration.key}`, `resource: ${registration.resourceUri}`];
-  if (registration.snapshot) lines.push(...briefSnapshotLines(registration.snapshot, user));
-  else if (registration.refreshScheduled) lines.push("snapshot: refresh scheduled");
-  return lines;
-}
-
-function briefEventLines(events: WatchEvent[]): string[] {
-  return events.map((event) => {
-    const action = event.action ? ` ${event.action}` : "";
-    const changes = event.changes.length ? ` (${event.changes.join(", ")})` : "";
-    return `event ${event.githubEvent}${action}${changes} @${event.receivedAt}`;
-  });
-}
 
 export function createMcpServer(context: McpSessionContext): McpServer {
   const server = new McpServer(
@@ -238,11 +49,16 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "Watch pull request",
       description: "Subscribe to a pull request and receive lifecycle changes as MCP resource updates.",
-      inputSchema: watchInputSchema,
+      inputSchema: pullRequestInputSchema,
     },
-    async ({ repository, number, mode }) => {
+    async ({ repository, number }) => {
       const registration = await context.watch(repository, number);
-      return textResult(registration, mode, briefRegistration(registration, context.user));
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify(registration),
+        }],
+      };
     },
   );
 
@@ -251,13 +67,16 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "Unwatch pull request",
       description: "Stop receiving updates for a pull request.",
-      inputSchema: watchInputSchema,
+      inputSchema: pullRequestInputSchema,
     },
-    async ({ repository, number, mode }) => {
+    async ({ repository, number }) => {
       const removed = await context.unwatch(repository, number);
-      return textResult({ repository, number, removed }, mode, [
-        `${removed ? "unwatched" : "not watching"} ${repository}#${number}`,
-      ]);
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ repository, number, removed }),
+        }],
+      };
     },
   );
 
@@ -281,16 +100,14 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "List watched pull requests",
       description: "List pull requests watched by the authenticated GitHub account.",
-      inputSchema: { mode: outputModeSchema },
+      inputSchema: {},
     },
-    async ({ mode }) => {
-      const registrations = await context.listWatches();
-      return textResult(
-        registrations,
-        mode,
-        registrations.flatMap((registration) => briefRegistration(registration, context.user)),
-      );
-    },
+    async () => ({
+      content: [{
+        type: "text" as const,
+        text: JSON.stringify(await context.listWatches()),
+      }],
+    }),
   );
 
   server.registerTool(
@@ -298,14 +115,16 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "Get pull request state",
       description: "Read the latest durable pull request snapshot. A refresh is scheduled after webhook or timer events.",
-      inputSchema: watchInputSchema,
+      inputSchema: pullRequestInputSchema,
     },
-    async ({ repository, number, mode }) => {
+    async ({ repository, number }) => {
       const state = await context.readWatch(repository, number);
-      const lines = state.snapshot
-        ? briefSnapshotLines(state.snapshot, context.user)
-        : ["snapshot: unavailable"];
-      return textResult(state.snapshot, mode, lines);
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify(state.snapshot),
+        }],
+      };
     },
   );
 
@@ -315,16 +134,21 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       title: "List pull request events",
       description: "Read recent webhook and snapshot events for a watched pull request.",
       inputSchema: {
-        ...watchInputSchema,
+        ...pullRequestInputSchema,
         limit: z.number().int().min(1).max(100).default(20).describe("Maximum number of events"),
       },
     },
-    async ({ repository, number, limit, mode }) => {
+    async ({ repository, number, limit }) => {
       const state = await context.readWatch(repository, number);
-      const events = state.events.slice(-limit);
-      return textResult({ repository, number, events }, mode, briefEventLines(events));
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ repository, number, events: state.events.slice(-limit) }),
+        }],
+      };
     },
   );
+
 
   server.registerResource(
     "pull_request",

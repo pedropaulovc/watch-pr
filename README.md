@@ -19,9 +19,10 @@ Authenticate with the OAuth 2.0 authorization-code flow advertised at `/.well-kn
 - `get_pr`: Read the latest durable pull request snapshot.
 - `list_pr_events`: Read up to 100 recent webhook and snapshot events.
 
-Tool outputs default to `mode: "brief"`. This mode returns newline-delimited lifecycle lines for PR state, head revision, mergeability, checks, reviews, comments, reactions, and feedback. Reaction lines cover every current reaction left by someone other than the authenticated account and identify the actor and target: `reaction @actor THUMBS_UP on comment #123 @author https://...`.
+Tool calls return JSON text. `watch_pr` returns a registration object, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the exact latest snapshot (or `null`), and `list_pr_events` returns `{ repository, number, events }`. `open_pr_monitor` also returns its JSON registration object. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records.
 
-Own activity is matched by GitHub user ID, so a renamed or recased login is still excluded. A snapshot contributes at most 12 reaction lines and 1,000 reaction characters to a listing. Lines are sorted and the first that fit are kept, so the listing is stable between refreshes. Additional entries appear as `+N more reactions`. Pass `mode: "full"` to `get_pr` for the complete snapshot or to `list_pr_events` for event payloads. Resource reads always return full snapshots.
+Resource reads always return the full stored watch state. Snapshot and event payloads are not abbreviated by the MCP tool layer.
+
 
 ## Resources
 
@@ -31,7 +32,7 @@ Each watched PR is available at `watch-pr://owner/repository/pull/NUMBER`. A web
 
 A monitor URL is scoped to one OAuth session and PR and carries no GitHub credential. It expires no later than 12 hours after creation; an earlier OAuth-session expiry also revokes it. Repeated `open_pr_monitor` calls reuse the same capability and deadline until it expires. The endpoint accepts only `GET /monitor/...`.
 
-The feed replays events after the URL's `cursor` or the `Last-Event-ID` header, then stays open for live events and heartbeat comments. Events contain bounded `details`: one-line named check states, one-line mergeability and deployment changes, active review-comment count changes, changed comment and review bodies with their IDs, and attributed reaction changes such as `reaction created: @actor THUMBS_UP on PR #7 @author https://...` or `reaction deleted: @actor HEART from feedback #456 @author https://...`. Failed and cancelled checks include their URLs. Routine partial check completions leave `details` empty until the wave reaches a terminal state.
+The feed replays events after the URL's `cursor` or the `Last-Event-ID` header, then stays open for live events and heartbeat comments. Events contain bounded non-body `details`: one physical record per named check state, one-line mergeability and deployment changes, active review-comment count changes, deletion and thread changes, and attributed reaction changes such as `reaction created: @actor THUMBS_UP on PR #7 @author https://...` or `reaction deleted: @actor HEART from feedback #456 @author https://...`. Changed comment, review, and feedback records retain their IDs, thread/location/author/state fields, omit GitHub URLs, and carry the complete body, including multiline text. Full body records are outside the non-body detail budget, so a long body cannot hide later actionable records. Failed and cancelled checks include their URLs. Routine partial check completions leave `details` empty until the wave reaches a terminal state.
 
 An active watch reports a reaction even when the same refresh first reveals its target comment. Initial reconciliation omits reaction history. Removing a comment produces one deletion line for the comment instead of one line per reaction. A cursor older than the retained event history receives a reconciliation event from the current snapshot.
 
