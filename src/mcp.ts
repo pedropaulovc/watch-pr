@@ -48,15 +48,16 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     "watch_pr",
     {
       title: "Watch pull request",
-      description: "Subscribe to a pull request and receive lifecycle changes as MCP resource updates.",
+      description: "Subscribe to a pull request and open its read-only SSE monitor capability in one call. The JSON result is the watch registration plus `monitor: { monitorUrl, cursor, terminalState }`. Repeated calls reuse or renew the same capability.",
       inputSchema: pullRequestInputSchema,
     },
     async ({ repository, number }) => {
       const registration = await context.watch(repository, number);
+      const monitor = await context.openMonitor(repository, number);
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify(registration),
+          text: JSON.stringify({ ...registration, monitor }),
         }],
       };
     },
@@ -78,21 +79,6 @@ export function createMcpServer(context: McpSessionContext): McpServer {
         }],
       };
     },
-  );
-
-  server.registerTool(
-    "open_pr_monitor",
-    {
-      title: "Open pull request monitor",
-      description: "Create a revocable read-only SSE capability for an already-watched pull request.",
-      inputSchema: pullRequestInputSchema,
-    },
-    async ({ repository, number }) => ({
-      content: [{
-        type: "text" as const,
-        text: JSON.stringify(await context.openMonitor(repository, number)),
-      }],
-    }),
   );
 
   server.registerTool(

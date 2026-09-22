@@ -12,14 +12,13 @@ Authenticate with the OAuth 2.0 authorization-code flow advertised at `/.well-kn
 
 ## Tools
 
-- `watch_pr`: Subscribe to `repository` (`owner/name`) and `number`.
-- `open_pr_monitor`: Create a revocable, read-only SSE capability for a watched PR. The JSON result includes `monitorUrl`, `cursor`, and `terminalState`.
+- `watch_pr`: Subscribe to `repository` (`owner/name`) and `number` and create its revocable, read-only SSE capability in one call. The JSON result adds `monitor: { monitorUrl, cursor, terminalState }`.
 - `unwatch_pr`: Remove a subscription for the current GitHub account.
 - `list_watched_prs`: List the current account's subscriptions.
 - `get_pr`: Read the latest durable pull request snapshot.
 - `list_pr_events`: Read up to 100 recent webhook and snapshot events.
 
-Tool calls return JSON text. `watch_pr` returns a registration object, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the exact latest snapshot (or `null`), and `list_pr_events` returns `{ repository, number, events }`. `open_pr_monitor` also returns its JSON registration object. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records.
+Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the exact latest snapshot (or `null`), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records.
 
 Resource reads always return the full stored watch state. Snapshot and event payloads are not abbreviated by the MCP tool layer.
 
@@ -30,7 +29,7 @@ Each watched PR is available at `watch-pr://owner/repository/pull/NUMBER`. A web
 
 ## Monitor feeds
 
-A monitor URL is scoped to one OAuth session and PR and carries no GitHub credential. It expires no later than 12 hours after creation; an earlier OAuth-session expiry also revokes it. Repeated `open_pr_monitor` calls reuse the same capability and deadline until it expires. The endpoint accepts only `GET /monitor/...`.
+A monitor URL is scoped to one OAuth session and PR and carries no GitHub credential. It expires no later than 12 hours after creation; an earlier OAuth-session expiry also revokes it. Repeated `watch_pr` calls reuse the same capability and deadline until it expires. The endpoint accepts only `GET /monitor/...`.
 
 The feed replays events after the URL's `cursor` or the `Last-Event-ID` header, then stays open for live events and heartbeat comments. Events contain bounded non-body `details`: one physical record per named check state, one-line mergeability and deployment changes, active review-comment count changes, deletion and thread changes, and attributed reaction changes such as `reaction created: @actor THUMBS_UP on PR #7 @author https://...` or `reaction deleted: @actor HEART from feedback #456 @author https://...`. Changed comment, review, and feedback records retain their IDs, thread/location/author/state fields, omit GitHub URLs, and carry the complete body, including multiline text. Full body records are outside the non-body detail budget, so a long body cannot hide later actionable records. Failed and cancelled checks include their URLs. Routine partial check completions leave `details` empty until the wave reaches a terminal state.
 
