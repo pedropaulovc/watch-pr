@@ -5,6 +5,11 @@ import * as z from "zod/v4";
 import { parseResourceUri, watchKey } from "./events";
 import type { GithubUser, PrMonitorRegistration, PullRequestSnapshot, StoredWatchState } from "./types";
 
+/**
+ * One watched pull request as `list_watched_prs` reports it: session-scoped identity, its
+ * resource URI, and the latest snapshot. `watch_pr` returns the same shape plus the
+ * `monitor` capability object.
+ */
 export interface WatchRegistration {
   key: string;
   repository: string;
@@ -14,6 +19,7 @@ export interface WatchRegistration {
   refreshScheduled: boolean;
 }
 
+/** Session-scoped operations behind the MCP tools, implemented by the hub. */
 export interface McpSessionContext {
   user: GithubUser;
   watches: Set<string>;
@@ -31,6 +37,11 @@ const pullRequestInputSchema = {
   number: z.number().int().positive().describe("Pull request number"),
 };
 
+/**
+ * Builds the MCP server for one authenticated session: the five JSON tools and the pull
+ * request resource. `watch_pr` is the single entry point for watching and monitoring;
+ * every tool returns its result as one JSON text block.
+ */
 export function createMcpServer(context: McpSessionContext): McpServer {
   const server = new McpServer(
     { name: "watch-pr", version: "0.1.0" },
@@ -49,6 +60,10 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "Watch pull request",
       description: "Subscribe to a pull request and open its read-only SSE monitor capability in one call. The JSON result is the watch registration plus `monitor: { monitorUrl, cursor, terminalState }`. Repeated calls reuse or renew the same capability.",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+      },
       inputSchema: pullRequestInputSchema,
     },
     async ({ repository, number }) => {
@@ -68,6 +83,10 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "Unwatch pull request",
       description: "Stop receiving updates for a pull request.",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+      },
       inputSchema: pullRequestInputSchema,
     },
     async ({ repository, number }) => {
@@ -86,6 +105,9 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "List watched pull requests",
       description: "List pull requests watched by the authenticated GitHub account.",
+      annotations: {
+        readOnlyHint: true,
+      },
       inputSchema: {},
     },
     async () => ({
@@ -101,6 +123,9 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "Get pull request state",
       description: "Read the latest durable pull request snapshot. A refresh is scheduled after webhook or timer events.",
+      annotations: {
+        readOnlyHint: true,
+      },
       inputSchema: pullRequestInputSchema,
     },
     async ({ repository, number }) => {
@@ -119,6 +144,9 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     {
       title: "List pull request events",
       description: "Read recent webhook and snapshot events for a watched pull request.",
+      annotations: {
+        readOnlyHint: true,
+      },
       inputSchema: {
         ...pullRequestInputSchema,
         limit: z.number().int().min(1).max(100).default(20).describe("Maximum number of events"),

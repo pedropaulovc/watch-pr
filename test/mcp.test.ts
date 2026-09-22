@@ -214,7 +214,7 @@ async function callTool(
 
 async function listTools(
   sessionContext: McpSessionContext = context(),
-): Promise<Array<{ name: string; inputSchema: { properties?: Record<string, unknown> } }>> {
+): Promise<Array<{ name: string; inputSchema: { properties?: Record<string, unknown> }; annotations?: Record<string, unknown> }>> {
   const transport = new WebStandardStreamableHTTPServerTransport({
     enableJsonResponse: true,
     sessionIdGenerator: () => "test-session",
@@ -252,7 +252,7 @@ async function listTools(
       params: {},
     }, sessionId);
     const body = await response.json() as {
-      result: { tools: Array<{ name: string; inputSchema: { properties?: Record<string, unknown> } }> };
+      result: { tools: Array<{ name: string; inputSchema: { properties?: Record<string, unknown> }; annotations?: Record<string, unknown> }> };
     };
     return body.result.tools;
   } finally {
@@ -299,6 +299,17 @@ describe("MCP JSON output", () => {
       "unwatch_pr",
       "watch_pr",
     ]);
+  });
+
+  it("advertises behavior hints matching each tool's side effects", async () => {
+    const tools = await listTools();
+    expect(Object.fromEntries(tools.map((tool) => [tool.name, tool.annotations]))).toEqual({
+      watch_pr: { readOnlyHint: false, destructiveHint: false },
+      unwatch_pr: { readOnlyHint: false, destructiveHint: true },
+      list_watched_prs: { readOnlyHint: true },
+      get_pr: { readOnlyHint: true },
+      list_pr_events: { readOnlyHint: true },
+    });
   });
 
   it("serializes a sidecar-backed event history", async () => {

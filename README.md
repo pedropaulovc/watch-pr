@@ -18,7 +18,7 @@ Authenticate with the OAuth 2.0 authorization-code flow advertised at `/.well-kn
 - `get_pr`: Read the latest durable pull request snapshot.
 - `list_pr_events`: Read up to 100 recent webhook and snapshot events.
 
-Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the exact latest snapshot (or `null`), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records.
+Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the exact latest snapshot (or `null`), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records. Tools also advertise MCP behavior hints: `watch_pr` is additive (`destructiveHint: false`), `unwatch_pr` is destructive, and `list_watched_prs`, `get_pr`, and `list_pr_events` are read-only.
 
 Resource reads always return the full stored watch state. Snapshot and event payloads are not abbreviated by the MCP tool layer.
 
