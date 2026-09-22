@@ -8,7 +8,7 @@ import {
   writeStoredWatchState,
   type WatchStorage,
 } from "../src/hub";
-import type { PullRequestSnapshot, StoredWatchState, WatchEvent } from "../src/types";
+import type { PrMonitorRegistration, PullRequestSnapshot, StoredWatchState, WatchEvent } from "../src/types";
 import { watchStorageKey } from "../src/types";
 
 function memoryStorage(): WatchStorage {
@@ -135,6 +135,12 @@ const event: WatchEvent = {
 
 const state: StoredWatchState = { snapshot, events: [event] };
 
+const monitor: PrMonitorRegistration = {
+  monitorUrl: "https://watch-pr.test/monitor/capability?cursor=event-1",
+  cursor: "event-1",
+  terminalState: "watching",
+};
+
 function context(currentSnapshot: PullRequestSnapshot = snapshot): McpSessionContext {
   const currentRegistration = { ...registration, snapshot: currentSnapshot };
   const currentState = { ...state, snapshot: currentSnapshot };
@@ -151,11 +157,7 @@ function context(currentSnapshot: PullRequestSnapshot = snapshot): McpSessionCon
     unwatch: async () => true,
     listWatches: async () => [currentRegistration],
     readWatch: async () => currentState,
-    openMonitor: async () => ({
-      monitorUrl: "https://watch-pr.test/monitor/capability?cursor=event-1",
-      cursor: "event-1",
-      terminalState: "watching",
-    }),
+    openMonitor: async () => monitor,
     subscribe: async () => undefined,
     unsubscribe: async () => undefined,
   };
@@ -212,7 +214,7 @@ async function callTool(
 
 async function listTools(
   sessionContext: McpSessionContext = context(),
-): Promise<Array<{ name: string; inputSchema: { properties?: Record<string, unknown> } }>> {
+): Promise<Array<{ name: string; inputSchema: { properties?: Record<string, unknown> }; annotations?: Record<string, unknown> }>> {
   const transport = new WebStandardStreamableHTTPServerTransport({
     enableJsonResponse: true,
     sessionIdGenerator: () => "test-session",
@@ -250,7 +252,7 @@ async function listTools(
       params: {},
     }, sessionId);
     const body = await response.json() as {
-      result: { tools: Array<{ name: string; inputSchema: { properties?: Record<string, unknown> } }> };
+      result: { tools: Array<{ name: string; inputSchema: { properties?: Record<string, unknown> }; annotations?: Record<string, unknown> }> };
     };
     return body.result.tools;
   } finally {
@@ -263,7 +265,7 @@ describe("MCP JSON output", () => {
     expect(JSON.parse(await callTool("watch_pr", {
       repository: "owner/repo",
       number: 7,
-    }))).toEqual(registration);
+    }))).toEqual({ ...registration, monitor });
     expect(JSON.parse(await callTool("list_watched_prs", {}))).toEqual([registration]);
     expect(JSON.parse(await callTool("unwatch_pr", {
       repository: "owner/repo",
@@ -288,15 +290,25 @@ describe("MCP JSON output", () => {
     }
   });
 
-  it("returns the read-only monitor capability as JSON text", async () => {
-    const result = JSON.parse(await callTool("open_pr_monitor", {
-      repository: "owner/repo",
-      number: 7,
-    })) as Record<string, unknown>;
-    expect(result).toEqual({
-      monitorUrl: "https://watch-pr.test/monitor/capability?cursor=event-1",
-      cursor: "event-1",
-      terminalState: "watching",
+  it("exposes exactly the merged tool surface", async () => {
+    const tools = await listTools();
+    expect(tools.map((tool) => tool.name).sort()).toEqual([
+      "get_pr",
+      "list_pr_events",
+      "list_watched_prs",
+      "unwatch_pr",
+      "watch_pr",
+    ]);
+  });
+
+  it("advertises behavior hints matching each tool's side effects", async () => {
+    const tools = await listTools();
+    expect(Object.fromEntries(tools.map((tool) => [tool.name, tool.annotations]))).toEqual({
+      watch_pr: { readOnlyHint: false, destructiveHint: false },
+      unwatch_pr: { readOnlyHint: false, destructiveHint: true },
+      list_watched_prs: { readOnlyHint: true },
+      get_pr: { readOnlyHint: true },
+      list_pr_events: { readOnlyHint: true },
     });
   });
 
