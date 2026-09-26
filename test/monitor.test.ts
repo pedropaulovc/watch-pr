@@ -499,6 +499,33 @@ describe("native monitor feed", () => {
       terminalState: "merged",
     });
     await expect(replay.reader.read()).resolves.toMatchObject({ done: true });
+
+    const olderHeaderResponse = await hub.fetch(new Request(
+      `https://watch-pr.test/monitor/${capability}?cursor=event-terminal`,
+      { headers: { "last-event-id": "event-1" } },
+    ));
+    expect(olderHeaderResponse.status).toBe(200);
+    const olderHeaderFeed = feedReader(olderHeaderResponse);
+    await expect(nextMonitorEvent(olderHeaderFeed)).resolves.toMatchObject({
+      id: "event-terminal",
+      terminalState: "merged",
+    });
+    await expect(olderHeaderFeed.reader.read()).resolves.toMatchObject({ done: true });
+  });
+
+  it("keeps watching when Last-Event-ID acknowledges the latest nonterminal event", async () => {
+    const { hub, storage } = hubFixture();
+    const current = snapshot();
+    await storeMonitor(storage, { snapshot: current, events: [event("event-1", current)] });
+    const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}`, {
+      headers: { "last-event-id": "event-1" },
+    }));
+    expect(response.status).toBe(200);
+    const feed = feedReader(response);
+    const connected = await feed.reader.read();
+    expect(connected.done).toBe(false);
+    expect(feed.decoder.decode(connected.value)).toContain(": connected\n\n");
+    await feed.reader.cancel();
   });
 
   it("stops an acknowledged synthetic terminal snapshot after an empty event log", async () => {
