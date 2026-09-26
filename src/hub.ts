@@ -1500,10 +1500,10 @@ export class WatchPrHub {
     const newestStoredEvent = watchState.events.at(-1);
     if (
       (currentTerminalState === "merged" || currentTerminalState === "closed") &&
-      cursor &&
-      newestStoredEvent &&
-      newestStoredEvent.terminalState !== "watching" &&
-      cursor === newestStoredEvent.id
+      headerCursor &&
+      (newestStoredEvent
+        ? newestStoredEvent.terminalState !== "watching" && headerCursor === newestStoredEvent.id
+        : headerCursor === `snapshot-${watchState.snapshot?.fetchedAt ?? "unavailable"}`)
     ) {
       const confirmed = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
       if (

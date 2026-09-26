@@ -12,6 +12,10 @@
 - GitHub App webhooks produce MCP resource updates. A one-minute cron performs reconciliation.
 - A changed snapshot sends `notifications/resources/updated` and a compact summary through `notifications/message`.
 
+### Monitor ingress guard
+
+Production's `vza.net` Cloudflare zone (account `be2aff099f03e835047ba1f8cfd9aa81`) has an active WAF rate-limit rule `5fb1909d8a5b4a4bb0c9de97b6197a13` named `watch-pr monitor reconnect storm`: match `http.host eq "watch-pr.vza.net" and starts_with(http.request.uri.path, "/monitor/")`, block each source IP after two matching requests in 10 seconds for 10 seconds. This runs before the Worker and protects its daily invocation allowance against a reconnect loop from one IP. It does not cap aggregate traffic across IPs or requests sent directly to the Worker’s `workers.dev` hostname. Keep this rule aligned with the canonical monitor URL if the hostname changes.
+
 ### Webhook delivery
 
 The webhook handler verifies `X-Hub-Signature-256` and deduplicates `X-GitHub-Delivery` IDs in memory during fanout. Each successfully published watch stores the delivery ID in its own watch state. The global `delivery:<id>` marker is written only after every matched watch succeeds.

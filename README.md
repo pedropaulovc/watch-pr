@@ -37,7 +37,7 @@ An active watch reports a reaction even when the same refresh first reveals its 
 
 Scheduled polling removes expired capabilities. `unwatch_pr` revokes active capabilities. Merged and closed feeds emit a terminal event and close.
 
-The feed sends an SSE `retry: 60000` directive so reconnecting clients wait at least one minute after a dropped connection. A reconnect that acknowledges the latest terminal event with `Last-Event-ID` receives HTTP `204 No Content`, which stops automatic EventSource reconnection. Clients must stop after a terminal event and preserve event IDs across reconnects; callers that need the completed history can use `list_pr_events`.
+The feed sends an SSE `retry: 60000` directive for EventSource-compatible clients after a dropped connection. A reconnect that acknowledges the latest terminal event with `Last-Event-ID` receives HTTP `204 No Content`, which stops automatic EventSource reconnection; the URL's `cursor` alone does not acknowledge delivery. Clients must stop after a terminal event and preserve event IDs across reconnects; callers that need the completed history can use `list_pr_events`.
 
 ## Snapshots
 

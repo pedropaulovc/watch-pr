@@ -472,20 +472,22 @@ describe("native monitor feed", () => {
     await internals.publishEvent(userId, watch, event("duplicate-terminal", mergedSnapshot), { snapshot: mergedSnapshot });
     const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-terminal"]);
-    const storageKey = watchStorageKey(userId, repository, number);
-    storage.getKeys.length = 0;
-    const registerFeed = vi.spyOn(internals.activeMonitorFeeds, "set");
     const completedReconnect = await hub.fetch(new Request(url, {
       headers: { "last-event-id": "event-terminal" },
     }));
     expect(completedReconnect.status).toBe(204);
     expect(completedReconnect.body).toBeNull();
     expect(completedReconnect.headers.get("cache-control")).toBe("no-store");
-    expect(registerFeed).not.toHaveBeenCalled();
-    registerFeed.mockRestore();
-    expect(storage.getKeys.some((key) => key.startsWith(`${storageKey}:sidecar:event:`))).toBe(false);
+    // The URL cursor alone is not an acknowledgement: a newly issued monitor URL may already be terminal.
+    const firstTerminalRead = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}?cursor=event-terminal`));
+    expect(firstTerminalRead.status).toBe(200);
+    const firstTerminalFeed = feedReader(firstTerminalRead);
+    await expect(nextMonitorEvent(firstTerminalFeed)).resolves.toMatchObject({
+      id: "event-terminal",
+      terminalState: "merged",
+    });
+    await expect(firstTerminalFeed.reader.read()).resolves.toMatchObject({ done: true });
 
-    storage.getKeys.length = 0;
     const replayResponse = await hub.fetch(new Request(url));
     expect(replayResponse.status).toBe(200);
     const replay = feedReader(replayResponse);
@@ -497,7 +499,25 @@ describe("native monitor feed", () => {
       terminalState: "merged",
     });
     await expect(replay.reader.read()).resolves.toMatchObject({ done: true });
-    expect(storage.getKeys).toContain(watchSidecarEventKey(storageKey, 0));
+  });
+
+  it("stops an acknowledged synthetic terminal snapshot after an empty event log", async () => {
+    const { hub, storage } = hubFixture();
+    const mergedSnapshot = snapshot({ state: "closed", merged: true, mergedAt: "2026-09-10T12:02:00.000Z" });
+    await storeMonitor(storage, { snapshot: mergedSnapshot, events: [] });
+    const url = `https://watch-pr.test/monitor/${capability}`;
+    const first = feedReader(await hub.fetch(new Request(url)));
+    await expect(nextMonitorEvent(first)).resolves.toMatchObject({
+      id: `snapshot-${mergedSnapshot.fetchedAt}`,
+      action: "terminal_snapshot",
+      terminalState: "merged",
+    });
+    await expect(first.reader.read()).resolves.toMatchObject({ done: true });
+    const acknowledged = await hub.fetch(new Request(url, {
+      headers: { "last-event-id": `snapshot-${mergedSnapshot.fetchedAt}` },
+    }));
+    expect(acknowledged.status).toBe(204);
+    expect(acknowledged.body).toBeNull();
   });
 
   it("reports the reaction counts a merge could not attribute instead of restoring the stored ones", async () => {
