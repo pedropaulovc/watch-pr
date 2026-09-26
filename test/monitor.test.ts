@@ -365,6 +365,9 @@ describe("native monitor feed", () => {
     ));
     expect(response.status).toBe(200);
     const feed = feedReader(response);
+    const connected = await feed.reader.read();
+    expect(connected.done).toBe(false);
+    expect(feed.decoder.decode(connected.value)).toContain("retry: 60000\n: connected\n\n");
     await expect(nextMonitorEvent(feed)).resolves.toMatchObject({ id: "event-2", terminalState: "watching" });
 
     const third = event("event-3", snapshot({ headSha: "def", fetchedAt: "2026-09-10T12:01:00.000Z" }));
@@ -438,12 +441,17 @@ describe("native monitor feed", () => {
     await feed.reader.cancel();
   });
 
-  it("publishes one terminal event and closes the live feed", async () => {
+  it("stops terminal reconnects and preserves older-cursor replay", async () => {
     const { hub, storage } = hubFixture();
     const initial = event("event-1");
     await storeMonitor(storage, { snapshot: initial.snapshot, events: [initial] });
-    const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}?cursor=event-1`));
+    const url = `https://watch-pr.test/monitor/${capability}?cursor=event-1`;
+    const response = await hub.fetch(new Request(url));
+    expect(response.status).toBe(200);
     const feed = feedReader(response);
+    const connected = await feed.reader.read();
+    expect(connected.done).toBe(false);
+    expect(feed.decoder.decode(connected.value)).toContain("retry: 60000\n: connected\n\n");
 
     const mergedSnapshot = snapshot({
       state: "closed",
@@ -464,6 +472,79 @@ describe("native monitor feed", () => {
     await internals.publishEvent(userId, watch, event("duplicate-terminal", mergedSnapshot), { snapshot: mergedSnapshot });
     const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-terminal"]);
+    const completedReconnect = await hub.fetch(new Request(url, {
+      headers: { "last-event-id": "event-terminal" },
+    }));
+    expect(completedReconnect.status).toBe(204);
+    expect(completedReconnect.body).toBeNull();
+    expect(completedReconnect.headers.get("cache-control")).toBe("no-store");
+    // The URL cursor alone is not an acknowledgement: a newly issued monitor URL may already be terminal.
+    const firstTerminalRead = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}?cursor=event-terminal`));
+    expect(firstTerminalRead.status).toBe(200);
+    const firstTerminalFeed = feedReader(firstTerminalRead);
+    await expect(nextMonitorEvent(firstTerminalFeed)).resolves.toMatchObject({
+      id: "event-terminal",
+      terminalState: "merged",
+    });
+    await expect(firstTerminalFeed.reader.read()).resolves.toMatchObject({ done: true });
+
+    const replayResponse = await hub.fetch(new Request(url));
+    expect(replayResponse.status).toBe(200);
+    const replay = feedReader(replayResponse);
+    const replayPrelude = await replay.reader.read();
+    expect(replayPrelude.done).toBe(false);
+    expect(replay.decoder.decode(replayPrelude.value)).toContain("retry: 60000\n: connected\n\n");
+    await expect(nextMonitorEvent(replay)).resolves.toMatchObject({
+      id: "event-terminal",
+      terminalState: "merged",
+    });
+    await expect(replay.reader.read()).resolves.toMatchObject({ done: true });
+
+    const olderHeaderResponse = await hub.fetch(new Request(
+      `https://watch-pr.test/monitor/${capability}?cursor=event-terminal`,
+      { headers: { "last-event-id": "event-1" } },
+    ));
+    expect(olderHeaderResponse.status).toBe(200);
+    const olderHeaderFeed = feedReader(olderHeaderResponse);
+    await expect(nextMonitorEvent(olderHeaderFeed)).resolves.toMatchObject({
+      id: "event-terminal",
+      terminalState: "merged",
+    });
+    await expect(olderHeaderFeed.reader.read()).resolves.toMatchObject({ done: true });
+  });
+
+  it("keeps watching when Last-Event-ID acknowledges the latest nonterminal event", async () => {
+    const { hub, storage } = hubFixture();
+    const current = snapshot();
+    await storeMonitor(storage, { snapshot: current, events: [event("event-1", current)] });
+    const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}`, {
+      headers: { "last-event-id": "event-1" },
+    }));
+    expect(response.status).toBe(200);
+    const feed = feedReader(response);
+    const connected = await feed.reader.read();
+    expect(connected.done).toBe(false);
+    expect(feed.decoder.decode(connected.value)).toContain(": connected\n\n");
+    await feed.reader.cancel();
+  });
+
+  it("stops an acknowledged synthetic terminal snapshot after an empty event log", async () => {
+    const { hub, storage } = hubFixture();
+    const mergedSnapshot = snapshot({ state: "closed", merged: true, mergedAt: "2026-09-10T12:02:00.000Z" });
+    await storeMonitor(storage, { snapshot: mergedSnapshot, events: [] });
+    const url = `https://watch-pr.test/monitor/${capability}`;
+    const first = feedReader(await hub.fetch(new Request(url)));
+    await expect(nextMonitorEvent(first)).resolves.toMatchObject({
+      id: `snapshot-${mergedSnapshot.fetchedAt}`,
+      action: "terminal_snapshot",
+      terminalState: "merged",
+    });
+    await expect(first.reader.read()).resolves.toMatchObject({ done: true });
+    const acknowledged = await hub.fetch(new Request(url, {
+      headers: { "last-event-id": `snapshot-${mergedSnapshot.fetchedAt}` },
+    }));
+    expect(acknowledged.status).toBe(204);
+    expect(acknowledged.body).toBeNull();
   });
 
   it("reports the reaction counts a merge could not attribute instead of restoring the stored ones", async () => {
@@ -1166,6 +1247,15 @@ describe("native monitor feed", () => {
     const active = internals.newActiveSession(sessionToken, record, "stateful");
     const registration = await internals.openMonitor(active, repository, number);
     expect(registration).toMatchObject({ cursor: "event-closed", terminalState: "closed" });
+    expect(new URL(registration.monitorUrl).searchParams.has("cursor")).toBe(false);
+    const firstRead = await hub.fetch(new Request(registration.monitorUrl));
+    expect(firstRead.status).toBe(200);
+    const terminalFeed = feedReader(firstRead);
+    await expect(nextMonitorEvent(terminalFeed)).resolves.toMatchObject({
+      id: "event-closed",
+      terminalState: "closed",
+    });
+    await expect(terminalFeed.reader.read()).resolves.toMatchObject({ done: true });
 
     const fetchMock = vi.fn(async () => new Response("unexpected GitHub request"));
     vi.stubGlobal("fetch", fetchMock);
@@ -1177,6 +1267,38 @@ describe("native monitor feed", () => {
       vi.unstubAllGlobals();
     }
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("replays the terminal event when a client sends the issued URL cursor as its first header", async () => {
+    const { hub, storage } = hubFixture();
+    const initial = event("event-initial");
+    const terminalSnapshot = snapshot({ state: "closed", merged: true, mergedAt: "2026-09-10T12:03:00.000Z" });
+    const terminal = event("event-merged", terminalSnapshot, { action: "closed", changes: ["lifecycle"] });
+    const record = sessionRecord();
+    await storeMonitor(storage, { snapshot: terminalSnapshot, events: [initial, terminal] }, record);
+    const internals = hub as unknown as HubInternals;
+    const active = internals.newActiveSession(sessionToken, record, "stateful");
+    const registration = await internals.openMonitor(active, repository, number);
+    expect(registration.cursor).toBe("event-merged");
+    const firstUrl = new URL(registration.monitorUrl);
+    const initialCursor = firstUrl.searchParams.get("cursor");
+    expect(initialCursor).toBe("event-initial");
+    firstUrl.searchParams.delete("cursor");
+
+    const firstRead = await hub.fetch(new Request(firstUrl, {
+      headers: { "last-event-id": initialCursor! },
+    }));
+    expect(firstRead.status).toBe(200);
+    const feed = feedReader(firstRead);
+    await expect(nextMonitorEvent(feed)).resolves.toMatchObject({
+      id: "event-merged",
+      terminalState: "merged",
+    });
+    await expect(feed.reader.read()).resolves.toMatchObject({ done: true });
+    const acknowledged = await hub.fetch(new Request(firstUrl, {
+      headers: { "last-event-id": "event-merged" },
+    }));
+    expect(acknowledged.status).toBe(204);
   });
 
   it("publishes stack pushes only to watches whose head or direct base matches", async () => {

@@ -37,6 +37,10 @@ An active watch reports a reaction even when the same refresh first reveals its 
 
 Scheduled polling removes expired capabilities. `unwatch_pr` revokes active capabilities. Merged and closed feeds emit a terminal event and close.
 
+For an already-terminal PR, the issued URL's cursor precedes the terminal event (or is absent when that is the only event). The registration's `cursor` still identifies the newest stored event. Clients that put the issued URL cursor in their first `Last-Event-ID` header therefore receive the terminal event instead of an acknowledgement response.
+
+The feed sends an SSE `retry: 60000` directive for EventSource-compatible clients; after a dropped connection, including one on a live watch, automatic reconnection waits one minute and replays from `Last-Event-ID`. A reconnect that acknowledges the latest terminal event with that header receives HTTP `204 No Content`, which stops automatic EventSource reconnection; the URL's `cursor` alone does not acknowledge delivery. Clients must stop after a terminal event and preserve event IDs across reconnects; callers that need the completed history can use `list_pr_events`.
+
 ## Snapshots
 
 Snapshots include PR lifecycle and mergeability, base and head refs, checks and commit statuses, reviews, top-level and inline comments, GraphQL review-thread resolution state, and reactions.

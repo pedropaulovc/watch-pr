@@ -1497,6 +1497,30 @@ export class WatchPrHub {
 
     const watchState = await this.watchStateMetadata(record.userId, key);
     const currentTerminalState = terminalState(watchState.snapshot);
+    const newestStoredEvent = watchState.events.at(-1);
+    if (
+      (currentTerminalState === "merged" || currentTerminalState === "closed") &&
+      headerCursor &&
+      (newestStoredEvent
+        ? newestStoredEvent.terminalState !== "watching" && headerCursor === newestStoredEvent.id
+        : headerCursor === `snapshot-${watchState.snapshot?.fetchedAt ?? "unavailable"}`)
+    ) {
+      const confirmed = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
+      if (
+        !confirmed ||
+        confirmed.sessionToken !== record.sessionToken ||
+        confirmed.userId !== record.userId ||
+        confirmed.repository !== record.repository ||
+        confirmed.pullRequestNumber !== record.pullRequestNumber ||
+        confirmed.expiresAt !== record.expiresAt
+      ) {
+        return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+      }
+      return new Response(null, {
+        status: 204,
+        headers: { "cache-control": "no-store" },
+      });
+    }
     let selected = watchState.events;
     let reconciliationAction: "cursor_miss" | "terminal_snapshot" | null = null;
     if (cursor) {
@@ -1596,7 +1620,7 @@ export class WatchPrHub {
           ? [...events, ...pending].filter((event) => event.terminalState === "watching")
           : [...events, ...pending];
         activeFeed.ready = true;
-        streamController.enqueue(monitorEncoder.encode(": connected\n\n"));
+        streamController.enqueue(monitorEncoder.encode("retry: 60000\n: connected\n\n"));
         for (const event of queued) streamController.enqueue(monitorFrame(event));
         if (finalTerminalState !== "watching") this.closeMonitorFeed(activeFeed);
       }
@@ -1904,12 +1928,16 @@ export class WatchPrHub {
 
     const state = await this.watchStateMetadata(record.userId, key);
     const cursor = state.events.at(-1)?.id ?? null;
+    const currentState = terminalState(state.snapshot);
+    // Clients may send the URL cursor as Last-Event-ID on their first request.
+    // A terminal URL must start before its final event so that request still receives it.
+    const initialCursor = currentState === "watching" ? cursor : (state.events.at(-2)?.id ?? null);
     const monitorUrl = new URL(`${this.baseUrl()}/monitor/${capability}`);
-    if (cursor) monitorUrl.searchParams.set("cursor", cursor);
+    if (initialCursor) monitorUrl.searchParams.set("cursor", initialCursor);
     return {
       monitorUrl: monitorUrl.toString(),
       cursor,
-      terminalState: terminalState(state.snapshot),
+      terminalState: currentState,
     };
   }
 
