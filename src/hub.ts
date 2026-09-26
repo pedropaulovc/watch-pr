@@ -2068,7 +2068,7 @@ export class WatchPrHub {
         await this.closeActiveSessionsForToken(active.token);
         throw new Error("session is no longer active");
       }
-      this.syncActiveSessions(active.token, updated.record);
+      this.syncActiveSessions(active.token, updated.record, active);
       return updated.result;
     });
   }
@@ -2604,9 +2604,13 @@ export class WatchPrHub {
     return { published: true, write };
   }
 
-  private syncActiveSessions(token: string, record: SessionRecord): void {
+  private syncActiveSessions(token: string, record: SessionRecord, caller?: ActiveSession): void {
+    if (caller?.token === token) {
+      caller.record = record;
+      this.syncActiveSession(caller, record);
+    }
     for (const active of this.activeSessions.values()) {
-      if (active.token !== token) continue;
+      if (active.token !== token || active === caller) continue;
       active.record = record;
       this.syncActiveSession(active, record);
     }
