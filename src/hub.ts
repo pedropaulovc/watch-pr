@@ -1928,12 +1928,16 @@ export class WatchPrHub {
 
     const state = await this.watchStateMetadata(record.userId, key);
     const cursor = state.events.at(-1)?.id ?? null;
+    const currentState = terminalState(state.snapshot);
+    // Clients may send the URL cursor as Last-Event-ID on their first request.
+    // A terminal URL must start before its final event so that request still receives it.
+    const initialCursor = currentState === "watching" ? cursor : (state.events.at(-2)?.id ?? null);
     const monitorUrl = new URL(`${this.baseUrl()}/monitor/${capability}`);
-    if (cursor) monitorUrl.searchParams.set("cursor", cursor);
+    if (initialCursor) monitorUrl.searchParams.set("cursor", initialCursor);
     return {
       monitorUrl: monitorUrl.toString(),
       cursor,
-      terminalState: terminalState(state.snapshot),
+      terminalState: currentState,
     };
   }
 

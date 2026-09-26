@@ -1247,6 +1247,15 @@ describe("native monitor feed", () => {
     const active = internals.newActiveSession(sessionToken, record, "stateful");
     const registration = await internals.openMonitor(active, repository, number);
     expect(registration).toMatchObject({ cursor: "event-closed", terminalState: "closed" });
+    expect(new URL(registration.monitorUrl).searchParams.has("cursor")).toBe(false);
+    const firstRead = await hub.fetch(new Request(registration.monitorUrl));
+    expect(firstRead.status).toBe(200);
+    const terminalFeed = feedReader(firstRead);
+    await expect(nextMonitorEvent(terminalFeed)).resolves.toMatchObject({
+      id: "event-closed",
+      terminalState: "closed",
+    });
+    await expect(terminalFeed.reader.read()).resolves.toMatchObject({ done: true });
 
     const fetchMock = vi.fn(async () => new Response("unexpected GitHub request"));
     vi.stubGlobal("fetch", fetchMock);
@@ -1258,6 +1267,38 @@ describe("native monitor feed", () => {
       vi.unstubAllGlobals();
     }
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("replays the terminal event when a client sends the issued URL cursor as its first header", async () => {
+    const { hub, storage } = hubFixture();
+    const initial = event("event-initial");
+    const terminalSnapshot = snapshot({ state: "closed", merged: true, mergedAt: "2026-09-10T12:03:00.000Z" });
+    const terminal = event("event-merged", terminalSnapshot, { action: "closed", changes: ["lifecycle"] });
+    const record = sessionRecord();
+    await storeMonitor(storage, { snapshot: terminalSnapshot, events: [initial, terminal] }, record);
+    const internals = hub as unknown as HubInternals;
+    const active = internals.newActiveSession(sessionToken, record, "stateful");
+    const registration = await internals.openMonitor(active, repository, number);
+    expect(registration.cursor).toBe("event-merged");
+    const firstUrl = new URL(registration.monitorUrl);
+    const initialCursor = firstUrl.searchParams.get("cursor");
+    expect(initialCursor).toBe("event-initial");
+    firstUrl.searchParams.delete("cursor");
+
+    const firstRead = await hub.fetch(new Request(firstUrl, {
+      headers: { "last-event-id": initialCursor! },
+    }));
+    expect(firstRead.status).toBe(200);
+    const feed = feedReader(firstRead);
+    await expect(nextMonitorEvent(feed)).resolves.toMatchObject({
+      id: "event-merged",
+      terminalState: "merged",
+    });
+    await expect(feed.reader.read()).resolves.toMatchObject({ done: true });
+    const acknowledged = await hub.fetch(new Request(firstUrl, {
+      headers: { "last-event-id": "event-merged" },
+    }));
+    expect(acknowledged.status).toBe(204);
   });
 
   it("publishes stack pushes only to watches whose head or direct base matches", async () => {
