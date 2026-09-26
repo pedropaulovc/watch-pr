@@ -18,6 +18,8 @@ import {
   watchSidecarEventKey,
   watchSidecarIndexKey,
   watchSidecarSnapshotKey,
+  monitorCapabilityStorageKey,
+  monitorScopeStorageKey,
   watchStorageKey,
 } from "../src/types";
 
@@ -634,6 +636,95 @@ describe("OAuth broker", () => {
     const active = (hub as unknown as HubSessionInternals).activeSessions.get(mcpSessionId);
     expect(active?.subscriptions.has(key)).toBe(true);
     await hub.fetch(new Request("https://watch-pr.vza.net/mcp", { method: "DELETE", headers: streamHeaders }));
+  });
+
+  it("rewatches and opens a monitor from an ephemeral recovered session", async () => {
+    const { hub, storage, pending } = hubFixture();
+    const sessionToken = "ephemeral-rewatch-token";
+    const mcpSessionId = "ephemeral-rewatch-session";
+    const key = "owner/repo#7";
+    const record = sessionRecord({ watches: [key], subscriptions: [key] });
+    await storage.put(sessionStorageKey(sessionToken), record);
+
+    const internals = hub as unknown as HubSessionInternals;
+    const clients = [
+      internals.newActiveSession(sessionToken, structuredClone(record), "stateful"),
+      internals.newActiveSession(sessionToken, structuredClone(record), "stateful"),
+    ];
+    internals.activeSessions.set("first-stateful-client", clients[0]);
+    internals.activeSessions.set("second-stateful-client", clients[1]);
+
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("GitHub unavailable", { status: 503 })));
+    const headers = {
+      authorization: `Bearer ${sessionToken}`,
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json",
+      "mcp-session-id": mcpSessionId,
+      "mcp-protocol-version": "2025-06-18",
+    };
+    const callTool = async (id: number, name: "unwatch_pr" | "watch_pr") => {
+      expect(internals.activeSessions.has(mcpSessionId)).toBe(false);
+      const response = await hub.fetch(new Request("https://watch-pr.vza.net/mcp", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name, arguments: { repository: "owner/repo", number: 7 } },
+        }),
+      }));
+      expect(response.status).toBe(200);
+      return await response.json() as {
+        result?: { isError?: boolean; content?: Array<{ text?: string }> };
+      };
+    };
+
+    try {
+      const unwatched = await callTool(1, "unwatch_pr");
+      expect(unwatched.result?.isError).not.toBe(true);
+      expect(JSON.parse(unwatched.result?.content?.[0]?.text ?? "null")).toEqual({
+        repository: "owner/repo",
+        number: 7,
+        removed: true,
+      });
+      for (const client of clients) {
+        expect([...client.watches]).toEqual([]);
+        expect([...client.subscriptions]).toEqual([]);
+      }
+
+      const rewatched = await callTool(2, "watch_pr");
+      expect(rewatched.result?.isError).not.toBe(true);
+      const registration = JSON.parse(rewatched.result?.content?.[0]?.text ?? "null") as {
+        key: string;
+        monitor: { monitorUrl: string; cursor: string | null; terminalState: string };
+      };
+      expect(registration.key).toBe(key);
+      const monitorUrl = new URL(registration.monitor.monitorUrl);
+      expect(monitorUrl.pathname).toMatch(/^\/monitor\/[A-Za-z0-9_-]+$/u);
+      const capability = monitorUrl.pathname.slice("/monitor/".length);
+      expect(await storage.get(monitorScopeStorageKey(sessionToken, "owner/repo", 7))).toBe(capability);
+      expect(await storage.get(monitorCapabilityStorageKey(capability))).toMatchObject({
+        sessionToken,
+        userId: 42,
+        repository: "owner/repo",
+        pullRequestNumber: 7,
+      });
+      await expect(storage.get<SessionRecord>(sessionStorageKey(sessionToken))).resolves.toMatchObject({
+        watches: [key],
+        subscriptions: [key],
+      });
+      for (const client of clients) {
+        expect([...client.watches]).toEqual([key]);
+        expect([...client.subscriptions]).toEqual([key]);
+        expect(client.record.watches).toEqual([key]);
+      }
+      expect(internals.activeSessions.has(mcpSessionId)).toBe(false);
+    } finally {
+      await Promise.all(pending.splice(0));
+      vi.stubGlobal("fetch", originalFetch);
+    }
   });
 
   it("does not recover an MCP session after DELETE closes its recovered stream", async () => {
