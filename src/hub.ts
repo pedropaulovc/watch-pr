@@ -1497,6 +1497,30 @@ export class WatchPrHub {
 
     const watchState = await this.watchStateMetadata(record.userId, key);
     const currentTerminalState = terminalState(watchState.snapshot);
+    const newestStoredEvent = watchState.events.at(-1);
+    if (
+      (currentTerminalState === "merged" || currentTerminalState === "closed") &&
+      cursor &&
+      newestStoredEvent &&
+      newestStoredEvent.terminalState !== "watching" &&
+      cursor === newestStoredEvent.id
+    ) {
+      const confirmed = await this.state.storage.get<MonitorCapabilityRecord>(capabilityKey);
+      if (
+        !confirmed ||
+        confirmed.sessionToken !== record.sessionToken ||
+        confirmed.userId !== record.userId ||
+        confirmed.repository !== record.repository ||
+        confirmed.pullRequestNumber !== record.pullRequestNumber ||
+        confirmed.expiresAt !== record.expiresAt
+      ) {
+        return this.monitorError(404, "monitor_not_found", "monitor capability is invalid or revoked");
+      }
+      return new Response(null, {
+        status: 204,
+        headers: { "cache-control": "no-store" },
+      });
+    }
     let selected = watchState.events;
     let reconciliationAction: "cursor_miss" | "terminal_snapshot" | null = null;
     if (cursor) {
@@ -1596,7 +1620,7 @@ export class WatchPrHub {
           ? [...events, ...pending].filter((event) => event.terminalState === "watching")
           : [...events, ...pending];
         activeFeed.ready = true;
-        streamController.enqueue(monitorEncoder.encode(": connected\n\n"));
+        streamController.enqueue(monitorEncoder.encode("retry: 60000\n: connected\n\n"));
         for (const event of queued) streamController.enqueue(monitorFrame(event));
         if (finalTerminalState !== "watching") this.closeMonitorFeed(activeFeed);
       }

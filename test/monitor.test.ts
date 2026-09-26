@@ -365,6 +365,9 @@ describe("native monitor feed", () => {
     ));
     expect(response.status).toBe(200);
     const feed = feedReader(response);
+    const connected = await feed.reader.read();
+    expect(connected.done).toBe(false);
+    expect(feed.decoder.decode(connected.value)).toContain("retry: 60000\n: connected\n\n");
     await expect(nextMonitorEvent(feed)).resolves.toMatchObject({ id: "event-2", terminalState: "watching" });
 
     const third = event("event-3", snapshot({ headSha: "def", fetchedAt: "2026-09-10T12:01:00.000Z" }));
@@ -438,12 +441,17 @@ describe("native monitor feed", () => {
     await feed.reader.cancel();
   });
 
-  it("publishes one terminal event and closes the live feed", async () => {
+  it("stops terminal reconnects and preserves older-cursor replay", async () => {
     const { hub, storage } = hubFixture();
     const initial = event("event-1");
     await storeMonitor(storage, { snapshot: initial.snapshot, events: [initial] });
-    const response = await hub.fetch(new Request(`https://watch-pr.test/monitor/${capability}?cursor=event-1`));
+    const url = `https://watch-pr.test/monitor/${capability}?cursor=event-1`;
+    const response = await hub.fetch(new Request(url));
+    expect(response.status).toBe(200);
     const feed = feedReader(response);
+    const connected = await feed.reader.read();
+    expect(connected.done).toBe(false);
+    expect(feed.decoder.decode(connected.value)).toContain("retry: 60000\n: connected\n\n");
 
     const mergedSnapshot = snapshot({
       state: "closed",
@@ -464,6 +472,32 @@ describe("native monitor feed", () => {
     await internals.publishEvent(userId, watch, event("duplicate-terminal", mergedSnapshot), { snapshot: mergedSnapshot });
     const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1", "event-terminal"]);
+    const storageKey = watchStorageKey(userId, repository, number);
+    storage.getKeys.length = 0;
+    const registerFeed = vi.spyOn(internals.activeMonitorFeeds, "set");
+    const completedReconnect = await hub.fetch(new Request(url, {
+      headers: { "last-event-id": "event-terminal" },
+    }));
+    expect(completedReconnect.status).toBe(204);
+    expect(completedReconnect.body).toBeNull();
+    expect(completedReconnect.headers.get("cache-control")).toBe("no-store");
+    expect(registerFeed).not.toHaveBeenCalled();
+    registerFeed.mockRestore();
+    expect(storage.getKeys.some((key) => key.startsWith(`${storageKey}:sidecar:event:`))).toBe(false);
+
+    storage.getKeys.length = 0;
+    const replayResponse = await hub.fetch(new Request(url));
+    expect(replayResponse.status).toBe(200);
+    const replay = feedReader(replayResponse);
+    const replayPrelude = await replay.reader.read();
+    expect(replayPrelude.done).toBe(false);
+    expect(replay.decoder.decode(replayPrelude.value)).toContain("retry: 60000\n: connected\n\n");
+    await expect(nextMonitorEvent(replay)).resolves.toMatchObject({
+      id: "event-terminal",
+      terminalState: "merged",
+    });
+    await expect(replay.reader.read()).resolves.toMatchObject({ done: true });
+    expect(storage.getKeys).toContain(watchSidecarEventKey(storageKey, 0));
   });
 
   it("reports the reaction counts a merge could not attribute instead of restoring the stored ones", async () => {
