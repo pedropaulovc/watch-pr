@@ -766,7 +766,18 @@ export function snapshotChanges(
   return changes;
 }
 
-function checkBucket(check: PullRequestCheck): "pending" | "pass" | "fail" | "skipping" | "cancel" {
+type CheckBucket = "pending" | "pass" | "fail" | "skipping" | "cancel" | "action_required";
+
+/** Buckets that need someone to act, so summaries link them and transitions into them are announced. */
+const ATTENTION_BUCKETS: Partial<Record<CheckBucket, true>> = {
+  fail: true,
+  cancel: true,
+  action_required: true,
+};
+
+function checkBucket(check: PullRequestCheck): CheckBucket {
+  // Waiting on a person is the state to report, whatever GitHub's status says about the suite.
+  if (check.conclusion?.toLowerCase() === "action_required") return "action_required";
   if (check.status?.toLowerCase() !== "completed") return "pending";
   switch (check.conclusion?.toLowerCase()) {
     case "success":
@@ -795,7 +806,7 @@ function checkSummary(checks: PullRequestCheck[]): (string | MonitorDetail)[] {
     .sort((left, right) => left.name.localeCompare(right.name))
     .map((check) => {
       const bucket = checkBucket(check);
-      const url = (bucket === "fail" || bucket === "cancel") && check.url ? ` ${check.url}` : "";
+      const url = ATTENTION_BUCKETS[bucket] && check.url ? ` ${check.url}` : "";
       return `checks: ${check.name} -> ${bucket}${url}`;
     });
   if (details.length <= MAX_MONITOR_CHECK_LINES) return details;
@@ -820,7 +831,7 @@ function checkDetails(
   const selected = new Map<string, PullRequestCheck>();
   for (const check of current) {
     const bucket = checkBucket(check);
-    if (bucket !== "fail" && bucket !== "cancel") continue;
+    if (!ATTENTION_BUCKETS[bucket]) continue;
     const prior = previousByKey.get(checkKey(check));
     if (!prior || checkBucket(prior) !== bucket || prior.completedAt !== check.completedAt) {
       selected.set(checkKey(check), check);

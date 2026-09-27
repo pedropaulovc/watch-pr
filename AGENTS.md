@@ -38,6 +38,16 @@ A stale refresh that loses a race to a newer snapshot is dropped. Before any wri
 
 Numeric actor IDs determine actor identity when both records have one. Records created before actor IDs were stored fall back to normalized logins for diffing and filtering the watcher's own reactions.
 
+### Conditional requests
+
+A snapshot's `githubValidators` maps each REST request URL to the ETag of the response its content came from: the object URL for the pull and issue reads, and the `per_page=100` first-page URL for lists. Check URLs contain the head SHA, so a new head never sends an old validator. A refresh sends `If-None-Match` for each stored ETag, and a `304` reuses the matching slice of the stored snapshot: core fields (pull), `bodyReactions` (issue), `comments`, `reviews`, `reviewComments`, or the checks of one kind (check runs, statuses, check suites). A list that runs past one page stores no validator, because one page's ETag cannot vouch for the whole. Reaction detail reads stay unconditional.
+
+A validator is only as good as the content it describes. Whenever the hub stores a snapshot assembled from more than one source, such as a silent enrichment on the stored snapshot or a published event that merges stored reaction knowledge, `coherentRequestKnowledge` keeps a validator only when the stored content holds exactly the slice (compared as JSON) that the validator's source snapshot held for that URL. Comment slices are compared without reaction bookkeeping, which the list response does not carry. A dropped validator costs the next refresh one full read. It never makes a `304` return content that GitHub did not send.
+
+GraphQL review threads cannot be revalidated. A refresh reuses the stored `threads` only when the review comments returned `304` and `threadsReadAt` is less than 15 minutes old. Otherwise, or when a `pull_request_review_thread` webhook triggered the refresh, it reads the threads again. A failed threads read keeps the stored threads and drops `threadsReadAt`, so the next refresh retries.
+
+A refresh that announces nothing but carries different validators, or a threads read that replaces a stale one, is stored silently like a reaction enrichment: no event, monitor frame, or notification, and a newer stored `fetchedAt` wins. `snapshotChanges` ignores both fields. `fetchedAt` therefore records the last stored change. `watch:<user-id>:<repository>:<number>:polled` records the last successful GitHub read from any source (poll, watch, read, or webhook). It is written in its own transaction only when newer, and webhook fanout counts it in `storage_key_puts`. `get_pr` adds it as `polledAt` and omits `githubValidators`. Resource reads return `{ snapshot, events, polledAt }`.
+
 ### Event storage
 
 Each watch stores event history in versioned sidecar records:
