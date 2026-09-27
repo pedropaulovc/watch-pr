@@ -22,7 +22,7 @@ Tool calls return JSON text. `watch_pr` returns the registration object plus its
 
 Resource reads always return the full stored watch state as `{ snapshot, events, polledAt }`. Snapshot and event payloads are not abbreviated by the MCP tool layer.
 
-A snapshot's `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt`. `polledAt` is when GitHub was last read successfully for the watch, by a poll, a webhook, or a watch or read; it is `null` until the first successful read. `get_pr` omits the snapshot's `githubValidators`, which are request bookkeeping rather than pull request state.
+A snapshot's `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt`. `polledAt` is when GitHub was last read successfully for the watch and that read was stored, by a poll, a webhook, or a watch or read; a read whose result could not be stored does not advance it, so `polledAt` never vouches for data the snapshot lacks; it is `null` until the first successful read. `get_pr` omits the snapshot's `githubValidators`, which are request bookkeeping rather than pull request state.
 
 
 ## Resources
