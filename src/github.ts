@@ -61,7 +61,7 @@ function recordGithubUsage(usage: GithubUsage, path: string, response: Response)
 }
 
 
-type GithubRecord = Record<string, unknown>;
+export type GithubRecord = Record<string, unknown>;
 
 export class GithubApiError extends Error {
   readonly status: number;
@@ -202,7 +202,7 @@ function nextLink(linkHeader: string | null): string | null {
   return null;
 }
 
-function stringValue(record: GithubRecord, key: string): string | null {
+export function stringValue(record: GithubRecord, key: string): string | null {
   const value = record[key];
   return typeof value === "string" ? value : null;
 }
@@ -218,7 +218,7 @@ function repositoryFullName(value: unknown): string | null {
   }
 }
 
-function numberValue(record: GithubRecord, key: string): number {
+export function numberValue(record: GithubRecord, key: string): number {
   const value = record[key];
   return typeof value === "number" ? value : 0;
 }
@@ -247,7 +247,7 @@ function reactionCounts(value: unknown): ReactionCounts {
  * Reaction totals decide whether a target is worth a request at all: the summary GitHub
  * already returned with the comment is authoritative for "has no reactions".
  */
-function reactionTotal(counts: ReactionCounts): number {
+export function reactionTotal(counts: ReactionCounts): number {
   const total = counts.total_count;
   if (typeof total === "number") return total;
   let sum = 0;
@@ -392,7 +392,9 @@ interface SnapshotReactions {
  * top-level comments, and inline review comments, shares a single `REACTION_CONCURRENCY`
  * budget. Two kinds of target never spend a request: a zero summary count is authoritative
  * for "no reactions" as of the moment that summary response returned, and an unchanged
- * summary count over known details means the stored details still describe the target. The
+ * summary count over known details that add up to it means the stored details still
+ * describe the target. A webhook stores the counts its payload carries beside the details
+ * it could not read, so those details stop adding up and the next refresh reads them. The
  * residual blind spot is a swap that leaves every count identical - one `heart` replaced by
  * another actor's `heart` between two refreshes - which the summary cannot express and only
  * a per-target read would reveal. Reused details
@@ -445,7 +447,12 @@ async function snapshotReactions(
     if (reactionTotal(reactions) === 0) {
       slots[slot].reactionDetails = [];
       slots[slot].reactionDetailsReadAt = summary.observedAt;
-    } else if (prior?.reactionDetails && sameReactionCounts(prior.reactions, reactions)) {
+    } else if (
+      prior?.reactionDetails &&
+      sameReactionCounts(prior.reactions, reactions) &&
+      // A webhook advances the stored counts without reading the details behind them.
+      reactionDetailsMatchCounts(prior.reactionDetails, reactions)
+    ) {
       slots[slot].reactionDetails = prior.reactionDetails;
       slots[slot].reactionDetailsState = "borrowed";
       slots[slot].reactionDetailsReadAt = prior.reactionDetailsReadAt;
@@ -558,7 +565,8 @@ async function snapshotReactions(
   };
 }
 
-function normalizeComment(record: GithubRecord): PullRequestComment {
+/** REST list items and webhook payload objects share this shape. */
+export function normalizeComment(record: GithubRecord): PullRequestComment {
   return {
     id: numberValue(record, "id"),
     author: userLogin(record),
@@ -575,18 +583,19 @@ function normalizeComment(record: GithubRecord): PullRequestComment {
   };
 }
 
-function normalizeReview(record: GithubRecord): PullRequestReview {
+/** Webhooks spell review states in lowercase and the REST list in uppercase. */
+export function normalizeReview(record: GithubRecord): PullRequestReview {
   return {
     id: numberValue(record, "id"),
     author: userLogin(record),
-    state: stringValue(record, "state") ?? "PENDING",
+    state: stringValue(record, "state")?.toUpperCase() ?? "PENDING",
     body: stringValue(record, "body") ?? "",
     submittedAt: stringValue(record, "submitted_at"),
     htmlUrl: stringValue(record, "html_url") ?? undefined,
   };
 }
 
-function normalizeCheckRun(record: GithubRecord): PullRequestCheck {
+export function normalizeCheckRun(record: GithubRecord): PullRequestCheck {
   return {
     id: numberValue(record, "id"),
     name: stringValue(record, "name") ?? "check",
@@ -599,7 +608,7 @@ function normalizeCheckRun(record: GithubRecord): PullRequestCheck {
   };
 }
 
-function normalizeCommitStatus(record: GithubRecord, index: number): PullRequestCheck {
+export function normalizeCommitStatus(record: GithubRecord, index: number): PullRequestCheck {
   return {
     id: numberValue(record, "id") || index,
     name: stringValue(record, "context") ?? "status",
@@ -612,10 +621,10 @@ function normalizeCommitStatus(record: GithubRecord, index: number): PullRequest
   };
 }
 
-function latestCommitStatuses(records: GithubRecord[]): PullRequestCheck[] {
+/** The newest status per context, which is what GitHub's combined status reports. */
+export function latestCommitStatuses(statuses: PullRequestCheck[]): PullRequestCheck[] {
   const latestByContext = new Map<string, PullRequestCheck>();
-  for (const [index, record] of records.entries()) {
-    const candidate = normalizeCommitStatus(record, index);
+  for (const candidate of statuses) {
     const contextKey = candidate.name.toLowerCase();
     const previous = latestByContext.get(contextKey);
     if (!previous) {
@@ -639,7 +648,7 @@ function latestCommitStatuses(records: GithubRecord[]): PullRequestCheck[] {
  * `action_required` with no check runs and no statuses, so without this the snapshot would
  * show no checks at all. A suite that has runs is already represented by them.
  */
-function awaitingApprovalSuites(records: GithubRecord[], pullUrl: string): PullRequestCheck[] {
+export function awaitingApprovalSuites(records: GithubRecord[], pullUrl: string): PullRequestCheck[] {
   return records
     .filter((record) => stringValue(record, "conclusion") === "action_required" && record.latest_check_runs_count === 0)
     .map((record) => {
@@ -821,9 +830,10 @@ type PullFields = Pick<
   | "headRepository"
   | "headSha"
   | "author"
+  | "updatedAt"
 >;
 
-function pullFields(pull: GithubRecord, repository: string, number: number): PullFields {
+export function pullFields(pull: GithubRecord, repository: string, number: number): PullFields {
   const head = pull.head && typeof pull.head === "object" ? pull.head as GithubRecord : {};
   const base = pull.base && typeof pull.base === "object" ? pull.base as GithubRecord : {};
   return {
@@ -841,6 +851,7 @@ function pullFields(pull: GithubRecord, repository: string, number: number): Pul
     headRepository: repositoryFullName(head.repo),
     headSha: stringValue(head, "sha"),
     author: userLogin(pull, "user"),
+    updatedAt: stringValue(pull, "updated_at") ?? undefined,
   };
 }
 
@@ -860,6 +871,7 @@ function storedPullFields(snapshot: PullRequestSnapshot): PullFields {
     headRepository: snapshot.headRepository,
     headSha: snapshot.headSha,
     author: snapshot.author,
+    updatedAt: snapshot.updatedAt,
   };
 }
 
@@ -1122,7 +1134,7 @@ export async function pullRequestSnapshot(
     reviewComments: reactions.reviewComments,
     checks: [
       ...checksOfKind(checkRunsRead, "check_run", (runs) => runs.map(normalizeCheckRun)),
-      ...checksOfKind(statusesRead, "commit_status", latestCommitStatuses),
+      ...checksOfKind(statusesRead, "commit_status", (statuses) => latestCommitStatuses(statuses.map(normalizeCommitStatus))),
       ...checksOfKind(checkSuitesRead, "check_suite", (suites) => awaitingApprovalSuites(suites, pull.url)),
     ],
     threads: threads.threads,

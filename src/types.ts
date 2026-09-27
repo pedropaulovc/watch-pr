@@ -198,6 +198,11 @@ export interface PullRequestSnapshot {
   headRepository: string | null;
   headSha: string | null;
   author: string | null;
+  /**
+   * GitHub's `updated_at` for the pull request, which orders `pull_request` deliveries against
+   * the stored fields. Absent on snapshots stored before it was recorded.
+   */
+  updatedAt?: string;
   fetchedAt: string;
   bodyReactions: ReactionCounts;
   /** Body counterpart of `PullRequestComment.reactionsObservedAt`. */

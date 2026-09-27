@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, type Mock } from "vitest";
 import { hmacSha256Hex, sha256Base64Url } from "../src/crypto";
 import {
   WatchPrHub,
@@ -2670,5 +2670,334 @@ describe("native monitor feed", () => {
     expect(stored.snapshot?.checks).toEqual(concurrent.checks);
     expect(stored.snapshot?.fetchedAt).toBe("2026-09-10T12:30:00.000Z");
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+  });
+});
+
+describe("webhook reducers", () => {
+  const reviewComment = {
+    id: 21,
+    author: "carol",
+    body: "please rename",
+    createdAt: "2026-09-10T11:00:00.000Z",
+    updatedAt: "2026-09-10T11:00:00.000Z",
+    reactions: {},
+    reactionDetails: [],
+    path: "src/a.ts",
+    line: 1,
+    startLine: null,
+    inReplyToId: null,
+  };
+  const stored = snapshot({
+    updatedAt: "2026-09-10T12:00:00.000Z",
+    reviewComments: [reviewComment],
+    threads: [{ id: "PRRT_1", isResolved: false, commentIds: [21] }],
+  });
+
+  const githubRefused = () => vi.fn(async (input: RequestInfo | URL) => {
+    throw new Error(`unexpected GitHub request ${String(input)}`);
+  });
+
+  async function deliver(
+    eventName: string,
+    payload: Record<string, unknown>,
+    fetchMock: Mock<typeof fetch> = githubRefused(),
+  ) {
+    const fixture = hubFixture();
+    await storeMonitor(fixture.storage, { snapshot: stored, events: [event("event-seeded", stored)] });
+    fixture.storage.putKeys.length = 0;
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const internals = fixture.hub as unknown as { processWebhook: (...args: unknown[]) => Promise<{ reducerOutcomes: Record<string, number>; publishedWatches: number }> };
+      const stats = await internals.processWebhook(eventName, "delivery-reduced", { repository: { full_name: repository }, ...payload });
+      const state = await readStoredWatchState(
+        fixture.storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, number),
+      );
+      return { ...fixture, stats, state, fetchMock };
+    } finally {
+      log.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  }
+
+  const cases: {
+    name: string;
+    eventName: string;
+    payload: Record<string, unknown>;
+    expected: Partial<PullRequestSnapshot>;
+    changes: string[];
+    details: string[];
+  }[] = [
+    {
+      name: "pull_request",
+      eventName: "pull_request",
+      payload: {
+        action: "edited",
+        pull_request: {
+          number,
+          html_url: "https://github.com/owner/repo/pull/7",
+          title: "Renamed",
+          body: "body",
+          state: "open",
+          draft: false,
+          merged: false,
+          merged_at: null,
+          mergeable: null,
+          mergeable_state: "unknown",
+          updated_at: "2026-09-10T12:30:00.000Z",
+          user: { login: "author" },
+          head: { ref: "feature", sha: "abc", repo: { full_name: repository } },
+          base: { ref: "main" },
+        },
+      },
+      expected: { title: "Renamed", mergeable: true, mergeableState: "clean", updatedAt: "2026-09-10T12:30:00.000Z" },
+      changes: ["description"],
+      details: [],
+    },
+    {
+      name: "pull_request_review",
+      eventName: "pull_request_review",
+      payload: {
+        action: "submitted",
+        pull_request: { number },
+        review: { id: 31, user: { login: "carol" }, state: "approved", body: "LGTM", submitted_at: "2026-09-10T12:30:00.000Z" },
+      },
+      expected: { reviews: [{ id: 31, author: "carol", state: "APPROVED", body: "LGTM", submittedAt: "2026-09-10T12:30:00.000Z", htmlUrl: undefined }] },
+      changes: ["reviews"],
+      details: ["review #31 @carol APPROVED: LGTM"],
+    },
+    {
+      name: "pull_request_review_comment",
+      eventName: "pull_request_review_comment",
+      payload: {
+        action: "created",
+        pull_request: { number },
+        comment: {
+          id: 22,
+          user: { login: "dave" },
+          body: "nit",
+          path: "src/a.ts",
+          line: 3,
+          created_at: "2026-09-10T12:30:00.000Z",
+          updated_at: "2026-09-10T12:30:00.000Z",
+          reactions: { total_count: 0 },
+        },
+      },
+      expected: { reviewComments: [reviewComment, expect.objectContaining({ id: 22, body: "nit", reactionDetails: [] })] },
+      changes: ["review_comments"],
+      details: ["active comments: +1, now 2", "feedback [-] #22 src/a.ts:3 @dave: nit"],
+    },
+    {
+      name: "pull_request_review_thread",
+      eventName: "pull_request_review_thread",
+      payload: { action: "resolved", pull_request: { number }, thread: { node_id: "PRRT_1", comments: [{ id: 21 }] } },
+      expected: { threads: [{ id: "PRRT_1", isResolved: true, commentIds: [21] }] },
+      changes: ["review_threads"],
+      details: ["active comments: -1, now 0", "thread PRRT_1: resolved"],
+    },
+    {
+      name: "issue_comment",
+      eventName: "issue_comment",
+      payload: {
+        action: "created",
+        issue: { number, pull_request: {} },
+        comment: {
+          id: 12,
+          user: { login: "erin" },
+          body: "hello",
+          created_at: "2026-09-10T12:30:00.000Z",
+          updated_at: "2026-09-10T12:30:00.000Z",
+          reactions: { total_count: 0 },
+        },
+      },
+      expected: { comments: [expect.objectContaining({ id: 12, author: "erin", body: "hello" })] },
+      changes: ["comments"],
+      details: ["comment #12 @erin: hello"],
+    },
+    {
+      name: "check_run",
+      eventName: "check_run",
+      payload: {
+        action: "completed",
+        check_run: {
+          id: 41,
+          name: "test",
+          head_sha: "abc",
+          status: "completed",
+          conclusion: "failure",
+          started_at: "2026-09-10T12:20:00.000Z",
+          completed_at: "2026-09-10T12:30:00.000Z",
+          html_url: "https://github.com/owner/repo/runs/41",
+          pull_requests: [{ number }],
+        },
+      },
+      expected: { checks: [expect.objectContaining({ id: 41, kind: "check_run", conclusion: "failure" })] },
+      changes: ["checks"],
+      details: ["checks: test -> fail https://github.com/owner/repo/runs/41"],
+    },
+    {
+      name: "check_suite",
+      eventName: "check_suite",
+      payload: {
+        action: "completed",
+        check_suite: {
+          id: 61,
+          head_sha: "abc",
+          status: "completed",
+          conclusion: "action_required",
+          latest_check_runs_count: 0,
+          app: { name: "GitHub Actions" },
+          created_at: "2026-09-10T12:30:00.000Z",
+          updated_at: "2026-09-10T12:30:00.000Z",
+          pull_requests: [{ number }],
+        },
+      },
+      expected: { checks: [expect.objectContaining({ id: 61, kind: "check_suite", conclusion: "action_required" })] },
+      changes: ["checks"],
+      details: ["checks: GitHub Actions -> action_required https://github.com/owner/repo/pull/7/checks"],
+    },
+    {
+      name: "status",
+      eventName: "status",
+      payload: {
+        id: 51,
+        sha: "abc",
+        context: "ci/lint",
+        state: "failure",
+        target_url: "https://ci.example/51",
+        created_at: "2026-09-10T12:30:00.000Z",
+        updated_at: "2026-09-10T12:30:00.000Z",
+      },
+      expected: { checks: [expect.objectContaining({ id: 51, kind: "commit_status", name: "ci/lint", conclusion: "failure" })] },
+      changes: ["checks"],
+      details: ["checks: ci/lint -> fail https://ci.example/51"],
+    },
+  ];
+
+  for (const { name, eventName, payload, expected, changes, details } of cases) {
+    it(`applies a ${name} delivery and publishes its event without reading GitHub`, async () => {
+      const { hub, state, stats, fetchMock } = await deliver(eventName, payload);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(stats.reducerOutcomes).toMatchObject({ applied: 1, refetch: 0 });
+      expect(state.snapshot).toMatchObject(expected);
+      expect(state.events.at(-1)).toMatchObject({ deliveryId: "delivery-reduced", githubEvent: eventName, changes });
+      const feed = feedReader(await hub.fetch(new Request(
+        `https://watch-pr.test/monitor/${capability}?cursor=event-seeded`,
+      )));
+      await expect(nextMonitorEvent(feed)).resolves.toMatchObject({ githubEvent: eventName, changes, details });
+      await feed.reader.cancel();
+    });
+  }
+
+  it("ignores checks for another head revision without writing or reading GitHub", async () => {
+    const { state, stats, storage, fetchMock } = await deliver("check_run", {
+      action: "completed",
+      check_run: { id: 41, name: "test", head_sha: "previous-head", status: "completed", conclusion: "failure", pull_requests: [{ number }] },
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats.reducerOutcomes).toMatchObject({ ignored: 1, applied: 0, refetch: 0 });
+    expect(storage.putKeys).toEqual(["delivery:delivery-reduced"]);
+    expect(state.snapshot).toEqual(stored);
+    expect(state.events.map((storedEvent) => storedEvent.id)).toEqual(["event-seeded"]);
+  });
+
+  it("stores a change no event announces silently", async () => {
+    const { state, stats, fetchMock } = await deliver("pull_request", {
+      action: "labeled",
+      pull_request: {
+        number,
+        html_url: "https://github.com/owner/repo/pull/7",
+        title: "Monitor feed",
+        body: "body",
+        state: "open",
+        draft: false,
+        merged: false,
+        merged_at: null,
+        mergeable: null,
+        updated_at: "2026-09-10T12:40:00.000Z",
+        user: { login: "author" },
+        head: { ref: "feature", sha: "abc", repo: { full_name: repository } },
+        base: { ref: "main" },
+      },
+    });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(stats).toMatchObject({ reducerOutcomes: { applied: 1 }, publishedWatches: 0 });
+    expect(state.snapshot?.updatedAt).toBe("2026-09-10T12:40:00.000Z");
+    expect(state.events.map((storedEvent) => storedEvent.id)).toEqual(["event-seeded"]);
+  });
+
+  it("reads GitHub for a thread the snapshot does not know", async () => {
+    const { state, stats, fetchMock } = await deliver("pull_request_review_thread", {
+      action: "resolved",
+      pull_request: { number },
+      thread: { node_id: "PRRT_unknown", comments: [{ id: 99 }] },
+    }, openPullRequestFetch());
+
+    expect(stats.reducerOutcomes).toMatchObject({ refetch: 1, applied: 0 });
+    expect(fetchMock.mock.calls.map(([input]) => String(input))).toContain("https://api.github.com/graphql");
+    expect(state.snapshot?.headSha).toBe("reopened");
+    expect(state.events.at(-1)?.deliveryId).toBe("delivery-reduced");
+  });
+
+  it("reports reducer outcomes and zero GitHub requests in the fanout record", async () => {
+    const { hub, storage, pending } = hubFixture();
+    await storeMonitor(storage, { snapshot: stored, events: [] });
+    const body = JSON.stringify({
+      action: "synchronize",
+      repository: { full_name: repository },
+      pull_request: {
+        number,
+        html_url: "https://github.com/owner/repo/pull/7",
+        title: "Monitor feed",
+        body: "body",
+        state: "open",
+        draft: false,
+        merged: false,
+        merged_at: null,
+        mergeable: null,
+        updated_at: "2026-09-10T12:30:00.000Z",
+        user: { login: "author" },
+        head: { ref: "feature", sha: "def", repo: { full_name: repository } },
+        base: { ref: "main" },
+      },
+    });
+    const fetchMock = githubRefused();
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const response = await hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+        method: "POST",
+        headers: {
+          "x-github-delivery": "delivery-synchronize",
+          "x-github-event": "pull_request",
+          "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+        },
+        body,
+      }));
+      expect(response.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      const records = log.mock.calls.map(([value]) => JSON.parse(String(value)) as Record<string, unknown>);
+      expect(records.find((record) => record.event === "watch_pr.webhook_fanout")).toMatchObject({
+        outcome: "completed",
+        published_watches: 1,
+        reducer_applied: 0,
+        reducer_applied_mergeability_unknown: 1,
+        reducer_refetch: 0,
+        reducer_ignored: 0,
+        github_rest_requests: 0,
+        github_graphql_requests: 0,
+      });
+    } finally {
+      log.mockRestore();
+      vi.unstubAllGlobals();
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+    const state = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
+    expect(state.snapshot).toMatchObject({ headSha: "def", mergeable: null, mergeableState: "unknown" });
+    expect(state.events.at(-1)?.changes).toEqual(["mergeability"]);
   });
 });

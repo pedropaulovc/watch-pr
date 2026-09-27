@@ -122,7 +122,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     "get_pr",
     {
       title: "Get pull request state",
-      description: "Read the latest durable pull request snapshot, or null before the first one. `polledAt` is when GitHub was last read successfully and stored; `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt` while `polledAt` advances. A refresh is scheduled after webhook or timer events.",
+      description: "Read the latest durable pull request snapshot, or null before the first one. `polledAt` is when GitHub was last read successfully and stored; `fetchedAt` is when the stored snapshot last changed, from a GitHub read or a webhook payload applied without one, so `fetchedAt` can be newer than `polledAt`, and a quiet pull request keeps an old `fetchedAt` while `polledAt` advances. `updatedAt` is GitHub's own last-update time for the pull request.",
       annotations: {
         readOnlyHint: true,
       },
