@@ -108,7 +108,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     "list_watched_prs",
     {
       title: "List watched pull requests",
-      description: "List the pull requests the authenticated GitHub account watches, one summary each: title, state, head commit, mergeability, and when the stored snapshot last changed. Use `get_pr` for a pull request's checks, reviews, and comments.",
+      description: "List the pull requests the authenticated GitHub account watches, one summary each: title, state, head commit, mergeability, and when the stored snapshot last changed.",
       annotations: {
         title: "List watched pull requests",
         readOnlyHint: true,
