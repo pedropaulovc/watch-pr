@@ -722,6 +722,17 @@ export async function refreshGithubToken(
 }
 
 /**
+ * `Promise.all` that waits for every request before rejecting. A wave that fails fast would
+ * leave peers still counting into the caller's usage after the caller has reported it.
+ */
+async function settleWave<T extends readonly unknown[]>(wave: { [K in keyof T]: Promise<T[K]> }): Promise<T> {
+  const results = await Promise.allSettled(wave);
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (rejected) throw rejected.reason;
+  return results.map((result) => (result as PromiseFulfilledResult<unknown>).value) as unknown as T;
+}
+
+/**
  * `previous` is the caller's last stored snapshot for this PR, and it only saves requests:
  * a reaction target whose aggregate counts are unchanged keeps the details already stored
  * instead of being read again every minute.
@@ -734,7 +745,7 @@ export async function pullRequestSnapshot(
   usage?: GithubUsage,
 ): Promise<PullRequestSnapshot> {
   const auth: GithubAuth = { token, usage };
-  const [pull, issue] = await Promise.all([
+  const [pull, issue] = await settleWave([
     githubJson<GithubRecord>(auth, `/repos/${repository}/pulls/${number}`),
     // The body's reaction summary is only as fresh as the response that carried it, which is
     // also where the wave's slowest work has not happened yet.
@@ -743,7 +754,7 @@ export async function pullRequestSnapshot(
   const head = pull.head && typeof pull.head === "object" ? pull.head as GithubRecord : {};
   const base = pull.base && typeof pull.base === "object" ? pull.base as GithubRecord : {};
   const headSha = stringValue(head, "sha");
-  const [commentPages, reviews, reviewCommentPages, checkRuns, statuses, threads] = await Promise.all([
+  const [commentPages, reviews, reviewCommentPages, checkRuns, statuses, threads] = await settleWave([
     githubPages<GithubRecord>(auth, `/repos/${repository}/issues/${number}/comments`),
     githubPaginated<GithubRecord>(auth, `/repos/${repository}/pulls/${number}/reviews`),
     githubPages<GithubRecord>(auth, `/repos/${repository}/pulls/${number}/comments`),
