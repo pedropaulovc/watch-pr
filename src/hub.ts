@@ -22,20 +22,40 @@ import {
   exchangeGithubCode,
   GithubApiError,
   githubUser,
+  installationCoverage,
   pullRequestSnapshot,
   refreshGithubToken,
   requestKnowledgeAdvanced,
   type GithubUsage,
+  type InstallationCoverage,
+  type InstallationLookup,
 } from "./github";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "./mcp";
 import { applyWebhook, type WebhookOutcome } from "./reducers";
+import {
+  applyInstallationLookup,
+  applyInstallationWebhook,
+  needsInstallationLookup,
+  planPollTick,
+  recordDeliveryCoverage,
+  registerPollEntry,
+  repositoryCoverage,
+  requestMergeabilityFollowUp,
+  retryFailedPoll,
+  settleMergeabilityFollowUp,
+  WEBHOOK_RECONCILE_MS,
+  type MergeabilityFollowUp,
+  type RefreshOutcome,
+} from "./schedule";
 import type {
+  CoverageIndex,
   GithubUser,
   MonitorCapabilityRecord,
   MonitorTerminalState,
   OAuthClientRecord,
   OAuthCodeRecord,
   OAuthRequestRecord,
+  PollSchedule,
   PrMonitorEvent,
   PrMonitorRegistration,
   PullRequestCheck,
@@ -54,10 +74,14 @@ import type {
   WatchStateMetadata,
 } from "./types";
 import {
+  installationLookupStorageKey,
   legacyWatchStorageKey,
   monitorCapabilityStorageKey,
   monitorScopeStorageKey,
+  POLL_SCHEDULE_KEY,
+  pollScheduleId,
   sessionStorageKey,
+  WEBHOOK_COVERAGE_KEY,
   watchSidecarCleanupKey,
   watchSidecarEventKey,
   watchSidecarIndexKey,
@@ -112,6 +136,8 @@ const MAX_WATCH_CHUNK_CHARACTERS = 16_000;
 const DELIVERY_DEDUPLICATION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_DEFERRED_CLEANUP_DATA_ROWS_PER_JOB = 8;
 const MIN_DEFERRED_CLEANUP_ROWS = MAX_DEFERRED_CLEANUP_DATA_ROWS_PER_JOB;
+/** `pull_request` actions after which GitHub recomputes mergeability asynchronously. */
+const MERGEABILITY_ACTIONS: Record<string, true> = { opened: true, reopened: true, synchronize: true };
 
 /**
  * Sidecar layout version. Version 3 uses immutable payload and snapshot records behind a
@@ -1437,15 +1463,10 @@ function createRefreshTotals(): RefreshTotals {
   return { completed: 0, failed: 0, githubUsage: createGithubUsage() };
 }
 
-/** One record per failed snapshot read; the read keeps the previous snapshot and retries later. */
-function logSnapshotFailure(source: string, error: unknown): void {
+/** Classification of a failed GitHub read, without its message or response body. */
+function errorFields(error: unknown): Record<string, string | number> {
   const githubStatus = error instanceof GithubApiError ? error.status : undefined;
-  console.log(JSON.stringify({
-    event: "watch_pr.snapshot_failure",
-    schema_version: 1,
-    sample_rate: 1,
-    sample_reason: "all",
-    source,
+  return {
     error_kind: error instanceof GithubApiError
       ? "github_api"
       : error instanceof TypeError
@@ -1453,6 +1474,29 @@ function logSnapshotFailure(source: string, error: unknown): void {
         : "unexpected",
     error_name: error instanceof Error ? error.name : typeof error,
     ...(githubStatus === undefined ? {} : { github_status: githubStatus }),
+  };
+}
+
+/** One record per failed snapshot read; the read keeps the previous snapshot and retries later. */
+function logSnapshotFailure(source: string, error: unknown): void {
+  console.log(JSON.stringify({
+    event: "watch_pr.snapshot_failure",
+    schema_version: 1,
+    sample_rate: 1,
+    sample_reason: "all",
+    source,
+    ...errorFields(error),
+  }));
+}
+
+/** One record per installation lookup a watch registration made. */
+function logCoverageLookup(outcome: InstallationCoverage | "failed", usage: GithubUsage, error?: unknown): void {
+  console.log(JSON.stringify({
+    event: "watch_pr.coverage_lookup",
+    schema_version: 1,
+    outcome,
+    ...(error === undefined ? {} : errorFields(error)),
+    ...githubUsageFields(usage),
   }));
 }
 
@@ -1513,6 +1557,8 @@ export class WatchPrHub {
   private readonly activeMonitorFeeds = new Map<string, Set<ActiveMonitorFeed>>();
   private readonly refreshes = new Set<string>();
   private readonly refreshTotals = createRefreshTotals();
+  /** Pending mergeability follow-ups by `pollScheduleId`; see `MergeabilityFollowUp`. */
+  private readonly mergeabilityFollowUps = new Map<string, MergeabilityFollowUp>();
   private readonly sessionOperations = new Map<string, Promise<void>>();
   private readonly recentDeliveries = new Set<string>();
 
@@ -1944,12 +1990,25 @@ export class WatchPrHub {
       return existed;
     });
     const state = await this.watchStateMetadata(active.record.user.id, key);
-    const refreshScheduled = terminalState(state.snapshot) !== "merged";
-    if (refreshScheduled) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "watch");
+    const currentState = terminalState(state.snapshot);
+    const refreshScheduled = currentState !== "merged";
+    const scheduleId = pollScheduleId(active.record.user.id, key);
+    const now = Date.now();
+    await this.updatePollSchedule((schedule) => {
+      const next = registerPollEntry(schedule[scheduleId], currentState, now);
+      if (!next) return false;
+      schedule[scheduleId] = next;
+      return true;
+    });
+    const parsedRepository = parseWatchKey(key).repository;
+    if (refreshScheduled) {
+      this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "watch");
+      this.state.waitUntil(this.seedCoverage(active.record, parsedRepository));
+    }
     if (!wasWatched) await this.notifyResourceListChanged(active);
     return {
       key,
-      repository: parseWatchKey(key).repository,
+      repository: parsedRepository,
       number,
       resourceUri: resourceUri(repository, number),
       snapshot: state.snapshot,
@@ -2097,7 +2156,11 @@ export class WatchPrHub {
     const polledAt = await this.state.storage.get<string>(
       watchPolledKey(watchStorageKey(active.record.user.id, parsed.repository, parsed.number)),
     );
-    return { ...state, polledAt: typeof polledAt === "string" ? polledAt : null };
+    return {
+      ...state,
+      polledAt: typeof polledAt === "string" ? polledAt : null,
+      coverage: repositoryCoverage(await this.readCoverage(), parsed.repository),
+    };
   }
 
   private async subscribe(active: ActiveSession, repository: string, number: number): Promise<void> {
@@ -2265,7 +2328,9 @@ export class WatchPrHub {
     if (!valid) return new Response("Invalid webhook signature", { status: 401 });
     const eventName = request.headers.get("x-github-event")?.trim() ?? "";
     const deliveryId = request.headers.get("x-github-delivery")?.trim() || randomToken(12);
-    if (!isSupportedGithubEvent(eventName)) {
+    // Installation events reach every GitHub App without a subscription; they carry coverage only.
+    const installationEvent = eventName === "installation" || eventName === "installation_repositories";
+    if (!installationEvent && !isSupportedGithubEvent(eventName)) {
       logWebhookAdmission("unsupported_event");
       return this.accepted({ accepted: true, ignored: true, event: eventName });
     }
@@ -2276,6 +2341,17 @@ export class WatchPrHub {
     } catch {
       logWebhookAdmission("invalid_json", eventName);
       return new Response("Invalid JSON", { status: 400 });
+    }
+    if (installationEvent) {
+      const at = new Date().toISOString();
+      try {
+        await this.updateCoverage((index) => applyInstallationWebhook(index, eventName, payload, at));
+      } catch (error) {
+        logWebhookAdmission("admission_error", eventName);
+        throw error;
+      }
+      logWebhookAdmission("accepted", eventName);
+      return this.accepted({ accepted: true, deliveryId, event: eventName });
     }
     const deliveryKey = `delivery:${deliveryId}`;
     let previousDelivery: number | undefined;
@@ -2364,7 +2440,7 @@ export class WatchPrHub {
     const invalidSessionTokens = new Set<string>();
     const addWatchers = (sessionToken: string, record: SessionRecord): void => {
       for (const key of record.watches) {
-        watchers.set(`${record.user.id}:${key}`, {
+        watchers.set(pollScheduleId(record.user.id, key), {
           userId: record.user.id,
           key,
           githubToken: record.githubAccessToken,
@@ -2380,7 +2456,14 @@ export class WatchPrHub {
     if (!repository) {
       return stats;
     }
+    // A signature-valid delivery for a watched repository proves the app receives its webhooks.
+    if ([...watchers.values()].some((watcher) => watcher.key.startsWith(`${repository}#`))) {
+      const at = new Date().toISOString();
+      stats.storageKeyPuts += await this.updateCoverage((index) => recordDeliveryCoverage(index, repository, at));
+    }
     const webhookAction = actionFromPayload(payload);
+    const movesMergeability = eventName === "pull_request" && MERGEABILITY_ACTIONS[webhookAction ?? ""] === true;
+    const mergeabilityFollowUps: string[] = [];
     const targets: WebhookTarget[] = [];
     for (const watcher of watchers.values()) {
       let parsed;
@@ -2440,7 +2523,10 @@ export class WatchPrHub {
       // The payload itself is the data whenever a reducer can apply it: no GitHub request.
       const reduced = await this.applyWebhookDelivery(userId, key, delivery, countWrites);
       stats.reducerOutcomes[reduced.outcome] += 1;
+      const followUp = reduced.outcome === "applied_mergeability_unknown" ||
+        (movesMergeability && reduced.outcome !== "ignored");
       if (reduced.outcome !== "refetch") {
+        if (followUp) mergeabilityFollowUps.push(pollScheduleId(userId, key));
         countPublished(reduced.result);
         continue;
       }
@@ -2466,12 +2552,27 @@ export class WatchPrHub {
         }
         snapshot = previous.snapshot;
       }
+      if (followUp) mergeabilityFollowUps.push(pollScheduleId(userId, key));
       const changes = snapshot && previous.snapshot ? snapshotChanges(previous.snapshot, snapshot) : snapshot ? ["initial_snapshot"] : [];
       const result = await this.publishEvent(userId, key, { ...delivery, snapshot, changes }, { snapshot }, countWrites);
       if (polledAt !== null) {
         stats.storageKeyPuts += await this.recordPolled(watchStorageKey(userId, targetRepository, number), polledAt);
       }
       countPublished(result);
+    }
+    if (mergeabilityFollowUps.length > 0) {
+      const now = Date.now();
+      for (const id of mergeabilityFollowUps) requestMergeabilityFollowUp(this.mergeabilityFollowUps, id, now);
+      // Only a watch the index stopped as closed needs a write: a reopened pull request resumes.
+      stats.storageKeyPuts += await this.updatePollSchedule((schedule) => {
+        let changed = false;
+        for (const id of mergeabilityFollowUps) {
+          if (schedule[id]?.state !== "stopped") continue;
+          schedule[id] = { state: "active", dueAt: now + WEBHOOK_RECONCILE_MS };
+          changed = true;
+        }
+        return changed;
+      });
     }
     const deliveryKey = `delivery:${deliveryId}`;
     await this.state.storage.put(deliveryKey, Date.now());
@@ -2480,16 +2581,60 @@ export class WatchPrHub {
     return stats;
   }
 
-  private scheduleRefresh(userId: number, key: string, githubToken: string, sessionToken: string, reason: string): boolean {
-    const refreshKey = `${userId}:${key}`;
+  /**
+   * Starts one refresh unless the watch already has one in flight. A cron or registration
+   * refresh then settles the watch's schedule; `followUp` is the mergeability follow-up this
+   * read performs, if the cron started it for one.
+   */
+  private scheduleRefresh(
+    userId: number,
+    key: string,
+    githubToken: string,
+    sessionToken: string,
+    reason: string,
+    followUp?: MergeabilityFollowUp,
+  ): boolean {
+    const refreshKey = pollScheduleId(userId, key);
     if (this.refreshes.has(refreshKey)) return false;
     this.refreshes.add(refreshKey);
+    const settles = reason === "poll" || reason === "watch";
     this.state.waitUntil(
-      this.refreshAndPublish(userId, key, githubToken, sessionToken, reason).finally(() => {
-        this.refreshes.delete(refreshKey);
-      }),
+      this.refreshAndPublish(userId, key, githubToken, sessionToken, reason)
+        .then(
+          async (outcome) => {
+            if (settles) await this.settlePoll(refreshKey, outcome, followUp);
+          },
+          async (error: unknown) => {
+            if (settles) await this.settlePoll(refreshKey, "failed", followUp);
+            throw error;
+          },
+        )
+        .finally(() => {
+          this.refreshes.delete(refreshKey);
+        }),
     );
     return true;
+  }
+
+  /**
+   * Applies what a scheduled read found: a merged or closed pull request stops being scheduled
+   * and drops its follow-up; a failed read is retried within minutes instead of at the next
+   * hourly reconcile; otherwise the follow-up it performed, if any, settles.
+   */
+  private async settlePoll(id: string, outcome: RefreshOutcome, followUp: MergeabilityFollowUp | undefined): Promise<void> {
+    const now = Date.now();
+    if (followUp) settleMergeabilityFollowUp(this.mergeabilityFollowUps, id, followUp, outcome, now);
+    if (outcome === "failed") {
+      await this.updatePollSchedule((schedule) => retryFailedPoll(schedule, id, now));
+      return;
+    }
+    if (outcome !== "terminal") return;
+    this.mergeabilityFollowUps.delete(id);
+    await this.updatePollSchedule((schedule) => {
+      if (schedule[id]?.state === "stopped") return false;
+      schedule[id] = { state: "stopped" };
+      return true;
+    });
   }
 
   private async refreshAndPublish(
@@ -2498,10 +2643,10 @@ export class WatchPrHub {
     githubToken: string,
     sessionToken: string,
     reason: string,
-  ): Promise<void> {
+  ): Promise<RefreshOutcome> {
     const initialState = await this.watchStateMetadata(userId, key);
     const initialTerminalState = terminalState(initialState.snapshot);
-    if (initialTerminalState === "merged" || (initialTerminalState === "closed" && reason !== "watch")) return;
+    if (initialTerminalState === "merged" || (initialTerminalState === "closed" && reason !== "watch")) return "terminal";
     const parsed = parseWatchKey(key);
     let snapshot;
     try {
@@ -2510,7 +2655,7 @@ export class WatchPrHub {
       this.refreshTotals.failed += 1;
       logSnapshotFailure(reason, error);
       if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken, githubToken);
-      return;
+      return "failed";
     }
     try {
       await this.storeRefresh(userId, key, snapshot, reason);
@@ -2520,7 +2665,8 @@ export class WatchPrHub {
       throw error;
     }
     this.refreshTotals.completed += 1;
-
+    if (terminalState(snapshot) !== "watching") return "terminal";
+    return snapshot.mergeableState === "unknown" ? "mergeability_unknown" : "settled";
   }
 
   private async storeRefresh(userId: number, key: string, snapshot: PullRequestSnapshot, reason: string): Promise<void> {
@@ -2580,20 +2726,49 @@ export class WatchPrHub {
     return revoked;
   }
 
+  /**
+   * One cron tick. The due index and the coverage record decide which watches to read, so an
+   * idle webhook-covered watch costs no storage read until its hourly reconcile. Sessions are
+   * still listed: they hold the credentials and the set of watches the index must mirror.
+   */
   private async handlePoll(request: Request): Promise<Response> {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
     await this.reconcileActiveSessions();
     const expiredMonitorsRevoked = await this.revokeExpiredMonitorCapabilities();
     const sessions = await this.sessionRecords();
-    let refreshesStarted = 0;
-    let scheduled = 0;
+    const watchers = new Map<string, WebhookWatcher>();
+    const watched = new Map<string, string>();
     for (const [sessionToken, record] of sessions) {
       for (const key of record.watches) {
-        const state = await this.watchStateMetadata(record.user.id, key);
-        if (terminalState(state.snapshot) !== "watching") continue;
-        scheduled += 1;
-        if (this.scheduleRefresh(record.user.id, key, record.githubAccessToken, sessionToken, "poll")) refreshesStarted += 1;
+        let repository;
+        try {
+          repository = parseWatchKey(key).repository;
+        } catch {
+          continue;
+        }
+        const id = pollScheduleId(record.user.id, key);
+        watchers.set(id, { userId: record.user.id, key, githubToken: record.githubAccessToken, sessionToken });
+        watched.set(id, repository);
       }
+    }
+    const coverage = await this.readCoverage();
+    const now = Date.now();
+    const plan = await this.state.storage.transaction(async (storage) => {
+      const schedule = (await storage.get<PollSchedule>(POLL_SCHEDULE_KEY)) ?? {};
+      const tick = planPollTick(schedule, this.mergeabilityFollowUps, watched, coverage, now);
+      if (tick.changed) await storage.put(POLL_SCHEDULE_KEY, schedule);
+      return tick;
+    });
+    let refreshesStarted = 0;
+    for (const due of plan.due) {
+      const watcher = watchers.get(due.id)!;
+      if (this.scheduleRefresh(watcher.userId, watcher.key, watcher.githubToken, watcher.sessionToken, "poll", due.mergeability)) {
+        refreshesStarted += 1;
+        continue;
+      }
+      // A read already in flight may predate the push: the follow-up retries on its backoff
+      // instead of waiting for the next hourly reconcile.
+      if (due.mergeability) await this.settlePoll(due.id, "failed", due.mergeability);
     }
     const refreshTotals = { ...this.refreshTotals, githubUsage: { ...this.refreshTotals.githubUsage } };
     this.refreshTotals.completed = 0;
@@ -2602,7 +2777,11 @@ export class WatchPrHub {
     console.log(JSON.stringify({
       event: "watch_pr.poll",
       active_sessions: sessions.size,
-      scheduled_watches: scheduled,
+      // Watches the index still schedules: neither merged nor closed.
+      scheduled_watches: plan.active,
+      due_watches: plan.due.length,
+      coverage_webhook: plan.coverage.webhook,
+      coverage_polling: plan.coverage.polling,
       refreshes_started: refreshesStarted,
       expired_monitors_revoked: expiredMonitorsRevoked,
       // Refreshes that finished since the previous tick, from every source, not just polls.
@@ -2610,7 +2789,58 @@ export class WatchPrHub {
       refresh_failures: refreshTotals.failed,
       ...githubUsageFields(refreshTotals.githubUsage),
     }));
-    return this.accepted({ accepted: true, scheduled });
+    return this.accepted({ accepted: true, scheduled: plan.active, due: plan.due.length });
+  }
+
+  private async readCoverage(): Promise<CoverageIndex> {
+    return (await this.state.storage.get<CoverageIndex>(WEBHOOK_COVERAGE_KEY)) ?? { accounts: {}, repositories: {} };
+  }
+
+  /** Read-modify-write of the coverage record; `mutate` reports a change. Returns keys written. */
+  private async updateCoverage(mutate: (index: CoverageIndex) => boolean): Promise<number> {
+    return this.state.storage.transaction(async (storage) => {
+      const index = (await storage.get<CoverageIndex>(WEBHOOK_COVERAGE_KEY)) ?? { accounts: {}, repositories: {} };
+      if (!mutate(index)) return 0;
+      await storage.put(WEBHOOK_COVERAGE_KEY, index);
+      return 1;
+    });
+  }
+
+  /** Read-modify-write of the due index; `mutate` reports a change. Returns keys written. */
+  private async updatePollSchedule(mutate: (schedule: PollSchedule) => boolean): Promise<number> {
+    return this.state.storage.transaction(async (storage) => {
+      const schedule = (await storage.get<PollSchedule>(POLL_SCHEDULE_KEY)) ?? {};
+      if (!mutate(schedule)) return 0;
+      await storage.put(POLL_SCHEDULE_KEY, schedule);
+      return 1;
+    });
+  }
+
+  /**
+   * Seeds a watched repository's coverage from the user's installations when no webhook has
+   * said anything about it yet. The lookup is conditional, so a repeat is a pair of `304`s; a
+   * failed lookup leaves the repository `polling`. A deployment without a webhook secret (PPE)
+   * accepts no delivery, so an installation covers nothing there and every watch polls.
+   */
+  private async seedCoverage(record: SessionRecord, repository: string): Promise<void> {
+    if (!this.env.GITHUB_WEBHOOK_SECRET) return;
+    if (!needsInstallationLookup(await this.readCoverage(), repository)) return;
+    const lookupKey = installationLookupStorageKey(record.user.id);
+    const usage = createGithubUsage();
+    let result: InstallationCoverage | "failed";
+    try {
+      const cached = (await this.state.storage.get<InstallationLookup>(lookupKey)) ?? null;
+      const lookup = await installationCoverage(record.githubAccessToken, repository, cached, usage);
+      result = lookup.coverage;
+      // Two 304s hand back exactly what is stored, so a repeated lookup writes nothing.
+      if (JSON.stringify(lookup.lookup) !== JSON.stringify(cached)) await this.state.storage.put(lookupKey, lookup.lookup);
+      logCoverageLookup(result, usage);
+    } catch (error) {
+      result = "failed";
+      logCoverageLookup(result, usage, error);
+    }
+    const at = new Date().toISOString();
+    await this.updateCoverage((index) => applyInstallationLookup(index, repository, result, at));
   }
 
   /**

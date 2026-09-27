@@ -122,7 +122,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     "get_pr",
     {
       title: "Get pull request state",
-      description: "Read the latest durable pull request snapshot, or null before the first one. `polledAt` is when GitHub was last read successfully and stored; `fetchedAt` is when the stored snapshot last changed, from a GitHub read or a webhook payload applied without one, so `fetchedAt` can be newer than `polledAt`, and a quiet pull request keeps an old `fetchedAt` while `polledAt` advances. `updatedAt` is GitHub's own last-update time for the pull request.",
+      description: "Read the latest durable pull request snapshot, or null before the first one. `polledAt` is when GitHub was last read successfully and stored; `fetchedAt` is when the stored snapshot last changed, from a GitHub read or a webhook payload applied without one, so `fetchedAt` can be newer than `polledAt`, and a quiet pull request keeps an old `fetchedAt` while `polledAt` advances. `updatedAt` is GitHub's own last-update time for the pull request. `coverage` is `webhook` when the repository's GitHub webhooks reach the server, which applies them as they arrive and reads GitHub about hourly, or `polling`, when it reads GitHub every minute.",
       annotations: {
         readOnlyHint: true,
       },
@@ -136,7 +136,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ ...snapshot, polledAt: state.polledAt }),
+          text: JSON.stringify({ ...snapshot, polledAt: state.polledAt, coverage: state.coverage }),
         }],
       };
     },

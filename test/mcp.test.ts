@@ -144,7 +144,7 @@ const monitor: PrMonitorRegistration = {
 
 function context(currentSnapshot: PullRequestSnapshot = snapshot): McpSessionContext {
   const currentRegistration = { ...registration, snapshot: currentSnapshot };
-  const currentState = { ...state, snapshot: currentSnapshot, polledAt };
+  const currentState = { ...state, snapshot: currentSnapshot, polledAt, coverage: "webhook" as const };
   return {
     user: {
       login: "pedropaulovc",
@@ -275,7 +275,7 @@ describe("MCP JSON output", () => {
     expect(JSON.parse(await callTool("get_pr", {
       repository: "owner/repo",
       number: 7,
-    }))).toEqual({ ...snapshot, polledAt });
+    }))).toEqual({ ...snapshot, polledAt, coverage: "webhook" });
     expect(JSON.parse(await callTool("list_pr_events", {
       repository: "owner/repo",
       number: 7,
@@ -288,12 +288,12 @@ describe("MCP JSON output", () => {
       githubValidators: { "https://api.github.com/repos/owner/repo/pulls/7": "\"etag\"" },
     };
     expect(JSON.parse(await callTool("get_pr", { repository: "owner/repo", number: 7 }, validated)))
-      .toEqual({ ...snapshot, polledAt });
+      .toEqual({ ...snapshot, polledAt, coverage: "webhook" });
     expect(JSON.parse(await callTool(
       "get_pr",
       { repository: "owner/repo", number: 7 },
       snapshot,
-      { ...context(), readWatch: async () => ({ snapshot: null, events: [], polledAt: null }) },
+      { ...context(), readWatch: async () => ({ snapshot: null, events: [], polledAt: null, coverage: "polling" }) },
     ))).toBeNull();
   });
 
@@ -351,7 +351,7 @@ describe("MCP JSON output", () => {
       "list_pr_events",
       { repository: "owner/repo", number: 7 },
       snapshot,
-      { ...context(), readWatch: async () => ({ ...await readStoredWatchState(storage, storageKey), polledAt: null }) },
+      { ...context(), readWatch: async () => ({ ...await readStoredWatchState(storage, storageKey), polledAt: null, coverage: "polling" }) },
     );
     expect(JSON.parse(result)).toEqual({
       repository: "owner/repo",
@@ -384,9 +384,9 @@ describe("MCP JSON output", () => {
       "get_pr",
       { repository: "owner/repo", number: 7 },
       snapshot,
-      { ...context(), readWatch: async () => ({ ...await readStoredWatchState(storage, storageKey), polledAt: null }) },
+      { ...context(), readWatch: async () => ({ ...await readStoredWatchState(storage, storageKey), polledAt: null, coverage: "polling" }) },
     );
-    expect(JSON.parse(result)).toEqual({ ...legacySnapshot, polledAt: null });
+    expect(JSON.parse(result)).toEqual({ ...legacySnapshot, polledAt: null, coverage: "polling" });
   });
 
   it("returns every reaction in the exact snapshot without truncation", async () => {
@@ -408,6 +408,6 @@ describe("MCP JSON output", () => {
     expect(JSON.parse(await callTool("get_pr", {
       repository: "owner/repo",
       number: 7,
-    }, crowded))).toEqual({ ...crowded, polledAt });
+    }, crowded))).toEqual({ ...crowded, polledAt, coverage: "webhook" });
   });
 });

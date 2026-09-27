@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mergeReactionKnowledge, monitorEventDetails } from "../src/events";
-import { createGithubUsage, githubUser, pullRequestSnapshot, type GithubUsage } from "../src/github";
+import { createGithubUsage, githubUser, installationCoverage, pullRequestSnapshot, type GithubUsage } from "../src/github";
 
 /** A PR with no comments, reviews, or checks, so only its body carries reactions. */
 function stubPullRequest(options: {
@@ -841,5 +841,71 @@ describe("conditional snapshot reads", () => {
     expect(stale).toMatchObject({ restRequests: 0, notModified: 8, graphqlRequests: 1 });
     expect(reread.threadsReadAt).toBe("2026-09-03T00:15:00.000Z");
     expect(github.requests.filter((request) => request.url.endsWith("/graphql"))).toHaveLength(2);
+  });
+});
+
+describe("installation coverage lookup", () => {
+  function installationsGithub() {
+    const bodies: Record<string, unknown> = {
+      "/user/installations?per_page=100": {
+        total_count: 3,
+        installations: [
+          { id: 1, account: { login: "Owner" }, repository_selection: "selected", suspended_at: null },
+          { id: 2, account: { login: "Org" }, repository_selection: "all", suspended_at: null },
+          { id: 3, account: { login: "Paused" }, repository_selection: "all", suspended_at: "2026-01-01T00:00:00Z" },
+        ],
+      },
+      "/user/installations/1/repositories?per_page=100": {
+        total_count: 1,
+        repositories: [{ full_name: "Owner/Covered" }],
+      },
+    };
+    const requests: Array<{ path: string; status: number }> = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const path = `${url.pathname}${url.search}`;
+      if (!Object.hasOwn(bodies, path)) throw new Error(`unexpected GitHub URL ${url}`);
+      const etag = `"${path}"`;
+      const status = new Headers(init?.headers).get("if-none-match") === etag ? 304 : 200;
+      requests.push({ path, status });
+      if (status === 304) return new Response(null, { status, headers: { etag } });
+      return Response.json(bodies[path], { headers: { etag } });
+    });
+    return requests;
+  }
+
+  it("finds a selected installation's repository, and repeats the lookup as two 304s", async () => {
+    const requests = installationsGithub();
+    const first = await installationCoverage("token", "owner/covered", null);
+    expect(first.coverage).toBe("repository");
+
+    const usage = createGithubUsage();
+    const repeat = await installationCoverage("token", "owner/covered", first.lookup, usage);
+    expect(repeat).toEqual(first);
+    expect(requests.slice(2)).toEqual([
+      { path: "/user/installations?per_page=100", status: 304 },
+      { path: "/user/installations/1/repositories?per_page=100", status: 304 },
+    ]);
+    expect(usage.notModified).toBe(2);
+
+    // Another repository of the same selected installation is answered from the same lists.
+    await expect(installationCoverage("token", "owner/uncovered", repeat.lookup)).resolves.toMatchObject({ coverage: "none" });
+  });
+
+  it("covers every repository of an account-wide installation without listing them", async () => {
+    const requests = installationsGithub();
+    await expect(installationCoverage("token", "org/anything", null)).resolves.toMatchObject({ coverage: "account" });
+    expect(requests.map(({ path }) => path)).toEqual(["/user/installations?per_page=100"]);
+  });
+
+  it("reports no coverage for suspended installations and other owners", async () => {
+    installationsGithub();
+    await expect(installationCoverage("token", "paused/repo", null)).resolves.toMatchObject({ coverage: "none" });
+    await expect(installationCoverage("token", "can1357/oh-my-pi", null)).resolves.toMatchObject({ coverage: "none" });
+  });
+
+  it("throws when GitHub refuses the lookup", async () => {
+    globalThis.fetch = vi.fn(async () => Response.json({ message: "Forbidden" }, { status: 403 }));
+    await expect(installationCoverage("token", "owner/repo", null)).rejects.toThrow();
   });
 });

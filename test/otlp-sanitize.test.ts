@@ -138,6 +138,9 @@ describe("OTLP sanitizer", () => {
             { body: { kvlistValue: { values: [
               { key: "event", value: str("watch_pr.poll") },
               { key: "active_sessions", value: { intValue: "3" } },
+              { key: "due_watches", value: { intValue: "2" } },
+              { key: "coverage_webhook", value: { intValue: "5" } },
+              { key: "coverage_polling", value: { intValue: "1" } },
               { key: "repository", value: str("private-repository") },
               { key: "email", value: str("owner@example.test") },
               { key: "api_key", value: str("secret-key") },
@@ -170,7 +173,12 @@ describe("OTLP sanitizer", () => {
 
     expect(records[0]).toEqual({
       body: str("watch_pr.poll"),
-      attributes: [{ key: "watch_pr.active_sessions", value: { intValue: 3 } }],
+      attributes: [
+        { key: "watch_pr.active_sessions", value: { intValue: 3 } },
+        { key: "watch_pr.due_watches", value: { intValue: 2 } },
+        { key: "watch_pr.coverage_webhook", value: { intValue: 5 } },
+        { key: "watch_pr.coverage_polling", value: { intValue: 1 } },
+      ],
     });
     expect(records[1]).toEqual({
       body: str("watch_pr.do_storage"),
