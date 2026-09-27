@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyInstallationLookup,
   applyInstallationWebhook,
+  FAILED_POLL_RETRY_MS,
   MERGEABILITY_FOLLOW_UP_MS,
   needsInstallationLookup,
   planPollTick,
@@ -9,6 +10,7 @@ import {
   registerPollEntry,
   repositoryCoverage,
   requestMergeabilityFollowUp,
+  retryFailedPoll,
   settleMergeabilityFollowUp,
   WEBHOOK_RECONCILE_MS,
   type MergeabilityFollowUp,
@@ -172,6 +174,23 @@ describe("poll due index", () => {
     const quiet = planPollTick(schedule, new Map(), watched, webhookCovered, now + 30 * MINUTE);
     expect(quiet).toMatchObject({ due: [], active: 1, coverage: { webhook: 1, polling: 0 }, changed: false });
     expect(planPollTick(schedule, new Map(), watched, webhookCovered, now + WEBHOOK_RECONCILE_MS).due).toHaveLength(1);
+  });
+
+  it("retries a failed reconcile within minutes and never delays a sooner read or revives a stopped one", () => {
+    const id = "42:owner/repo#7";
+    const schedule: PollSchedule = {};
+    const watched = new Map([[id, "owner/repo"]]);
+    planPollTick(schedule, new Map(), watched, webhookCovered, now);
+    expect(retryFailedPoll(schedule, id, now)).toBe(true);
+    expect(planPollTick(schedule, new Map(), watched, webhookCovered, now + FAILED_POLL_RETRY_MS - MINUTE).due).toEqual([]);
+    expect(planPollTick(schedule, new Map(), watched, webhookCovered, now + FAILED_POLL_RETRY_MS).due).toEqual([{ id }]);
+
+    const sooner: PollSchedule = { [id]: { state: "active", dueAt: now + MINUTE } };
+    expect(retryFailedPoll(sooner, id, now)).toBe(false);
+    expect(sooner[id]).toEqual({ state: "active", dueAt: now + MINUTE });
+    const stopped: PollSchedule = { [id]: { state: "stopped" } };
+    expect(retryFailedPoll(stopped, id, now)).toBe(false);
+    expect(retryFailedPoll({}, id, now)).toBe(false);
   });
 
   it("reads a polling watch on every tick without rewriting the index", () => {

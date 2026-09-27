@@ -41,6 +41,7 @@ import {
   registerPollEntry,
   repositoryCoverage,
   requestMergeabilityFollowUp,
+  retryFailedPoll,
   settleMergeabilityFollowUp,
   WEBHOOK_RECONCILE_MS,
   type MergeabilityFollowUp,
@@ -2617,13 +2618,17 @@ export class WatchPrHub {
 
   /**
    * Applies what a scheduled read found: a merged or closed pull request stops being scheduled
-   * and drops its follow-up; otherwise the follow-up it performed, if any, settles.
+   * and drops its follow-up; a failed read is retried within minutes instead of at the next
+   * hourly reconcile; otherwise the follow-up it performed, if any, settles.
    */
   private async settlePoll(id: string, outcome: RefreshOutcome, followUp: MergeabilityFollowUp | undefined): Promise<void> {
-    if (outcome !== "terminal") {
-      if (followUp) settleMergeabilityFollowUp(this.mergeabilityFollowUps, id, followUp, outcome, Date.now());
+    const now = Date.now();
+    if (followUp) settleMergeabilityFollowUp(this.mergeabilityFollowUps, id, followUp, outcome, now);
+    if (outcome === "failed") {
+      await this.updatePollSchedule((schedule) => retryFailedPoll(schedule, id, now));
       return;
     }
+    if (outcome !== "terminal") return;
     this.mergeabilityFollowUps.delete(id);
     await this.updatePollSchedule((schedule) => {
       if (schedule[id]?.state === "stopped") return false;

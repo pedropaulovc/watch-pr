@@ -3135,6 +3135,42 @@ describe("poll cadence", () => {
     }
   });
 
+  it("retries a failed webhook reconcile after five minutes instead of the next hour", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    const { hub, pending, storage } = hubFixture();
+    await storage.put(sessionStorageKey(sessionToken), sessionRecord({
+      watches: ["owner/repo#1"],
+      expiresAt: start + 3 * 60 * MINUTE,
+    }));
+    await storage.put(WEBHOOK_COVERAGE_KEY, ownerCovered);
+    const github = pullsGithub();
+    let failing = true;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (!failing) return github.fetchMock(input);
+      await github.fetchMock(input);
+      return new Response("unavailable", { status: 502 });
+    }));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const readMinutes: number[] = [];
+      for (let minute = 0; minute <= 70; minute += 1) {
+        vi.setSystemTime(start + minute * MINUTE);
+        const before = github.reads.length;
+        await tick(hub, pending);
+        if (github.reads.length > before) readMinutes.push(minute);
+        if (minute === 0) failing = false;
+      }
+      expect(readMinutes).toEqual([0, 5, 65]);
+    } finally {
+      error.mockRestore();
+      log.mockRestore();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
   it("reads a pushed pull request again after 1, 3 and 7 minutes while mergeability stays unknown", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(start);

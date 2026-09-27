@@ -14,6 +14,8 @@ import type {
 export const POLL_TICK_TOLERANCE_MS = 30_000;
 /** Webhook-covered watches are read this often to pick up reactions, drift, and missed deliveries. */
 export const WEBHOOK_RECONCILE_MS = 60 * 60 * 1000;
+/** A failed read is retried this soon, so a webhook-covered watch is not left stale for the hour. */
+export const FAILED_POLL_RETRY_MS = 5 * 60 * 1000;
 /** GitHub computes mergeability asynchronously after a push; the first check waits this long. */
 export const MERGEABILITY_FOLLOW_UP_MS = 60_000;
 /** Delay before the next check when attempt N still found mergeability unknown. The last attempt has none. */
@@ -248,6 +250,19 @@ export function registerPollEntry(
   if (state === "merged") return entry?.state === "stopped" ? undefined : { state: "stopped" };
   if (entry?.state === "active") return undefined;
   return { state: "active", dueAt: now + WEBHOOK_RECONCILE_MS };
+}
+
+/**
+ * A scheduled read failed: bring an active watch's next read forward to the retry delay. The
+ * schedule is left alone, and not rewritten, when that read is already due sooner.
+ */
+export function retryFailedPoll(schedule: PollSchedule, id: string, now: number): boolean {
+  const entry = schedule[id];
+  if (entry?.state !== "active") return false;
+  const dueAt = now + FAILED_POLL_RETRY_MS;
+  if (entry.dueAt <= dueAt) return false;
+  schedule[id] = { state: "active", dueAt };
+  return true;
 }
 
 /**

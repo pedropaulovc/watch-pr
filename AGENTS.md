@@ -57,7 +57,7 @@ The GitHub App is installed per account, so a watched repository owned by someon
 
 - No entry: due now. Entries no session holds any more are dropped.
 - `stopped`: skipped. A poll or registration read that finds the pull request merged or closed stops it; registering a merged watch stores it stopped. A delivery that requests a mergeability follow-up (below), such as `reopened`, resumes it with an hourly `dueAt`.
-- `dueAt` within 30 s of now: due, and the entry claims `dueAt = now + 1 h`, the hourly reconcile that picks up reactions, drift, and missed deliveries.
+- `dueAt` within 30 s of now: due, and the entry claims `dueAt = now + 1 h`, the hourly reconcile that picks up reactions, drift, and missed deliveries. If that read, or a registration read, fails, `dueAt` is brought forward to 5 min after the failure (one put, skipped when the entry is already due sooner), so a transient GitHub error does not leave a `webhook` watch stale for the hour.
 - A pending mergeability follow-up due within 30 s: due.
 - Otherwise a `polling` watch is due on every tick; a `webhook` watch waits.
 
