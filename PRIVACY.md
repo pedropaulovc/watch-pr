@@ -8,7 +8,7 @@ Effective 2026-09-27. This policy covers the hosted MCP server at `https://watch
 - **Tool arguments.** The repository (`owner/name`) and pull request number you pass to a tool.
 - **Pull request data.** For each watched pull request, the service reads GitHub and stores a snapshot: title, body, state, branches, head commit, mergeability, checks and statuses, reviews, review threads, comments, and reactions, including their authors. When the GitHub App is installed on a repository, GitHub also sends webhook deliveries for it.
 
-The service never receives your conversation with Claude, your prompts, or files from your machine. It only sees tool arguments.
+The service never receives your conversation with Claude, your prompts, or files from your machine. From the Claude side it receives only tool arguments; everything else it holds is the GitHub data described above.
 
 ## How it is used
 
@@ -18,13 +18,13 @@ The data is used only to answer tool calls, resource reads, and monitor feeds fo
 
 - An OAuth session, and the GitHub tokens stored with it, lasts 30 days. An expired session, or one whose GitHub token GitHub rejects, is deleted.
 - Monitor URLs expire 12 hours after creation, or earlier when the session ends or the pull request is unwatched.
-- Each watch keeps its latest snapshot and its most recent 100 events. Older events are deleted as new ones arrive.
+- Each watch keeps its latest snapshot and its most recent 100 events. When a new event pushes one out of that window, its stored payload is deleted in the same write, or shortly after through a cleanup queue when the payload is large.
 - Unwatching a pull request stops refreshes and notifications for it. Its stored snapshot and events remain until deleted on request.
 - Webhook delivery IDs are kept to suppress duplicate deliveries.
 
 ## Telemetry
 
-Operational logs and traces go to Azure Monitor Application Insights. Before export, a filter removes headers, URLs with query strings, IP addresses and location data, storage keys, log bodies, exception messages, credentials, and any unrecognized field. Telemetry does not contain tokens, repository names, snapshots, or webhook payloads.
+Operational logs and traces go to Azure Monitor Application Insights. Before export, a filter removes headers, URLs with query strings, client IP addresses and client geolocation (country, city, ASN), storage keys, log bodies, exception messages, credentials, and any unrecognized field. The Cloudflare data center and region that handled a request are kept. Telemetry does not contain tokens, repository names, snapshots, or webhook payloads.
 
 ## Infrastructure
 
