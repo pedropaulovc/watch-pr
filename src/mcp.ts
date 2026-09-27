@@ -6,9 +6,8 @@ import { parseResourceUri, watchKey } from "./events";
 import type { GithubUser, PrMonitorRegistration, PullRequestSnapshot, WatchReadState } from "./types";
 
 /**
- * One watched pull request as `list_watched_prs` reports it: session-scoped identity, its
- * resource URI, and the latest snapshot. `watch_pr` returns the same shape plus the
- * `monitor` capability object.
+ * One watched pull request as the hub reports it: session-scoped identity, its resource URI,
+ * and the latest snapshot. Tools replace the snapshot with `pullRequestSummary`.
  */
 export interface WatchRegistration {
   key: string;
@@ -39,6 +38,21 @@ const pullRequestInputSchema = {
   number: z.number().int().positive().describe("Pull request number"),
 };
 
+/** The compact pull request state `watch_pr` and `list_watched_prs` return in place of the snapshot. */
+function pullRequestSummary(snapshot: PullRequestSnapshot | null) {
+  if (!snapshot) return null;
+  return {
+    url: snapshot.url,
+    title: snapshot.title,
+    state: snapshot.state,
+    draft: snapshot.draft,
+    merged: snapshot.merged,
+    headSha: snapshot.headSha,
+    mergeableState: snapshot.mergeableState,
+    fetchedAt: snapshot.fetchedAt,
+  };
+}
+
 /**
  * Builds the MCP server for one authenticated session: the five JSON tools and the pull
  * request resource. `watch_pr` is the single entry point for watching and monitoring;
@@ -61,7 +75,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     "watch_pr",
     {
       title: "Watch pull request",
-      description: "Subscribe to a pull request and open its read-only SSE monitor capability in one call. The JSON result is the watch registration plus `monitor: { monitorUrl, cursor, terminalState }`. Repeated calls reuse or renew the same capability.",
+      description: "Subscribe to a pull request and open its read-only SSE monitor capability in one call. The JSON result is the watch registration with a compact `pullRequest` summary plus `monitor: { monitorUrl, cursor, terminalState }`. Repeated calls reuse or renew the same capability.",
       annotations: {
         title: "Watch pull request",
         readOnlyHint: false,
@@ -70,12 +84,12 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       inputSchema: pullRequestInputSchema,
     },
     async ({ repository, number }) => {
-      const registration = await context.watch(repository, number);
+      const { snapshot, ...registration } = await context.watch(repository, number);
       const monitor = await context.openMonitor(repository, number);
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ ...registration, monitor }),
+          text: JSON.stringify({ ...registration, pullRequest: pullRequestSummary(snapshot), monitor }),
         }],
       };
     },
@@ -120,16 +134,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
         type: "text" as const,
         text: JSON.stringify((await context.listWatches()).map(({ snapshot, ...watch }) => ({
           ...watch,
-          pullRequest: snapshot && {
-            url: snapshot.url,
-            title: snapshot.title,
-            state: snapshot.state,
-            draft: snapshot.draft,
-            merged: snapshot.merged,
-            headSha: snapshot.headSha,
-            mergeableState: snapshot.mergeableState,
-            fetchedAt: snapshot.fetchedAt,
-          },
+          pullRequest: pullRequestSummary(snapshot),
         }))),
       }],
     }),
@@ -164,7 +169,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     "list_pr_events",
     {
       title: "List pull request events",
-      description: "Read recent webhook and snapshot events for a watched pull request.",
+      description: "Read recent webhook and snapshot events for a watched pull request, oldest first: each event's ID, receipt time, GitHub event and action, changed areas, and detail lines.",
       annotations: {
         title: "List pull request events",
         readOnlyHint: true,
@@ -179,7 +184,18 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify({ repository, number, events: state.events.slice(-limit) }),
+          text: JSON.stringify({
+            repository,
+            number,
+            events: state.events.slice(-limit).map((event) => ({
+              id: event.id,
+              receivedAt: event.receivedAt,
+              githubEvent: event.githubEvent,
+              action: event.action,
+              changes: event.changes,
+              details: event.details ?? [],
+            })),
+          }),
         }],
       };
     },
