@@ -33,7 +33,9 @@ export interface McpSessionContext {
 }
 
 const pullRequestInputSchema = {
-  repository: z.string().describe("GitHub repository in owner/name form"),
+  repository: z.string()
+    .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9._-]+$/u, "repository must be a GitHub owner/name pair, such as octocat/hello-world")
+    .describe("GitHub repository in owner/name form, such as octocat/hello-world"),
   number: z.number().int().positive().describe("Pull request number"),
 };
 
@@ -61,6 +63,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       title: "Watch pull request",
       description: "Subscribe to a pull request and open its read-only SSE monitor capability in one call. The JSON result is the watch registration plus `monitor: { monitorUrl, cursor, terminalState }`. Repeated calls reuse or renew the same capability.",
       annotations: {
+        title: "Watch pull request",
         readOnlyHint: false,
         destructiveHint: false,
       },
@@ -84,6 +87,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       title: "Unwatch pull request",
       description: "Stop receiving updates for a pull request.",
       annotations: {
+        title: "Unwatch pull request",
         readOnlyHint: false,
         destructiveHint: true,
       },
@@ -104,8 +108,9 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     "list_watched_prs",
     {
       title: "List watched pull requests",
-      description: "List pull requests watched by the authenticated GitHub account.",
+      description: "List the pull requests the authenticated GitHub account watches, one summary each: title, state, head commit, mergeability, and when the stored snapshot last changed. Use `get_pr` for a pull request's checks, reviews, and comments.",
       annotations: {
+        title: "List watched pull requests",
         readOnlyHint: true,
       },
       inputSchema: {},
@@ -113,7 +118,19 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     async () => ({
       content: [{
         type: "text" as const,
-        text: JSON.stringify(await context.listWatches()),
+        text: JSON.stringify((await context.listWatches()).map(({ snapshot, ...watch }) => ({
+          ...watch,
+          pullRequest: snapshot && {
+            url: snapshot.url,
+            title: snapshot.title,
+            state: snapshot.state,
+            draft: snapshot.draft,
+            merged: snapshot.merged,
+            headSha: snapshot.headSha,
+            mergeableState: snapshot.mergeableState,
+            fetchedAt: snapshot.fetchedAt,
+          },
+        }))),
       }],
     }),
   );
@@ -124,6 +141,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       title: "Get pull request state",
       description: "Read the latest durable pull request snapshot, or null before the first one. `polledAt` is when GitHub was last read successfully and stored; `fetchedAt` is when the stored snapshot last changed, from a GitHub read or a webhook payload applied without one, so `fetchedAt` can be newer than `polledAt`, and a quiet pull request keeps an old `fetchedAt` while `polledAt` advances. `updatedAt` is GitHub's own last-update time for the pull request. `coverage` is `webhook` when the repository's GitHub webhooks reach the server, which applies them as they arrive and reads GitHub about hourly, or `polling`, when it reads GitHub every minute.",
       annotations: {
+        title: "Get pull request state",
         readOnlyHint: true,
       },
       inputSchema: pullRequestInputSchema,
@@ -148,6 +166,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
       title: "List pull request events",
       description: "Read recent webhook and snapshot events for a watched pull request.",
       annotations: {
+        title: "List pull request events",
         readOnlyHint: true,
       },
       inputSchema: {
@@ -185,9 +204,9 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     },
     async (uri) => {
       const parsed = parseResourceUri(uri.href);
-      if (!parsed) throw new Error("invalid watch-pr resource URI");
+      if (!parsed) throw new Error(`${uri.href} is not a watch-pr resource; expected watch-pr://OWNER/REPO/pull/NUMBER`);
       const key = watchKey(parsed.repository, parsed.number);
-      if (!context.watches.has(key)) throw new Error("pull request is not watched by this session");
+      if (!context.watches.has(key)) throw new Error(`${key} is not watched by this account; call watch_pr with this repository and number first`);
       return {
         contents: [{
           uri: uri.href,
@@ -200,23 +219,23 @@ export function createMcpServer(context: McpSessionContext): McpServer {
 
   server.server.setRequestHandler(SubscribeRequestSchema, async ({ params }) => {
     const parsed = parseResourceUri(params.uri);
-    if (!parsed) throw new Error("invalid watch-pr resource URI");
+    if (!parsed) throw new Error(`${params.uri} is not a watch-pr resource; expected watch-pr://OWNER/REPO/pull/NUMBER`);
     await context.subscribe(parsed.repository, parsed.number);
     return {};
   });
 
   server.server.setRequestHandler(UnsubscribeRequestSchema, async ({ params }) => {
     const parsed = parseResourceUri(params.uri);
-    if (!parsed) throw new Error("invalid watch-pr resource URI");
+    if (!parsed) throw new Error(`${params.uri} is not a watch-pr resource; expected watch-pr://OWNER/REPO/pull/NUMBER`);
     await context.unsubscribe(parsed.repository, parsed.number);
     return {};
   });
 
   server.server.setRequestHandler(ReadResourceRequestSchema, async ({ params }, extra) => {
     const parsed = parseResourceUri(params.uri);
-    if (!parsed) throw new Error("invalid watch-pr resource URI");
+    if (!parsed) throw new Error(`${params.uri} is not a watch-pr resource; expected watch-pr://OWNER/REPO/pull/NUMBER`);
     const key = watchKey(parsed.repository, parsed.number);
-    if (!context.watches.has(key)) throw new Error("pull request is not watched by this session");
+    if (!context.watches.has(key)) throw new Error(`${key} is not watched by this account; call watch_pr with this repository and number first`);
     return {
       contents: [{
         uri: params.uri,

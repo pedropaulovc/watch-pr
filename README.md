@@ -4,6 +4,10 @@
 
 The server combines GitHub App webhooks with scheduled refreshes. A webhook's payload is applied to the stored snapshot directly, without a GitHub API request; only a payload the server cannot apply triggers a read. A repository whose webhooks reach the server (the app is installed on its account and covers it) is refreshed about once an hour, plus a few reads after each push while GitHub computes mergeability. Any other repository, such as one owned by an account that has not installed the app, is refreshed every minute. The refresh covers state without a dedicated webhook, including reactions, check rollups, and changes to `mergeable` and `mergeable_state`.
 
+## Privacy and support
+
+See the [privacy policy](PRIVACY.md). For support, open an issue at <https://github.com/pedropaulovc/watch-pr/issues> or email pedro@vezza.com.br.
+
 ## Connect
 
 The server advertises dynamic OAuth client registration at `/oauth/register`. Registered redirect URIs must use HTTPS or loopback HTTP. Every authorization request requires S256 PKCE.
@@ -14,11 +18,13 @@ Authenticate with the OAuth 2.0 authorization-code flow advertised at `/.well-kn
 
 - `watch_pr`: Subscribe to `repository` (`owner/name`) and `number` and create its revocable, read-only SSE capability in one call. The JSON result adds `monitor: { monitorUrl, cursor, terminalState }`.
 - `unwatch_pr`: Remove a subscription for the current GitHub account.
-- `list_watched_prs`: List the current account's subscriptions.
+- `list_watched_prs`: List the current account's subscriptions, each with a compact pull request summary.
 - `get_pr`: Read the latest durable pull request snapshot, when GitHub was last read, and how the pull request is kept fresh.
 - `list_pr_events`: Read up to 100 recent webhook and snapshot events.
 
-Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the latest snapshot plus top-level `polledAt` and `coverage` (or `null` before the first snapshot), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records. Tools also advertise MCP behavior hints: `watch_pr` is additive (`destructiveHint: false`), `unwatch_pr` is destructive, and `list_watched_prs`, `get_pr`, and `list_pr_events` are read-only.
+Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects whose `snapshot` is replaced by `pullRequest: { url, title, state, draft, merged, headSha, mergeableState, fetchedAt }` (or `null` before the first snapshot), `get_pr` returns the latest snapshot plus top-level `polledAt` and `coverage` (or `null` before the first snapshot), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records. Every tool annotation carries a human-readable `title` and behavior hints: `watch_pr` is additive (`destructiveHint: false`), `unwatch_pr` is destructive, and `list_watched_prs`, `get_pr`, and `list_pr_events` are read-only.
+
+`repository` must match `owner/name`; a malformed value, or a pull request the account does not watch, returns a tool error that names the expected input or the `watch_pr` call to make.
 
 Resource reads always return the full stored watch state as `{ snapshot, events, polledAt, coverage }`. Snapshot and event payloads are not abbreviated by the MCP tool layer.
 

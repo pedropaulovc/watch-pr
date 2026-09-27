@@ -1,8 +1,10 @@
 import { WatchPrHub, type Env } from "./hub";
+import { ICON_PNG_BASE64 } from "./icon";
 
 const MCP_PATH = "/mcp";
 const WEBHOOK_PATH = "/webhooks/github";
 const OAUTH_PATHS = new Set(["/oauth/register", "/oauth/authorize", "/oauth/callback", "/oauth/token"]);
+const ICON_PNG = Uint8Array.from(atob(ICON_PNG_BASE64), (char) => char.charCodeAt(0));
 
 function baseUrl(request: Request, env: Env): string {
   return (env.PUBLIC_BASE_URL || new URL(request.url).origin).replace(/\/+$/u, "");
@@ -62,6 +64,9 @@ const worker = {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
     if (url.pathname === "/health") return addCors(json({ status: "ok", service: "watch-pr", protocol: "mcp", mcp: MCP_PATH }), request);
+    if (url.pathname === "/favicon.ico" || url.pathname === "/icon.png") {
+      return new Response(ICON_PNG, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
+    }
     if (url.pathname === "/") {
       return addCors(json({
         service: "watch-pr",

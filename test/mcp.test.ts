@@ -267,7 +267,20 @@ describe("MCP JSON output", () => {
       repository: "owner/repo",
       number: 7,
     }))).toEqual({ ...registration, monitor });
-    expect(JSON.parse(await callTool("list_watched_prs", {}))).toEqual([registration]);
+    const { snapshot: _full, ...watch } = registration;
+    expect(JSON.parse(await callTool("list_watched_prs", {}))).toEqual([{
+      ...watch,
+      pullRequest: {
+        url: snapshot.url,
+        title: snapshot.title,
+        state: snapshot.state,
+        draft: snapshot.draft,
+        merged: snapshot.merged,
+        headSha: snapshot.headSha,
+        mergeableState: snapshot.mergeableState,
+        fetchedAt: snapshot.fetchedAt,
+      },
+    }]);
     expect(JSON.parse(await callTool("unwatch_pr", {
       repository: "owner/repo",
       number: 7,
@@ -317,15 +330,20 @@ describe("MCP JSON output", () => {
     ]);
   });
 
-  it("advertises behavior hints matching each tool's side effects", async () => {
+  it("advertises a directory title and behavior hints matching each tool's side effects", async () => {
     const tools = await listTools();
     expect(Object.fromEntries(tools.map((tool) => [tool.name, tool.annotations]))).toEqual({
-      watch_pr: { readOnlyHint: false, destructiveHint: false },
-      unwatch_pr: { readOnlyHint: false, destructiveHint: true },
-      list_watched_prs: { readOnlyHint: true },
-      get_pr: { readOnlyHint: true },
-      list_pr_events: { readOnlyHint: true },
+      watch_pr: { title: "Watch pull request", readOnlyHint: false, destructiveHint: false },
+      unwatch_pr: { title: "Unwatch pull request", readOnlyHint: false, destructiveHint: true },
+      list_watched_prs: { title: "List watched pull requests", readOnlyHint: true },
+      get_pr: { title: "Get pull request state", readOnlyHint: true },
+      list_pr_events: { title: "List pull request events", readOnlyHint: true },
     });
+  });
+
+  it("rejects a malformed repository with an actionable message", async () => {
+    const text = await callTool("get_pr", { repository: "https://github.com/owner/repo", number: 7 });
+    expect(text).toContain("repository must be a GitHub owner/name pair");
   });
 
   it("serializes a sidecar-backed event history", async () => {

@@ -2033,7 +2033,7 @@ export class WatchPrHub {
     number: number,
   ): Promise<PrMonitorRegistration> {
     const key = watchKey(repository, number);
-    if (!active.watches.has(key)) throw new Error("pull request is not watched by this session");
+    if (!active.watches.has(key)) throw new Error(`${key} is not watched by this account; call watch_pr with this repository and number first`);
     const parsed = parseWatchKey(key);
     const scopeKey = monitorScopeStorageKey(active.token, parsed.repository, parsed.number);
     let capability = await this.state.storage.get<string>(scopeKey);
@@ -2149,7 +2149,7 @@ export class WatchPrHub {
 
   private async readWatch(active: ActiveSession, repository: string, number: number): Promise<WatchReadState> {
     const key = watchKey(repository, number);
-    if (!active.watches.has(key)) throw new Error("pull request is not watched by this session");
+    if (!active.watches.has(key)) throw new Error(`${key} is not watched by this account; call watch_pr with this repository and number first`);
     const state = await this.watchStateFull(active.record.user.id, key);
     if (!state.snapshot) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "read");
     const parsed = parseWatchKey(key);
@@ -2166,7 +2166,7 @@ export class WatchPrHub {
   private async subscribe(active: ActiveSession, repository: string, number: number): Promise<void> {
     const key = watchKey(repository, number);
     await this.updateSession(active, (watches, subscriptions) => {
-      if (!watches.has(key)) throw new Error("watch the pull request before subscribing to its resource");
+      if (!watches.has(key)) throw new Error(`${key} is not watched by this account; call watch_pr before subscribing to its resource`);
       subscriptions.add(key);
     });
   }
@@ -2214,7 +2214,7 @@ export class WatchPrHub {
       if (!updated) {
         await this.revokeSessionMonitors(active.token, active.watches);
         await this.closeActiveSessionsForToken(active.token);
-        throw new Error("session is no longer active");
+        throw new Error("the OAuth session has expired or was revoked; reconnect the watch-pr connector to sign in again");
       }
       this.syncActiveSessions(active.token, updated.record, active);
       return updated.result;
