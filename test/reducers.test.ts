@@ -209,6 +209,16 @@ describe("webhook reducers", () => {
     }
   });
 
+  it("refetches a status delivery missing its context or id instead of inventing one", () => {
+    const stored = snapshot();
+    for (const payload of [
+      { id: 50, sha: "abc", state: "failure" },
+      { sha: "abc", context: "ci", state: "failure" },
+    ]) {
+      expect(applyWebhook(stored, "status", payload, RECEIVED_AT)).toEqual({ snapshot: stored, outcome: "refetch" });
+    }
+  });
+
   it("keeps stored mergeability unless the payload computed it or the head moved", () => {
     const stored = snapshot({
       checks: [{

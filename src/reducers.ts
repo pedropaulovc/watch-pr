@@ -198,7 +198,8 @@ function reduceCheckSuite(snapshot: PullRequestSnapshot, payload: GithubRecord):
 
 function reduceStatus(snapshot: PullRequestSnapshot, payload: GithubRecord): WebhookReduction {
   const sha = stringValue(payload, "sha");
-  if (!sha) return { snapshot, outcome: "refetch" };
+  // A status without its identity would be stored under a synthetic context a later read replaces.
+  if (!sha || !stringValue(payload, "context") || numberValue(payload, "id") <= 0) return { snapshot, outcome: "refetch" };
   if (sha !== snapshot.headSha) return { snapshot, outcome: "ignored" };
   const incoming = normalizeCommitStatus(payload, 0);
   const context = incoming.name.toLowerCase();
