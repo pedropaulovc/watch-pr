@@ -262,25 +262,23 @@ async function listTools(
 }
 
 describe("MCP JSON output", () => {
-  it("returns the full JSON shape for every state tool", async () => {
+  it("returns compact watch and event shapes and the full snapshot from get_pr", async () => {
+    const { snapshot: _full, ...watch } = registration;
+    const pullRequest = {
+      url: snapshot.url,
+      title: snapshot.title,
+      state: snapshot.state,
+      draft: snapshot.draft,
+      merged: snapshot.merged,
+      headSha: snapshot.headSha,
+      mergeableState: snapshot.mergeableState,
+      fetchedAt: snapshot.fetchedAt,
+    };
     expect(JSON.parse(await callTool("watch_pr", {
       repository: "owner/repo",
       number: 7,
-    }))).toEqual({ ...registration, monitor });
-    const { snapshot: _full, ...watch } = registration;
-    expect(JSON.parse(await callTool("list_watched_prs", {}))).toEqual([{
-      ...watch,
-      pullRequest: {
-        url: snapshot.url,
-        title: snapshot.title,
-        state: snapshot.state,
-        draft: snapshot.draft,
-        merged: snapshot.merged,
-        headSha: snapshot.headSha,
-        mergeableState: snapshot.mergeableState,
-        fetchedAt: snapshot.fetchedAt,
-      },
-    }]);
+    }))).toEqual({ ...watch, pullRequest, monitor });
+    expect(JSON.parse(await callTool("list_watched_prs", {}))).toEqual([{ ...watch, pullRequest }]);
     expect(JSON.parse(await callTool("unwatch_pr", {
       repository: "owner/repo",
       number: 7,
@@ -292,7 +290,18 @@ describe("MCP JSON output", () => {
     expect(JSON.parse(await callTool("list_pr_events", {
       repository: "owner/repo",
       number: 7,
-    }))).toEqual({ repository: "owner/repo", number: 7, events: [event] });
+    }))).toEqual({
+      repository: "owner/repo",
+      number: 7,
+      events: [{
+        id: event.id,
+        receivedAt: event.receivedAt,
+        githubEvent: event.githubEvent,
+        action: event.action,
+        changes: event.changes,
+        details: [],
+      }],
+    });
   });
 
   it("returns get_pr without request validators, and null before the first snapshot", async () => {
@@ -365,17 +374,8 @@ describe("MCP JSON output", () => {
     };
     await mutation.append(appended, snapshot);
 
-    const result = await callTool(
-      "list_pr_events",
-      { repository: "owner/repo", number: 7 },
-      snapshot,
-      { ...context(), readWatch: async () => ({ ...await readStoredWatchState(storage, storageKey), polledAt: null, coverage: "polling" }) },
-    );
-    expect(JSON.parse(result)).toEqual({
-      repository: "owner/repo",
-      number: 7,
-      events: [{ ...predecessor, snapshot: null }, appended],
-    });
+    const stored = await readStoredWatchState(storage, storageKey);
+    expect(stored.events).toEqual([{ ...predecessor, snapshot: null }, appended]);
   });
 
   it("keeps unknown reactions in snapshots persisted before they were attributed", async () => {
