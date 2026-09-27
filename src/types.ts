@@ -259,6 +259,64 @@ export interface StoredWatchState {
 export interface WatchReadState extends StoredWatchState {
   /** Separate from `snapshot.fetchedAt`, which only moves when the stored snapshot does. */
   polledAt: string | null;
+  /** How the repository's changes reach the hub, which decides how often it is polled. */
+  coverage: WebhookCoverage;
+}
+
+/**
+ * Whether GitHub delivers a repository's webhooks to this app. `webhook` repositories are
+ * reconciled hourly; `polling` repositories are read on every cron tick.
+ */
+export type WebhookCoverage = "webhook" | "polling";
+
+/** What established a coverage record. */
+export type CoverageEvidence =
+  | "installation_created"
+  | "installation_deleted"
+  | "installation_suspend"
+  | "installation_unsuspend"
+  | "installation_repositories_added"
+  | "installation_repositories_removed"
+  | "delivery"
+  | "user_installations"
+  | "user_installations_failed";
+
+export interface CoverageRecord {
+  coverage: WebhookCoverage;
+  evidence: CoverageEvidence;
+  /** When the evidence was observed. The newest record that applies to a repository wins. */
+  at: string;
+}
+
+/** Everything known about app installations, stored under `WEBHOOK_COVERAGE_KEY`. */
+export interface CoverageIndex {
+  /** Owner login: an installation on every repository of the account, or its removal. */
+  accounts: Record<string, CoverageRecord>;
+  /** `owner/name`: one repository's coverage. */
+  repositories: Record<string, CoverageRecord>;
+}
+
+/**
+ * One watch in the poll schedule, keyed by `pollScheduleId`: when its next hourly reconcile is
+ * due, or `stopped` once it is merged or closed.
+ */
+export type PollScheduleEntry =
+  | { state: "active"; dueAt: number }
+  | { state: "stopped" };
+
+export type PollSchedule = Record<string, PollScheduleEntry>;
+
+/** The compact due index the cron reads instead of every watch record. */
+export const POLL_SCHEDULE_KEY = "poll-schedule";
+export const WEBHOOK_COVERAGE_KEY = "webhook-coverage";
+
+export function pollScheduleId(userId: number, key: string): string {
+  return `${userId}:${key}`;
+}
+
+/** ETag cache for the user's `GET /user/installations` coverage lookup. */
+export function installationLookupStorageKey(userId: number): string {
+  return `installation-lookup:${userId}`;
 }
 
 /**

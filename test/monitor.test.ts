@@ -8,17 +8,23 @@ import {
   type Env,
 } from "../src/hub";
 import type {
+  CoverageIndex,
   MonitorCapabilityRecord,
+  PollSchedule,
   PrMonitorEvent,
   PullRequestSnapshot,
   SessionRecord,
   StoredWatchState,
   WatchEvent,
+  WatchReadState,
 } from "../src/types";
 import {
   monitorCapabilityStorageKey,
   monitorScopeStorageKey,
+  POLL_SCHEDULE_KEY,
+  pollScheduleId,
   sessionStorageKey,
+  WEBHOOK_COVERAGE_KEY,
   watchSidecarEventKey,
   watchSidecarIndexKey,
   watchPolledKey,
@@ -151,7 +157,7 @@ function sessionRecord(overrides: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
-function hubFixture(): {
+function hubFixture(envOverrides: Partial<Env> = {}): {
   hub: WatchPrHub;
   storage: MemoryStorage;
   pending: Promise<unknown>[];
@@ -171,6 +177,7 @@ function hubFixture(): {
     GITHUB_CLIENT_SECRET: "github-client-secret",
     GITHUB_WEBHOOK_SECRET: "webhook-secret",
     PUBLIC_BASE_URL: "https://watch-pr.test",
+    ...envOverrides,
   };
   return { hub: new WatchPrHub(state, env), storage, pending, restart: () => new WatchPrHub(state, env) };
 }
@@ -342,6 +349,10 @@ async function storeMonitor(
   await storage.put(sessionStorageKey(sessionToken), record);
   await storage.put(monitorCapabilityStorageKey(capability), capabilityRecord);
   await storage.put(monitorScopeStorageKey(sessionToken, repository, number), capability);
+  // An indexed watch in steady state: its hourly reconcile is not due, and unknown coverage polls it every tick.
+  await storage.put(POLL_SCHEDULE_KEY, {
+    [pollScheduleId(userId, watch)]: { state: "active", dueAt: Date.now() + 60 * 60 * 1000 },
+  } satisfies PollSchedule);
   await writeStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number), state);
 }
 
@@ -386,7 +397,7 @@ type HubInternals = {
   }>;
   unwatch(active: TestActiveSession, repository: string, number: number): Promise<boolean>;
   listWatches(active: TestActiveSession): Promise<{ key: string }[]>;
-  readWatch(active: TestActiveSession, repository: string, number: number): Promise<StoredWatchState>;
+  readWatch(active: TestActiveSession, repository: string, number: number): Promise<WatchReadState>;
   publishEvent(
     userId: number,
     key: string,
@@ -923,10 +934,11 @@ describe("native monitor feed", () => {
           outcome: "completed",
           routed_watches: 1,
           published_watches: 1,
-          // Event, snapshot, index, poll time, and the delivery marker.
-          storage_key_puts: 5,
+          // Event, snapshot, index, poll time, the first delivery's coverage proof, and the
+          // delivery marker. The mergeability follow-up is held in memory and writes nothing.
+          storage_key_puts: 6,
           storage_key_deletes: 1,
-          storage_key_writes: 6,
+          storage_key_writes: 7,
         }),
       ]);
 
@@ -1113,12 +1125,13 @@ describe("native monitor feed", () => {
         outcome: "failed",
         routed_watches: 5,
         published_watches: 4,
-        // Four targets complete each event, snapshot, index, and root retirement, then record
-        // their poll time. The fifth persists its event and snapshot and retires the root
-        // before its index write fails, so its poll time is never recorded.
-        storage_key_puts: 18,
+        // The first delivery for the repository records its coverage proof. Four targets
+        // complete each event, snapshot, index, and root retirement, then record their poll
+        // time. The fifth persists its event and snapshot and retires the root before its
+        // index write fails, so its poll time and the follow-ups are never recorded.
+        storage_key_puts: 19,
         storage_key_deletes: 5,
-        storage_key_writes: 23,
+        storage_key_writes: 24,
       });
       expect(records.find((entry) => entry.event === "watch_pr.webhook_failure")).toMatchObject({
         delivery_fingerprint: await sha256Base64Url(deliveryId),
@@ -1183,9 +1196,10 @@ describe("native monitor feed", () => {
         sample_reason: "all",
         outcome: "completed",
         delivery_dedupe_puts: 1,
-        storage_key_puts: 1,
+        // The coverage proof and the delivery marker; the invalidated session gets no follow-up.
+        storage_key_puts: 2,
         storage_key_deletes: 3,
-        storage_key_writes: 4,
+        storage_key_writes: 5,
       });
     } finally {
       vi.unstubAllGlobals();
@@ -2627,10 +2641,10 @@ describe("native monitor feed", () => {
     storage.afterGet = async (key) => {
       if (writing || key !== storageKey) return;
       stateReads += 1;
-      // Reads one and two happen before the refresh fetches; three is the comparison it
-      // makes against stored state, so writing here lands in the window before its own
-      // transaction opens.
-      if (stateReads !== 3) return;
+      // Read one happens before the refresh fetches (the cron itself reads no watch record);
+      // two is the comparison it makes against stored state, so writing here lands in the
+      // window before its own transaction opens.
+      if (stateReads !== 2) return;
       writing = true;
       const mutation = await openWatchStateMutation(storage as unknown as DurableObjectStorage, storageKey);
       await mutation.replaceSnapshot(concurrent);
@@ -2704,6 +2718,11 @@ describe("webhook reducers", () => {
   ) {
     const fixture = hubFixture();
     await storeMonitor(fixture.storage, { snapshot: stored, events: [event("event-seeded", stored)] });
+    // A repository that already proved its deliveries arrive: a delivery adds no coverage write.
+    await fixture.storage.put(WEBHOOK_COVERAGE_KEY, {
+      accounts: {},
+      repositories: { [repository]: { coverage: "webhook", evidence: "delivery", at: "2026-09-10T11:00:00.000Z" } },
+    } satisfies CoverageIndex);
     fixture.storage.putKeys.length = 0;
     vi.stubGlobal("fetch", fetchMock);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -2999,5 +3018,361 @@ describe("webhook reducers", () => {
     const state = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
     expect(state.snapshot).toMatchObject({ headSha: "def", mergeable: null, mergeableState: "unknown" });
     expect(state.events.at(-1)?.changes).toEqual(["mergeability"]);
+  });
+});
+
+describe("poll cadence", () => {
+  const start = Date.parse("2026-09-10T12:00:00.000Z");
+  const MINUTE = 60_000;
+  const ownerCovered: CoverageIndex = {
+    accounts: { owner: { coverage: "webhook", evidence: "installation_created", at: "2026-09-01T00:00:00.000Z" } },
+    repositories: {},
+  };
+
+  /** Serves every pull request of every repository, logging each pull read as `owner/repo#n`. */
+  function pullsGithub(mergeableState: () => string = () => "clean") {
+    const reads: string[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/graphql")) {
+        return Response.json({ data: { repository: { pullRequest: { reviewThreads: {
+          nodes: [],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        } } } } });
+      }
+      const pull = /^\/repos\/([^/]+\/[^/]+)\/pulls\/([0-9]+)$/u.exec(url.pathname);
+      if (pull) {
+        reads.push(`${pull[1]}#${pull[2]}`);
+        const state = mergeableState();
+        return Response.json({
+          number: Number(pull[2]),
+          html_url: `https://github.com/${pull[1]}/pull/${pull[2]}`,
+          title: "Monitor feed",
+          body: "body",
+          state: "open",
+          draft: false,
+          merged: false,
+          merged_at: null,
+          mergeable: state === "unknown" ? null : true,
+          mergeable_state: state,
+          user: { login: "author" },
+          head: { ref: "feature", sha: "abc", repo: { full_name: pull[1] } },
+          base: { ref: "main" },
+        });
+      }
+      if (/\/issues\/[0-9]+$/u.test(url.pathname)) return Response.json({ reactions: {} });
+      if (url.pathname.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+      if (url.pathname.endsWith("/check-suites")) return Response.json({ check_suites: [] });
+      if (/\/(comments|reviews|statuses)$/u.test(url.pathname)) return Response.json([]);
+      throw new Error(`unexpected GitHub URL ${url}`);
+    });
+    return { reads, fetchMock };
+  }
+
+  async function tick(hub: WatchPrHub, pending: Promise<unknown>[]): Promise<Record<string, unknown>> {
+    const response = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+    expect(response.status).toBe(202);
+    await Promise.all(pending.splice(0));
+    return response.json();
+  }
+
+  async function signedDelivery(hub: WatchPrHub, eventName: string, deliveryId: string, payload: Record<string, unknown>) {
+    const body = JSON.stringify(payload);
+    return hub.fetch(new Request("https://watch-pr.test/webhooks/github", {
+      method: "POST",
+      headers: {
+        "x-github-delivery": deliveryId,
+        "x-github-event": eventName,
+        "x-hub-signature-256": `sha256=${await hmacSha256Hex("webhook-secret", body)}`,
+      },
+      body,
+    }));
+  }
+
+  it("reads idle webhook-covered watches once an hour and polling watches on every tick, without reading idle watch records", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    const { hub, pending, storage } = hubFixture();
+    const covered = Array.from({ length: 20 }, (_, index) => `owner/repo#${index + 1}`);
+    const polled = ["other/repo#1", "other/repo#2"];
+    await storage.put(sessionStorageKey(sessionToken), sessionRecord({
+      watches: [...covered, ...polled],
+      expiresAt: start + 3 * 60 * MINUTE,
+    }));
+    await storage.put(WEBHOOK_COVERAGE_KEY, ownerCovered);
+    const github = pullsGithub();
+    vi.stubGlobal("fetch", github.fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      for (let minute = 0; minute < 60; minute += 1) {
+        storage.getKeys.length = 0;
+        await tick(hub, pending);
+        if (minute > 0) {
+          // An idle tick reads the session, the coverage record and the due index; only the
+          // polling watches it refreshes read their own records.
+          expect(storage.getKeys.filter((key) => !key.startsWith("watch:42:other/repo:")))
+            .toEqual([sessionStorageKey(sessionToken), WEBHOOK_COVERAGE_KEY, POLL_SCHEDULE_KEY]);
+        }
+        vi.setSystemTime(start + (minute + 1) * MINUTE);
+      }
+      const readsOf = (key: string) => github.reads.filter((read) => read === key).length;
+      expect(covered.map(readsOf)).toEqual(covered.map(() => 1));
+      expect(polled.map(readsOf)).toEqual([60, 60]);
+
+      // The hour is up: every covered watch reconciles once.
+      await tick(hub, pending);
+      expect(covered.map(readsOf)).toEqual(covered.map(() => 2));
+
+      const polls = log.mock.calls
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .filter((entry) => entry.event === "watch_pr.poll");
+      expect(polls[1]).toMatchObject({ scheduled_watches: 22, due_watches: 2, coverage_webhook: 20, coverage_polling: 2 });
+      expect(polls.at(-1)).toMatchObject({ due_watches: 22 });
+    } finally {
+      log.mockRestore();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads a pushed pull request again after 1, 3 and 7 minutes while mergeability stays unknown", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    const { hub, pending, storage } = hubFixture();
+    const record = sessionRecord({ expiresAt: start + 3 * 60 * MINUTE });
+    const stored = snapshot({ updatedAt: "2026-09-10T11:00:00.000Z" });
+    await storeMonitor(storage, { snapshot: stored, events: [] }, record);
+    await storage.put(WEBHOOK_COVERAGE_KEY, ownerCovered);
+    storage.putKeys.length = 0;
+    const github = pullsGithub(() => "unknown");
+    vi.stubGlobal("fetch", github.fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const pushed = await signedDelivery(hub, "pull_request", "delivery-push", {
+        action: "synchronize",
+        repository: { full_name: repository },
+        pull_request: {
+          number,
+          html_url: "https://github.com/owner/repo/pull/7",
+          title: "Monitor feed",
+          body: "body",
+          state: "open",
+          draft: false,
+          merged: false,
+          merged_at: null,
+          mergeable: null,
+          updated_at: "2026-09-10T12:00:00.000Z",
+          user: { login: "author" },
+          head: { ref: "feature", sha: "def", repo: { full_name: repository } },
+          base: { ref: "main" },
+        },
+      });
+      expect(pushed.status).toBe(202);
+      await Promise.all(pending.splice(0));
+      // The payload was applied as it arrived; GitHub has not been read yet.
+      expect(github.reads).toEqual([]);
+
+      const readMinutes: number[] = [];
+      for (let minute = 1; minute <= 20; minute += 1) {
+        vi.setSystemTime(start + minute * MINUTE);
+        const before = github.reads.length;
+        await tick(hub, pending);
+        if (github.reads.length > before) readMinutes.push(minute);
+      }
+      expect(readMinutes).toEqual([1, 3, 7]);
+      // Three reads spent. Follow-ups never wrote the due index: the hourly reconcile stands.
+      expect(storage.putKeys).not.toContain(POLL_SCHEDULE_KEY);
+      await expect(storage.get(POLL_SCHEDULE_KEY)).resolves.toEqual({
+        [pollScheduleId(userId, watch)]: { state: "active", dueAt: start + 60 * MINUTE },
+      });
+    } finally {
+      log.mockRestore();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it("resumes a closed watch a delivery reopens and stops the follow-up once GitHub has computed mergeability", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    const { hub, pending, storage } = hubFixture();
+    const closed = snapshot({ state: "closed" });
+    await storeMonitor(storage, { snapshot: closed, events: [] }, sessionRecord({ expiresAt: start + 3 * 60 * MINUTE }));
+    await storage.put(POLL_SCHEDULE_KEY, { [pollScheduleId(userId, watch)]: { state: "stopped" } } satisfies PollSchedule);
+    await storage.put(WEBHOOK_COVERAGE_KEY, ownerCovered);
+    const answers = ["unknown", "unknown", "clean"];
+    const github = pullsGithub(() => answers.shift() ?? "clean");
+    vi.stubGlobal("fetch", github.fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      // A minimal payload the reducer cannot apply: the delivery reads GitHub, which has not
+      // finished computing mergeability yet.
+      await signedDelivery(hub, "pull_request", "delivery-reopened", {
+        action: "reopened",
+        repository: { full_name: repository },
+        pull_request: { number },
+      });
+      await Promise.all(pending.splice(0));
+      expect(github.reads).toHaveLength(1);
+      await expect(storage.get(POLL_SCHEDULE_KEY)).resolves.toEqual({
+        [pollScheduleId(userId, watch)]: { state: "active", dueAt: start + 60 * MINUTE },
+      });
+
+      const readMinutes: number[] = [];
+      for (let minute = 1; minute <= 20; minute += 1) {
+        vi.setSystemTime(start + minute * MINUTE);
+        const before = github.reads.length;
+        await tick(hub, pending);
+        if (github.reads.length > before) readMinutes.push(minute);
+      }
+      expect(readMinutes).toEqual([1, 3]);
+      const state = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
+      expect(state.snapshot?.mergeableState).toBe("clean");
+    } finally {
+      log.mockRestore();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it("follows installation webhooks: covered watches wait for their reconcile, uninstalled ones poll", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    const { hub, pending, storage } = hubFixture();
+    const record = sessionRecord({ expiresAt: start + 3 * 60 * MINUTE });
+    await storeMonitor(storage, { snapshot: snapshot(), events: [] }, record);
+    const github = pullsGithub();
+    vi.stubGlobal("fetch", github.fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const internals = hub as unknown as HubInternals;
+    const active = internals.newActiveSession(sessionToken, record, "stateful");
+    const installation = { id: 9, account: { login: "Owner" }, repository_selection: "selected" };
+    const coverage = async () => (await internals.readWatch(active, repository, number)).coverage;
+    try {
+      // Nothing is known about the repository: it is polled every minute.
+      expect(await coverage()).toBe("polling");
+      await tick(hub, pending);
+      expect(github.reads).toHaveLength(1);
+
+      const installed = await signedDelivery(hub, "installation", "delivery-installed", {
+        action: "created",
+        installation,
+        repositories: [{ full_name: repository }],
+      });
+      expect(installed.status).toBe(202);
+      expect(await coverage()).toBe("webhook");
+      vi.setSystemTime(start + MINUTE);
+      await tick(hub, pending);
+      expect(github.reads).toHaveLength(1);
+
+      const removed = await signedDelivery(hub, "installation_repositories", "delivery-removed", {
+        action: "removed",
+        installation,
+        repository_selection: "selected",
+        repositories_added: [],
+        repositories_removed: [{ full_name: repository }],
+      });
+      expect(removed.status).toBe(202);
+      expect(await coverage()).toBe("polling");
+      vi.setSystemTime(start + 2 * MINUTE);
+      await tick(hub, pending);
+      expect(github.reads).toHaveLength(2);
+
+      await signedDelivery(hub, "installation_repositories", "delivery-added", {
+        action: "added",
+        installation,
+        repository_selection: "selected",
+        repositories_added: [{ full_name: repository }],
+        repositories_removed: [],
+      });
+      expect(await coverage()).toBe("webhook");
+      await signedDelivery(hub, "installation", "delivery-deleted", { action: "deleted", installation });
+      expect(await coverage()).toBe("polling");
+    } finally {
+      log.mockRestore();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it("seeds coverage at watch time from the user's installations, conditionally, and polls when the lookup fails", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    const installationsRequests: Array<{ path: string; status: number }> = [];
+    let installationsStatus = 200;
+    const github = pullsGithub();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (!url.pathname.startsWith("/user/installations")) return github.fetchMock(input);
+      const path = `${url.pathname}${url.search}`;
+      const etag = `"${path}"`;
+      const status = installationsStatus !== 200
+        ? installationsStatus
+        : new Headers(init?.headers).get("if-none-match") === etag ? 304 : 200;
+      installationsRequests.push({ path, status });
+      if (status === 304) return new Response(null, { status, headers: { etag } });
+      if (status !== 200) return Response.json({ message: "unavailable" }, { status });
+      if (url.pathname === "/user/installations") {
+        return Response.json({ installations: [{ id: 9, account: { login: "Owner" }, repository_selection: "selected", suspended_at: null }] }, { headers: { etag } });
+      }
+      return Response.json({ repositories: [{ full_name: repository }] }, { headers: { etag } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const { hub, pending, storage } = hubFixture();
+      const record = sessionRecord({ watches: [], expiresAt: start + 3 * 60 * MINUTE });
+      await storage.put(sessionStorageKey(sessionToken), record);
+      const internals = hub as unknown as HubInternals;
+      const active = internals.newActiveSession(sessionToken, record, "stateful");
+      const coverage = async () => (await internals.readWatch(active, repository, number)).coverage;
+
+      await internals.watch(active, repository, number);
+      await Promise.all(pending.splice(0));
+      expect(await coverage()).toBe("webhook");
+      expect(installationsRequests.map(({ status }) => status)).toEqual([200, 200]);
+
+      // Watching again consults the installations again, as two 304s that write nothing.
+      storage.putKeys.length = 0;
+      await internals.watch(active, repository, number);
+      await Promise.all(pending.splice(0));
+      expect(installationsRequests.slice(2).map(({ status }) => status)).toEqual([304, 304]);
+      expect(storage.putKeys.filter((key) => key.startsWith("installation-lookup:") || key === WEBHOOK_COVERAGE_KEY)).toEqual([]);
+
+      // Registration was the read; the covered watch is not polled until its reconcile.
+      vi.setSystemTime(start + MINUTE);
+      await tick(hub, pending);
+      expect(github.reads).toHaveLength(2);
+
+      const failed = hubFixture();
+      await failed.storage.put(sessionStorageKey(sessionToken), record);
+      const failedInternals = failed.hub as unknown as HubInternals;
+      const failedActive = failedInternals.newActiveSession(sessionToken, record, "stateful");
+      installationsStatus = 500;
+      await failedInternals.watch(failedActive, repository, number);
+      await Promise.all(failed.pending.splice(0));
+      const failedCoverage = (await failedInternals.readWatch(failedActive, repository, number)).coverage;
+      expect(failedCoverage).toBe("polling");
+      const lookups = log.mock.calls
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .filter((entry) => entry.event === "watch_pr.coverage_lookup");
+      expect(lookups.map((entry) => entry.outcome)).toEqual(["repository", "repository", "failed"]);
+
+      // A deployment that accepts no delivery (PPE) never asks: every watch there polls.
+      installationsStatus = 200;
+      const requestsBefore = installationsRequests.length;
+      const unsigned = hubFixture({ GITHUB_WEBHOOK_SECRET: undefined });
+      await unsigned.storage.put(sessionStorageKey(sessionToken), record);
+      const unsignedInternals = unsigned.hub as unknown as HubInternals;
+      const unsignedActive = unsignedInternals.newActiveSession(sessionToken, record, "stateful");
+      await unsignedInternals.watch(unsignedActive, repository, number);
+      await Promise.all(unsigned.pending.splice(0));
+      expect(installationsRequests).toHaveLength(requestsBefore);
+      expect((await unsignedInternals.readWatch(unsignedActive, repository, number)).coverage).toBe("polling");
+    } finally {
+      log.mockRestore();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
   });
 });

@@ -2,7 +2,7 @@
 
 `watch-pr` is a hosted MCP server for monitoring GitHub pull requests. Its Streamable HTTP endpoint is `https://watch-pr.vza.net/mcp`.
 
-The server combines GitHub App webhooks with a once-per-minute refresh. A webhook's payload is applied to the stored snapshot directly, without a GitHub API request; only a payload the server cannot apply triggers a read. The refresh covers state without a dedicated webhook, including reactions, check rollups, and changes to `mergeable` and `mergeable_state`.
+The server combines GitHub App webhooks with scheduled refreshes. A webhook's payload is applied to the stored snapshot directly, without a GitHub API request; only a payload the server cannot apply triggers a read. A repository whose webhooks reach the server (the app is installed on its account and covers it) is refreshed about once an hour, plus a few reads after each push while GitHub computes mergeability. Any other repository, such as one owned by an account that has not installed the app, is refreshed every minute. The refresh covers state without a dedicated webhook, including reactions, check rollups, and changes to `mergeable` and `mergeable_state`.
 
 ## Connect
 
@@ -15,14 +15,14 @@ Authenticate with the OAuth 2.0 authorization-code flow advertised at `/.well-kn
 - `watch_pr`: Subscribe to `repository` (`owner/name`) and `number` and create its revocable, read-only SSE capability in one call. The JSON result adds `monitor: { monitorUrl, cursor, terminalState }`.
 - `unwatch_pr`: Remove a subscription for the current GitHub account.
 - `list_watched_prs`: List the current account's subscriptions.
-- `get_pr`: Read the latest durable pull request snapshot and when GitHub was last read.
+- `get_pr`: Read the latest durable pull request snapshot, when GitHub was last read, and how the pull request is kept fresh.
 - `list_pr_events`: Read up to 100 recent webhook and snapshot events.
 
-Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the latest snapshot plus a top-level `polledAt` (or `null` before the first snapshot), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records. Tools also advertise MCP behavior hints: `watch_pr` is additive (`destructiveHint: false`), `unwatch_pr` is destructive, and `list_watched_prs`, `get_pr`, and `list_pr_events` are read-only.
+Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the latest snapshot plus top-level `polledAt` and `coverage` (or `null` before the first snapshot), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records. Tools also advertise MCP behavior hints: `watch_pr` is additive (`destructiveHint: false`), `unwatch_pr` is destructive, and `list_watched_prs`, `get_pr`, and `list_pr_events` are read-only.
 
-Resource reads always return the full stored watch state as `{ snapshot, events, polledAt }`. Snapshot and event payloads are not abbreviated by the MCP tool layer.
+Resource reads always return the full stored watch state as `{ snapshot, events, polledAt, coverage }`. Snapshot and event payloads are not abbreviated by the MCP tool layer.
 
-A snapshot's `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt`. `polledAt` is when GitHub was last read successfully for the watch and that read was stored, by a poll, a watch or read, or a webhook whose payload could not be applied directly; a read whose result could not be stored does not advance it, so `polledAt` never vouches for data the snapshot lacks; it is `null` until the first successful read. A webhook applied from its payload changes `fetchedAt` without a read, so `fetchedAt` can be newer than `polledAt`. `updatedAt` is GitHub's `updated_at` for the pull request, and orders pull request deliveries. After a push delivery, `mergeableState` is `unknown` until the next refresh reads GitHub's computed mergeability, and `checks` starts empty and fills as the new head's check deliveries arrive. `get_pr` omits the snapshot's `githubValidators`, which are request bookkeeping rather than pull request state.
+A snapshot's `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt`. `polledAt` is when GitHub was last read successfully for the watch and that read was stored, by a poll, a watch or read, or a webhook whose payload could not be applied directly; a read whose result could not be stored does not advance it, so `polledAt` never vouches for data the snapshot lacks; it is `null` until the first successful read. A webhook applied from its payload changes `fetchedAt` without a read, so `fetchedAt` can be newer than `polledAt`. `updatedAt` is GitHub's `updated_at` for the pull request, and orders pull request deliveries. After a push delivery, `mergeableState` is `unknown` until a follow-up read finds GitHub's computed mergeability: about a minute after the push, then again after 2 and 4 more minutes while it is still `unknown`, at most three reads. If all three find it `unknown`, or a server restart drops the pending reads, it stays so until the next scheduled refresh, which is the next minute for a `polling` repository and up to an hour for a `webhook` one. A push also empties `checks`, which fill as the new head's check deliveries arrive. `coverage` is `webhook` when the repository's webhooks reach the server, learned from installation deliveries, from any delivery for the repository, or, until one arrives, from the watching user's app installations; otherwise it is `polling`. A `webhook` pull request is refreshed about once an hour, so reactions (which have no webhook) and anything a lost delivery missed can be up to an hour old; a `polling` one is refreshed every minute. Merged and closed pull requests are not refreshed on a schedule. `get_pr` omits the snapshot's `githubValidators`, which are request bookkeeping rather than pull request state.
 
 
 ## Resources
@@ -37,7 +37,7 @@ The feed replays events after the URL's `cursor` or the `Last-Event-ID` header, 
 
 An active watch reports a reaction even when the same refresh first reveals its target comment. Initial reconciliation omits reaction history. Removing a comment produces one deletion line for the comment instead of one line per reaction. A cursor older than the retained event history receives a reconciliation event from the current snapshot.
 
-Scheduled polling removes expired capabilities. `unwatch_pr` revokes active capabilities. Merged and closed feeds emit a terminal event and close.
+The one-minute cron removes expired capabilities. `unwatch_pr` revokes active capabilities. Merged and closed feeds emit a terminal event and close.
 
 For an already-terminal PR, the issued URL's cursor precedes the terminal event (or is absent when that is the only event). The registration's `cursor` still identifies the newest stored event. Clients that put the issued URL cursor in their first `Last-Event-ID` header therefore receive the terminal event instead of an acknowledgement response.
 
@@ -53,11 +53,11 @@ Refreshes send each REST request with the ETag of the response the stored snapsh
 
 - OAuth callback URLs: `https://watch-pr.vza.net/oauth/callback` and `https://watch-pr-ppe.vza.net/oauth/callback`.
 - Webhook URL: `https://watch-pr.vza.net/webhooks/github`.
-- Store the webhook secret as the production Cloudflare `GITHUB_WEBHOOK_SECRET` secret. The GitHub App has one webhook endpoint. PPE relies on its one-minute refresh and does not receive the production secret.
+- Store the webhook secret as the production Cloudflare `GITHUB_WEBHOOK_SECRET` secret. The GitHub App has one webhook endpoint. PPE does not receive the production secret, so it accepts no delivery and refreshes every watch each minute.
 - Request read-only access to repository metadata, pull requests, issues, checks, commit statuses, deployments, and merge queues.
 - Subscribe to `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `status`, `push`, `deployment`, `deployment_status`, `merge_group`, and `commit_comment`.
 
-The webhook handler verifies `X-Hub-Signature-256`. A manual GitHub redelivery resumes a partial fanout without duplicating completed watches. GitHub does not automatically redeliver a fanout failure that occurs after the handler returns `202`, so scheduled polling reconciles the snapshot. Reactions have no dedicated webhook, so the scheduled refresh supplies them; a comment delivery updates only the comment's reaction counts, and the refresh that follows reads and reports the individual reactions.
+The webhook handler verifies `X-Hub-Signature-256`. A manual GitHub redelivery resumes a partial fanout without duplicating completed watches. GitHub does not automatically redeliver a fanout failure that occurs after the handler returns `202`, so the scheduled refresh reconciles the snapshot: within the hour for a `webhook` repository. Reactions have no dedicated webhook, so the scheduled refresh supplies them; a comment delivery updates only the comment's reaction counts, and the refresh that follows reads and reports the individual reactions, within the hour for a `webhook` repository. The app's `installation` and `installation_repositories` events, which GitHub Apps receive without a subscription, tell the server which repositories it covers.
 
 ## Cloudflare environments
 
@@ -68,7 +68,7 @@ The environment files pin both the account ID and Worker name:
 | Production | `82fd9c2460271241c04b2401f16108db` (`pedro@vza.net`) | `watch-pr-vza-net-prod` | `wrangler.production.jsonc` |
 | PPE | `a30acccb05b2f4058c1b13c249056b4c` (`pedro@vezza.com.br`) | `watch-pr-ppe-vza-net` | `wrangler.ppe.jsonc` |
 
-Both Workers run a one-minute cron trigger. Production receives the GitHub webhook. PPE has no webhook secret and uses scheduled refreshes.
+Both Workers run a one-minute cron trigger that refreshes only the watches due. Production receives the GitHub webhook and refreshes covered repositories hourly. PPE has no webhook secret and refreshes every watch each minute.
 
 ## Observability
 

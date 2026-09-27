@@ -724,6 +724,96 @@ export async function githubUser(token: string): Promise<GithubUser> {
   };
 }
 
+/** One app installation the user can reach, as `GET /user/installations` lists it. */
+export interface UserInstallation {
+  id: number;
+  /** Lowercased login of the account the app is installed on. */
+  account: string;
+  repositorySelection: "all" | "selected";
+  suspended: boolean;
+}
+
+/**
+ * The stored answer to the installation lookup and the ETags it came with, so a repeated
+ * lookup is a pair of `304`s. `repositories` holds, per installation ID, the lowercased full
+ * names of a `selected` installation's repositories the user can see.
+ */
+export interface InstallationLookup {
+  validators: Record<string, string>;
+  installations: UserInstallation[];
+  repositories: Record<string, string[]>;
+}
+
+/** Whether the app is installed on the whole account, on the repository alone, or neither. */
+export type InstallationCoverage = "account" | "repository" | "none";
+
+function userInstallation(record: GithubRecord): UserInstallation | null {
+  const id = numberValue(record, "id");
+  const account = record.account && typeof record.account === "object"
+    ? stringValue(record.account as GithubRecord, "login")
+    : null;
+  const selection = stringValue(record, "repository_selection");
+  if (!id || !account || (selection !== "all" && selection !== "selected")) return null;
+  return { id, account: account.toLowerCase(), repositorySelection: selection, suspended: record.suspended_at != null };
+}
+
+/**
+ * Which installation, if any, delivers `repository`'s webhooks, as far as the user's token can
+ * see: `GET /user/installations`, then the repositories of the owner's `selected`
+ * installation. Both are sent with the ETags `cached` stored, so a repeat costs no primary
+ * rate limit. Only an installation on the repository's own account can cover it.
+ */
+export async function installationCoverage(
+  token: string,
+  repository: string,
+  cached: InstallationLookup | null,
+  usage?: GithubUsage,
+): Promise<{ coverage: InstallationCoverage; lookup: InstallationLookup }> {
+  const auth = { token, usage };
+  const validators = cached?.validators ?? {};
+  const installationsPath = "/user/installations";
+  const installationsUrl = firstPageUrl(installationsPath);
+  const listedInstallations = await githubListRead<unknown>(auth, installationsPath, validators, "installations");
+  const lookup: InstallationLookup = { validators: {}, installations: cached?.installations ?? [], repositories: {} };
+  if (listedInstallations.status === "fetched") {
+    lookup.installations = records(listedInstallations.value).flatMap((record) => userInstallation(record) ?? []);
+    if (listedInstallations.etag) lookup.validators[installationsUrl] = listedInstallations.etag;
+  } else {
+    lookup.validators[installationsUrl] = validators[installationsUrl];
+  }
+  // Repository lists of installations that still exist stay cached for other owners' lookups.
+  for (const installation of lookup.installations) {
+    const id = String(installation.id);
+    const url = firstPageUrl(`/user/installations/${id}/repositories`);
+    const known = cached?.repositories[id];
+    if (!known) continue;
+    lookup.repositories[id] = known;
+    if (validators[url]) lookup.validators[url] = validators[url];
+  }
+
+  const owner = repository.slice(0, repository.indexOf("/"));
+  const installation = lookup.installations.find((entry) => entry.account === owner && !entry.suspended);
+  if (!installation) return { coverage: "none", lookup };
+  if (installation.repositorySelection === "all") return { coverage: "account", lookup };
+
+  const id = String(installation.id);
+  const repositoriesPath = `/user/installations/${id}/repositories`;
+  const repositoriesUrl = firstPageUrl(repositoriesPath);
+  // A validator is sent only beside the list it was issued for.
+  const listed = await githubListRead<unknown>(
+    auth,
+    repositoriesPath,
+    lookup.repositories[id] ? lookup.validators : {},
+    "repositories",
+  );
+  if (listed.status === "fetched") {
+    lookup.repositories[id] = records(listed.value).flatMap((record) => repositoryFullName(record) ?? []);
+    if (listed.etag) lookup.validators[repositoriesUrl] = listed.etag;
+    else delete lookup.validators[repositoriesUrl];
+  }
+  return { coverage: lookup.repositories[id]?.includes(repository) ? "repository" : "none", lookup };
+}
+
 export async function exchangeGithubCode(
   clientId: string,
   clientSecret: string,
