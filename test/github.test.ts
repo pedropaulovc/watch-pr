@@ -131,6 +131,17 @@ describe("GitHub API adapter", () => {
           { id: 10, context: "buildkite/build", state: "success", created_at: "2026-09-19T12:01:00.000Z", updated_at: "2026-09-19T12:01:00.000Z", target_url: "https://buildkite.com/build/10" },
         ]);
       }
+      if (url.endsWith("/commits/abc/check-suites?per_page=100")) {
+        return Response.json({
+          check_suites: [
+            // Waiting on a maintainer to approve fork CI: no runs, so only the suite says so.
+            { id: 20, status: "completed", conclusion: "action_required", latest_check_runs_count: 0, app: { name: "GitHub Actions" }, created_at: "2026-09-19T12:00:00.000Z", updated_at: "2026-09-19T12:03:00.000Z" },
+            // Its runs already report it, so the suite adds nothing.
+            { id: 21, status: "completed", conclusion: "action_required", latest_check_runs_count: 2, app: { name: "Other CI" } },
+            { id: 22, status: "completed", conclusion: "success", latest_check_runs_count: 0, app: { name: "Idle" } },
+          ],
+        });
+      }
       if (url.endsWith("/graphql")) {
         graphqlCalls += 1;
         if (graphqlCalls === 1) {
@@ -168,6 +179,16 @@ describe("GitHub API adapter", () => {
       expect.objectContaining({ id: 10, name: "buildkite/build", conclusion: "success" }),
       expect.objectContaining({ id: 11, name: "coverage", conclusion: "failure" }),
     ]);
+    expect(result.checks.filter((check) => check.kind === "check_suite")).toEqual([{
+      id: 20,
+      name: "GitHub Actions",
+      status: "completed",
+      conclusion: "action_required",
+      completedAt: "2026-09-19T12:03:00.000Z",
+      startedAt: "2026-09-19T12:00:00.000Z",
+      url: "https://github.com/owner/repo/pull/7/checks",
+      kind: "check_suite",
+    }]);
     expect(result.threads).toEqual([
       { id: "thread-1", isResolved: false, commentIds: [8] },
       { id: "thread-2", isResolved: true, commentIds: [9] },
@@ -655,5 +676,170 @@ describe("GitHub API adapter", () => {
   it("reads the authenticated GitHub user profile", async () => {
     globalThis.fetch = vi.fn(async () => Response.json({ login: "pedropaulovc", id: 42, name: "Pedro", avatar_url: "https://avatar", html_url: "https://github.com/pedropaulovc" }));
     await expect(githubUser("token")).resolves.toEqual({ login: "pedropaulovc", id: 42, name: "Pedro", avatarUrl: "https://avatar", htmlUrl: "https://github.com/pedropaulovc" });
+  });
+});
+
+/**
+ * A GitHub whose REST responses each carry an ETag for their current version and answer 304
+ * to a matching `If-None-Match`. Bumping `versions[suffix]` after editing `bodies[suffix]`
+ * models the resource changing.
+ */
+function conditionalGithub() {
+  const bodies: Record<string, unknown> = {
+    "/pulls/7": {
+      number: 7,
+      html_url: "https://github.com/owner/repo/pull/7",
+      title: "Conditional",
+      state: "open",
+      user: { login: "author" },
+      head: { ref: "feature", sha: "abc" },
+      base: { ref: "main" },
+    },
+    "/issues/7": { reactions: { total_count: 0 } },
+    "/issues/7/comments?per_page=100": [
+      { id: 1, user: { login: "reviewer" }, body: "top-level", reactions: { total_count: 0 }, created_at: "then", updated_at: "then" },
+    ],
+    "/pulls/7/reviews?per_page=100": [],
+    "/pulls/7/comments?per_page=100": [
+      { id: 3, user: { login: "reviewer" }, body: "inline", path: "src/index.ts", line: 4, reactions: { total_count: 0 }, created_at: "then", updated_at: "then" },
+    ],
+    "/commits/abc/check-runs?per_page=100": { check_runs: [{ id: 4, name: "CI", status: "completed", conclusion: "success" }] },
+    "/commits/abc/statuses?per_page=100": [],
+    "/commits/abc/check-suites?per_page=100": { check_suites: [] },
+  };
+  const links: Record<string, string> = {};
+  const versions: Record<string, number> = {};
+  const requests: Array<{ url: string; ifNoneMatch: string | null }> = [];
+  const github = {
+    bodies,
+    links,
+    versions,
+    requests,
+    threads: (): Response => Response.json({ data: { repository: { pullRequest: { reviewThreads: {
+      nodes: [{ id: "thread-1", isResolved: false, comments: { nodes: [{ databaseId: 3 }] } }],
+      pageInfo: { hasNextPage: false, endCursor: null },
+    } } } } }),
+  };
+  globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const ifNoneMatch = new Headers(init?.headers).get("if-none-match");
+    requests.push({ url, ifNoneMatch });
+    if (url.endsWith("/graphql")) return github.threads();
+    const suffix = Object.keys(bodies).find((candidate) => url.endsWith(candidate));
+    if (!suffix) throw new Error(`unexpected GitHub URL ${url}`);
+    const etag = `"${suffix}@${versions[suffix] ?? 1}"`;
+    if (ifNoneMatch === etag) return new Response(null, { status: 304, headers: { etag } });
+    return Response.json(bodies[suffix], { headers: { etag, ...(links[suffix] ? { link: links[suffix] } : {}) } });
+  });
+  return github;
+}
+
+describe("conditional snapshot reads", () => {
+  it("revalidates every REST read and hands back the stored snapshot when nothing changed", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:00:00.000Z");
+    const github = conditionalGithub();
+    const first = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(Object.keys(first.githubValidators ?? {})).toHaveLength(8);
+    expect(first.threads).toEqual([{ id: "thread-1", isResolved: false, commentIds: [3] }]);
+
+    github.requests.length = 0;
+    const usage = createGithubUsage();
+    const second = await pullRequestSnapshot("token", "owner/repo", 7, first, usage);
+
+    expect(second).toEqual(first);
+    // Every REST read carried the stored ETag for its own URL, and the review comments' 304
+    // with a recent threads read left GraphQL, which cannot revalidate, unasked.
+    expect(github.requests).toHaveLength(8);
+    for (const request of github.requests) {
+      expect(request.ifNoneMatch).toBe(first.githubValidators?.[request.url]);
+    }
+    expect(usage).toMatchObject({ restRequests: 0, notModified: 8, graphqlRequests: 0 });
+  });
+
+  it("replaces only the slice whose endpoint answered with a new response", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:00:00.000Z");
+    const github = conditionalGithub();
+    const first = await pullRequestSnapshot("token", "owner/repo", 7);
+
+    github.bodies["/pulls/7/reviews?per_page=100"] = [
+      { id: 2, user: { login: "reviewer" }, state: "APPROVED", body: "ship it", submitted_at: "now" },
+    ];
+    github.versions["/pulls/7/reviews?per_page=100"] = 2;
+    const usage = createGithubUsage();
+    const second = await pullRequestSnapshot("token", "owner/repo", 7, first, usage);
+
+    const reviewsUrl = "https://api.github.com/repos/owner/repo/pulls/7/reviews?per_page=100";
+    expect(second.reviews).toEqual([{ id: 2, author: "reviewer", state: "APPROVED", body: "ship it", submittedAt: "now" }]);
+    expect(second).toEqual({
+      ...first,
+      reviews: second.reviews,
+      githubValidators: { ...first.githubValidators, [reviewsUrl]: '"/pulls/7/reviews?per_page=100@2"' },
+    });
+    expect(usage).toMatchObject({ restRequests: 1, notModified: 7, graphqlRequests: 0 });
+  });
+
+  it("stores no validator for a list that runs past one page", async () => {
+    const github = conditionalGithub();
+    github.links["/commits/abc/check-runs?per_page=100"] =
+      '<https://api.github.com/repos/owner/repo/commits/abc/check-runs?page=2&per_page=100>; rel="next"';
+    github.bodies["/check-runs?page=2&per_page=100"] = { check_runs: [{ id: 5, name: "Lint", status: "completed", conclusion: "success" }] };
+    const firstPage = "https://api.github.com/repos/owner/repo/commits/abc/check-runs?per_page=100";
+
+    const first = await pullRequestSnapshot("token", "owner/repo", 7);
+    expect(first.checks.map((check) => check.name)).toEqual(["CI", "Lint"]);
+    expect(first.githubValidators).not.toHaveProperty(firstPage);
+
+    github.requests.length = 0;
+    const second = await pullRequestSnapshot("token", "owner/repo", 7, first);
+    // One page's ETag cannot vouch for the list, so every page is read again in full.
+    expect(github.requests.filter((request) => request.url.includes("/check-runs"))).toEqual([
+      { url: firstPage, ifNoneMatch: null },
+      { url: "https://api.github.com/repos/owner/repo/commits/abc/check-runs?page=2&per_page=100", ifNoneMatch: null },
+    ]);
+    expect(second.checks.map((check) => check.name)).toEqual(["CI", "Lint"]);
+  });
+
+  it("keeps the stored threads when their read fails, and retries it on the next refresh", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:00:00.000Z");
+    const github = conditionalGithub();
+    const first = await pullRequestSnapshot("token", "owner/repo", 7);
+
+    // Old enough that the next refresh must read the threads again, and GraphQL fails.
+    vi.setSystemTime("2026-09-03T00:15:00.000Z");
+    github.threads = () => new Response("unavailable", { status: 502 });
+    const failed = await pullRequestSnapshot("token", "owner/repo", 7, first);
+    expect(failed.threads).toEqual(first.threads);
+    expect(failed.threadsReadAt).toBeUndefined();
+
+    // Everything answers 304, but a failed read left no read time to trust, so it is retried.
+    github.requests.length = 0;
+    vi.setSystemTime("2026-09-03T00:16:00.000Z");
+    const usage = createGithubUsage();
+    const retried = await pullRequestSnapshot("token", "owner/repo", 7, failed, usage);
+    expect(usage).toMatchObject({ restRequests: 0, notModified: 8, graphqlRequests: 1 });
+    expect(retried.threads).toEqual(first.threads);
+  });
+
+  it("reads the threads again once the stored read is fifteen minutes old", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-03T00:00:00.000Z");
+    const github = conditionalGithub();
+    const first = await pullRequestSnapshot("token", "owner/repo", 7);
+
+    vi.setSystemTime("2026-09-03T00:14:59.999Z");
+    const fresh = createGithubUsage();
+    const reused = await pullRequestSnapshot("token", "owner/repo", 7, first, fresh);
+    expect(fresh.graphqlRequests).toBe(0);
+    expect(reused.threadsReadAt).toBe("2026-09-03T00:00:00.000Z");
+
+    vi.setSystemTime("2026-09-03T00:15:00.000Z");
+    const stale = createGithubUsage();
+    const reread = await pullRequestSnapshot("token", "owner/repo", 7, reused, stale);
+    expect(stale).toMatchObject({ restRequests: 0, notModified: 8, graphqlRequests: 1 });
+    expect(reread.threadsReadAt).toBe("2026-09-03T00:15:00.000Z");
+    expect(github.requests.filter((request) => request.url.endsWith("/graphql"))).toHaveLength(2);
   });
 });

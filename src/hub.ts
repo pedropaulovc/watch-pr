@@ -16,12 +16,14 @@ import {
   watchKey,
 } from "./events";
 import {
+  coherentRequestKnowledge,
   createGithubUsage,
   exchangeGithubCode,
   GithubApiError,
   githubUser,
   pullRequestSnapshot,
   refreshGithubToken,
+  requestKnowledgeAdvanced,
   type GithubUsage,
 } from "./github";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "./mcp";
@@ -46,6 +48,7 @@ import type {
   WatchEvent,
   WatchEventMetadata,
   WatchEventSummary,
+  WatchReadState,
   WatchStateMetadata,
 } from "./types";
 import {
@@ -57,6 +60,7 @@ import {
   watchSidecarEventKey,
   watchSidecarIndexKey,
   watchSidecarSnapshotKey,
+  watchPolledKey,
   watchStorageKey,
 } from "./types";
 
@@ -427,7 +431,7 @@ function isPullRequestCheck(value: unknown): value is PullRequestCheck {
     isNullableString(value.completedAt) &&
     isNullableString(value.startedAt) &&
     isNullableString(value.url) &&
-    (value.kind === "check_run" || value.kind === "commit_status");
+    (value.kind === "check_run" || value.kind === "commit_status" || value.kind === "check_suite");
 }
 
 function isPullRequestThread(value: unknown): value is PullRequestThread {
@@ -507,7 +511,17 @@ function isPullRequestSnapshot(value: unknown): value is PullRequestSnapshot {
     isArrayOf(snapshot.reviews, isPullRequestReview) &&
     isArrayOf(snapshot.reviewComments, isPullRequestComment) &&
     isArrayOf(snapshot.checks, isPullRequestCheck) &&
-    isArrayOf(snapshot.threads, isPullRequestThread);
+    isArrayOf(snapshot.threads, isPullRequestThread) &&
+    (snapshot.githubValidators === undefined || isGithubValidators(snapshot.githubValidators)) &&
+    (snapshot.threadsReadAt === undefined || typeof snapshot.threadsReadAt === "string");
+}
+
+function isGithubValidators(value: unknown): value is Record<string, string> {
+  if (!isObjectRecord(value)) return false;
+  for (const key in value) {
+    if (Object.hasOwn(value, key) && typeof value[key] !== "string") return false;
+  }
+  return true;
 }
 
 function isWatchSnapshotRecord(value: unknown): value is WatchSnapshotRecord {
@@ -2065,12 +2079,16 @@ export class WatchPrHub {
     return registrations;
   }
 
-  private async readWatch(active: ActiveSession, repository: string, number: number): Promise<StoredWatchState> {
+  private async readWatch(active: ActiveSession, repository: string, number: number): Promise<WatchReadState> {
     const key = watchKey(repository, number);
     if (!active.watches.has(key)) throw new Error("pull request is not watched by this session");
     const state = await this.watchStateFull(active.record.user.id, key);
     if (!state.snapshot) this.scheduleRefresh(active.record.user.id, key, active.record.githubAccessToken, active.token, "read");
-    return state;
+    const parsed = parseWatchKey(key);
+    const polledAt = await this.state.storage.get<string>(
+      watchPolledKey(watchStorageKey(active.record.user.id, parsed.repository, parsed.number)),
+    );
+    return { ...state, polledAt: typeof polledAt === "string" ? polledAt : null };
   }
 
   private async subscribe(active: ActiveSession, repository: string, number: number): Promise<void> {
@@ -2380,9 +2398,8 @@ export class WatchPrHub {
     if (targets.length === 0) {
       return stats;
     }
-
-
-
+    // A thread delivery is about exactly what a 304 on the review comments cannot vouch for.
+    const threadsRead = eventName === "pull_request_review_thread" ? "refetch" : "when_stale";
     for (const target of targets) {
       const { githubToken, key, number, previous, repository: targetRepository, sessionToken, userId } = target;
       if (invalidSessionTokens.has(sessionToken)) continue;
@@ -2391,8 +2408,17 @@ export class WatchPrHub {
         continue;
       }
       let snapshot = previous.snapshot;
+      let polledAt: string | null = null;
       try {
-        snapshot = await pullRequestSnapshot(githubToken, targetRepository, number, previous.snapshot, stats.githubUsage);
+        snapshot = await pullRequestSnapshot(
+          githubToken,
+          targetRepository,
+          number,
+          previous.snapshot,
+          stats.githubUsage,
+          threadsRead,
+        );
+        polledAt = snapshot.fetchedAt;
       } catch (error) {
         stats.snapshotFailures += 1;
         logSnapshotFailure("webhook", error);
@@ -2418,6 +2444,9 @@ export class WatchPrHub {
         stats.storageKeyPuts += writes.puts;
         stats.storageKeyDeletes += writes.deletes;
       });
+      if (polledAt !== null) {
+        stats.storageKeyPuts += await this.recordPolled(watchStorageKey(userId, targetRepository, number), polledAt);
+      }
       if (!result.published || !result.write) continue;
       stats.publishedWatches += 1;
       stats.largestStateBytes = Math.max(stats.largestStateBytes, result.write.encodedBytes);
@@ -2466,11 +2495,13 @@ export class WatchPrHub {
     }
     try {
       await this.storeRefresh(userId, key, snapshot, reason);
+      await this.recordPolled(watchStorageKey(userId, parsed.repository, parsed.number), snapshot.fetchedAt);
     } catch (error) {
       this.refreshTotals.failed += 1;
       throw error;
     }
     this.refreshTotals.completed += 1;
+
   }
 
   private async storeRefresh(userId: number, key: string, snapshot: PullRequestSnapshot, reason: string): Promise<void> {
@@ -2482,7 +2513,11 @@ export class WatchPrHub {
     if (current.snapshot && changes.length === 0) {
       // Nothing to report, but a refresh that learned previously unknown reactions must still
       // be stored, or every later refresh re-reads the same targets and learns them again.
-      if (reactionKnowledgeAdvanced(current.snapshot, snapshot)) {
+      // A new validator is the same: unstored, the next refresh pays for the same 200.
+      if (
+        reactionKnowledgeAdvanced(current.snapshot, snapshot) ||
+        requestKnowledgeAdvanced(current.snapshot, snapshot, Date.now())
+      ) {
         await this.storeSnapshotOnly(userId, parsed.repository, parsed.number, snapshot);
       }
       return;
@@ -2498,6 +2533,20 @@ export class WatchPrHub {
       changes,
     });
     await this.publishEvent(userId, key, event, { snapshot });
+  }
+
+  /**
+   * Records when GitHub was last read successfully for a watch, only ever moving forward:
+   * overlapping refreshes finish out of order. Returns the number of keys written.
+   */
+  private async recordPolled(storageKey: string, polledAt: string): Promise<number> {
+    const key = watchPolledKey(storageKey);
+    return this.state.storage.transaction(async (storage) => {
+      const stored = await storage.get<string>(key);
+      if (typeof stored === "string" && Date.parse(stored) >= Date.parse(polledAt)) return 0;
+      await storage.put(key, polledAt);
+      return 1;
+    });
   }
 
   private async revokeExpiredMonitorCapabilities(): Promise<number> {
@@ -2547,8 +2596,10 @@ export class WatchPrHub {
 
   /**
    * Stores a refresh that has nothing to announce but does know more than the stored
-   * snapshot. No event is appended, so no monitor frame and no resource notification are
-   * produced; a concurrently stored newer snapshot wins exactly as it does in `publishEvent`.
+   * snapshot: reactions it learned, a validator the next refresh can send, or a threads read
+   * that replaces a stale one. No event is appended, so no monitor frame and no resource
+   * notification are produced; a concurrently stored newer snapshot wins exactly as it does
+   * in `publishEvent`.
    */
   private async storeSnapshotOnly(
     userId: number,
@@ -2573,8 +2624,18 @@ export class WatchPrHub {
       // invalidated cursor it needs removed from the committed state - so asking the merged
       // result instead would find nothing to store and leave that cursor durable forever.
       // The merge returning `current` itself means a concurrent write already got there.
-      const next = mergeReactionKnowledge(current, snapshot);
-      if (next === current || !reactionKnowledgeAdvanced(current, snapshot)) return;
+      const merged = mergeReactionKnowledge(current, snapshot);
+      const reactionsAdvanced = merged !== current && reactionKnowledgeAdvanced(current, snapshot);
+      let content = reactionsAdvanced ? merged : current;
+      // Fields no change announces - a renamed author or repository - are left to the refresh
+      // as long as nothing it would announce differs, or the pull validator would describe a
+      // response the stored snapshot never took and the same 200 would be paid every poll.
+      if (snapshotChanges(current, snapshot).length === 0) {
+        content = { ...content, url: snapshot.url, author: snapshot.author, headRepository: snapshot.headRepository };
+      }
+      // Validators are kept only where `content` still holds the slice their response produced.
+      const next = { ...content, ...coherentRequestKnowledge(content, [snapshot, current]) };
+      if (!reactionsAdvanced && !requestKnowledgeAdvanced(current, next, Date.now())) return;
       await mutation.replaceSnapshot(next);
       stored = true;
     });
@@ -2618,8 +2679,13 @@ export class WatchPrHub {
           } else {
             // This event's own snapshot is the base - reporting its change is the point of
             // the write - but it must not regress reaction knowledge: a read it failed may
-            // already have been stored by another refresh in flight.
-            snapshot = mergeReactionKnowledge(snapshot, current.snapshot);
+            // already have been stored by another refresh in flight. Counts the merge takes
+            // from the stored snapshot are not what this refresh's list responses said, so
+            // the validators are settled against the merged content.
+            const merged = mergeReactionKnowledge(snapshot, current.snapshot);
+            snapshot = merged === snapshot
+              ? merged
+              : { ...merged, ...coherentRequestKnowledge(merged, [snapshot, current.snapshot]) };
             changes = snapshotChanges(current.snapshot, snapshot);
             recomputedChanges = true;
           }

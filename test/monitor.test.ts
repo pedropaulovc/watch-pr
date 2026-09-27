@@ -21,6 +21,7 @@ import {
   sessionStorageKey,
   watchSidecarEventKey,
   watchSidecarIndexKey,
+  watchPolledKey,
   watchStorageKey,
 } from "../src/types";
 
@@ -174,6 +175,56 @@ function hubFixture(): {
   return { hub: new WatchPrHub(state, env), storage, pending, restart: () => new WatchPrHub(state, env) };
 }
 
+/** Keys written besides the poll time, which every successful read may advance. */
+function snapshotWrites(keys: readonly string[]): string[] {
+  return keys.filter((key) => key !== watchPolledKey(watchStorageKey(userId, repository, number)));
+}
+
+/**
+ * Serves `base` with an ETag per URL and answers 304 to a matching `If-None-Match`, counting
+ * what each poll spent. Bumping `generation` reissues every ETag for unchanged bodies.
+ */
+function conditionalFetch(base: (input: RequestInfo | URL) => Promise<Response>) {
+  const github = { generation: 1, fetched: 0, notModified: 0, graphql: 0 };
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith("/graphql")) {
+      github.graphql += 1;
+      return base(input);
+    }
+    const etag = `"${github.generation}:${url}"`;
+    if (new Headers(init?.headers).get("if-none-match") === etag) {
+      github.notModified += 1;
+      return new Response(null, { status: 304, headers: { etag } });
+    }
+    github.fetched += 1;
+    const response = await base(input);
+    const headers = new Headers(response.headers);
+    headers.set("etag", etag);
+    return new Response(response.body, { status: response.status, headers });
+  });
+  return { github, fetchMock };
+}
+
+/** One poll tick run to completion, with the write log and request counters reset first. */
+function pollOnce(
+  hub: WatchPrHub,
+  pending: Promise<unknown>[],
+  storage: MemoryStorage,
+  github: { fetched: number; notModified: number; graphql: number },
+): () => Promise<void> {
+  return async () => {
+    storage.putKeys.length = 0;
+    storage.deleteKeys.length = 0;
+    github.fetched = 0;
+    github.notModified = 0;
+    github.graphql = 0;
+    const response = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
+    expect(response.status).toBe(202);
+    await Promise.all(pending.splice(0));
+  };
+}
+
 function openPullRequestFetch() {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -202,6 +253,7 @@ function openPullRequestFetch() {
       url.endsWith("/commits/reopened/statuses?per_page=100")
     ) return Response.json([]);
     if (url.endsWith("/commits/reopened/check-runs?per_page=100")) return Response.json({ check_runs: [] });
+    if (url.endsWith("/commits/reopened/check-suites?per_page=100")) return Response.json({ check_suites: [] });
     if (url.endsWith("/graphql")) {
       return Response.json({
         data: {
@@ -264,6 +316,7 @@ function stackedPullRequestFetch(
 
     if (/\/issues\/[1-9][0-9]*$/u.test(url.pathname)) return Response.json({ reactions: {} });
     if (url.pathname.endsWith("/check-runs")) return Response.json({ check_runs: [] });
+    if (url.pathname.endsWith("/check-suites")) return Response.json({ check_suites: [] });
     if (
       url.pathname.endsWith("/comments") ||
       url.pathname.endsWith("/reviews") ||
@@ -870,9 +923,10 @@ describe("native monitor feed", () => {
           outcome: "completed",
           routed_watches: 1,
           published_watches: 1,
-          storage_key_puts: 4,
+          // Event, snapshot, index, poll time, and the delivery marker.
+          storage_key_puts: 5,
           storage_key_deletes: 1,
-          storage_key_writes: 5,
+          storage_key_writes: 6,
         }),
       ]);
 
@@ -1059,11 +1113,12 @@ describe("native monitor feed", () => {
         outcome: "failed",
         routed_watches: 5,
         published_watches: 4,
-        // Four targets complete each event, snapshot, index, and root retirement. The fifth
-        // persists its event and snapshot and retires the root before its index write fails.
-        storage_key_puts: 14,
+        // Four targets complete each event, snapshot, index, and root retirement, then record
+        // their poll time. The fifth persists its event and snapshot and retires the root
+        // before its index write fails, so its poll time is never recorded.
+        storage_key_puts: 18,
         storage_key_deletes: 5,
-        storage_key_writes: 19,
+        storage_key_writes: 23,
       });
       expect(records.find((entry) => entry.event === "watch_pr.webhook_failure")).toMatchObject({
         delivery_fingerprint: await sha256Base64Url(deliveryId),
@@ -1997,9 +2052,10 @@ describe("native monitor feed", () => {
     expect(stored.snapshot?.comments[0].reactionDetails).toEqual(reactedComment.reactionDetails);
   });
 
-  it("writes nothing when a polled refresh finds no snapshot change", async () => {
+  it("writes only the poll time when a polled refresh finds no snapshot change", async () => {
     const { hub, pending, storage } = hubFixture();
-    const unchanged = snapshot({ headSha: "reopened" });
+    // A recent threads read: storing a newer one would buy the next refresh nothing.
+    const unchanged = snapshot({ headSha: "reopened", threadsReadAt: new Date().toISOString() });
     await storeMonitor(storage, { snapshot: unchanged, events: [event("event-1", unchanged)] });
     const storageKey = watchStorageKey(userId, repository, number);
     const fetchMock = openPullRequestFetch();
@@ -2011,7 +2067,7 @@ describe("native monitor feed", () => {
       expect(poll.status).toBe(202);
       await Promise.all(pending.splice(0));
       expect(fetchMock).toHaveBeenCalled();
-      expect(storage.putKeys).toEqual([]);
+      expect(storage.putKeys).toEqual([watchPolledKey(storageKey)]);
       expect(storage.deleteKeys).toEqual([]);
     } finally {
       vi.unstubAllGlobals();
@@ -2020,6 +2076,113 @@ describe("native monitor feed", () => {
     await expect(storage.get(watchSidecarIndexKey(storageKey))).resolves.toBeUndefined();
     const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
     expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+  });
+
+  it("spends no rate limit re-polling an unchanged pull request", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-10T12:01:00.000Z");
+    const { hub, pending, storage } = hubFixture();
+    const unchanged = snapshot({ headSha: "reopened" });
+    await storeMonitor(storage, { snapshot: unchanged, events: [event("event-1", unchanged)] });
+    const storageKey = watchStorageKey(userId, repository, number);
+    const { github, fetchMock } = conditionalFetch(openPullRequestFetch());
+    vi.stubGlobal("fetch", fetchMock);
+    const poll = pollOnce(hub, pending, storage, github);
+    try {
+      await poll();
+      // Nothing to send yet: the first read pays for every response, and keeps their ETags.
+      expect(github).toMatchObject({ fetched: 8, notModified: 0, graphql: 1 });
+      const primed = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(Object.keys(primed.snapshot?.githubValidators ?? {})).toHaveLength(8);
+      expect(primed.snapshot?.fetchedAt).toBe(unchanged.fetchedAt);
+
+      vi.setSystemTime("2026-09-10T12:01:20.000Z");
+      await poll();
+      expect(github).toMatchObject({ fetched: 0, notModified: 8, graphql: 0 });
+      expect(snapshotWrites(storage.putKeys)).toEqual([]);
+      const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(stored.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it("stores a new ETag for unchanged content silently once, then revalidates it", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-10T12:01:00.000Z");
+    const { hub, pending, storage } = hubFixture();
+    const unchanged = snapshot({ headSha: "reopened" });
+    await storeMonitor(storage, { snapshot: unchanged, events: [event("event-1", unchanged)] });
+    const storageKey = watchStorageKey(userId, repository, number);
+    const pullUrl = "https://api.github.com/repos/owner/repo/pulls/7";
+    const { github, fetchMock } = conditionalFetch(openPullRequestFetch());
+    vi.stubGlobal("fetch", fetchMock);
+    const poll = pollOnce(hub, pending, storage, github);
+    try {
+      await poll();
+      // GitHub reissues every ETag for the same bodies, as a deploy on its side can.
+      github.generation = 2;
+      vi.setSystemTime("2026-09-10T12:01:20.000Z");
+      await poll();
+      expect(github).toMatchObject({ fetched: 8, notModified: 0, graphql: 1 });
+      const reissued = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+      expect(reissued.snapshot?.githubValidators?.[pullUrl]).toBe(`"2:${pullUrl}"`);
+      expect(reissued.snapshot?.fetchedAt).toBe(unchanged.fetchedAt);
+      expect(reissued.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
+
+      vi.setSystemTime("2026-09-10T12:01:40.000Z");
+      await poll();
+      expect(github).toMatchObject({ fetched: 0, notModified: 8, graphql: 0 });
+      expect(snapshotWrites(storage.putKeys)).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it("advances polledAt on every poll while fetchedAt keeps the last change, and get_pr shows both", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-10T12:01:00.000Z");
+    const { hub, pending, storage } = hubFixture();
+    const unchanged = snapshot({ headSha: "reopened" });
+    await storeMonitor(storage, { snapshot: unchanged, events: [event("event-1", unchanged)] });
+    const polledKey = watchPolledKey(watchStorageKey(userId, repository, number));
+    const { github, fetchMock } = conditionalFetch(openPullRequestFetch());
+    vi.stubGlobal("fetch", fetchMock);
+    const poll = pollOnce(hub, pending, storage, github);
+    try {
+      await poll();
+      await expect(storage.get(polledKey)).resolves.toBe("2026-09-10T12:01:00.000Z");
+      vi.setSystemTime("2026-09-10T12:01:20.000Z");
+      await poll();
+      await expect(storage.get(polledKey)).resolves.toBe("2026-09-10T12:01:20.000Z");
+
+      const response = await hub.fetch(new Request("https://watch-pr.test/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${sessionToken}`,
+          accept: "application/json, text/event-stream",
+          "content-type": "application/json",
+          "mcp-session-id": "polled-at-session",
+          "mcp-protocol-version": "2025-06-18",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "get_pr", arguments: { repository, number } },
+        }),
+      }));
+      await Promise.all(pending.splice(0));
+      const body = await response.json() as { result: { content: [{ text: string }] } };
+      const result = JSON.parse(body.result.content[0].text) as Record<string, unknown>;
+      expect(result).toMatchObject({ fetchedAt: unchanged.fetchedAt, polledAt: "2026-09-10T12:01:20.000Z" });
+      expect(result).not.toHaveProperty("githubValidators");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
   });
 
   it("stores a refresh that only learned unknown reactions, then stops re-reading them", async () => {
@@ -2067,7 +2230,7 @@ describe("native monitor feed", () => {
       await poll();
       // The stored details now answer the unchanged summary, so the target costs nothing.
       expect(reactionReads).toBe(1);
-      expect(storage.putKeys).toEqual([]);
+      expect(snapshotWrites(storage.putKeys)).toEqual([]);
       expect(storage.deleteKeys).toEqual([]);
       const settled = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
       expect(settled.events.map((storedEvent) => storedEvent.id)).toEqual(["event-1"]);
@@ -2147,7 +2310,7 @@ describe("native monitor feed", () => {
       await poll();
       // Known details against unchanged counts: the target costs nothing from here on.
       expect(reactionRequests).toEqual([]);
-      expect(storage.putKeys).toEqual([]);
+      expect(snapshotWrites(storage.putKeys)).toEqual([]);
     } finally {
       vi.unstubAllGlobals();
     }
@@ -2180,7 +2343,7 @@ describe("native monitor feed", () => {
       const response = await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }));
       expect(response.status).toBe(202);
       await Promise.all(pending.splice(0));
-      expect(storage.putKeys).toEqual([]);
+      expect(snapshotWrites(storage.putKeys)).toEqual([]);
       expect(storage.deleteKeys).toEqual([]);
     } finally {
       vi.unstubAllGlobals();
@@ -2304,7 +2467,7 @@ describe("native monitor feed", () => {
       await Promise.all(pending.splice(0));
       // Both targets are known with unchanged counts, so neither costs a request.
       expect(fixture.reads).toEqual({ body: 1, comment: 1 });
-      expect(storage.putKeys).toEqual([]);
+      expect(snapshotWrites(storage.putKeys)).toEqual([]);
       expect(storage.deleteKeys).toEqual([]);
     } finally {
       vi.unstubAllGlobals();
@@ -2358,7 +2521,7 @@ describe("native monitor feed", () => {
       expect(second).toMatchObject({
         refreshes_completed: 1,
         refresh_failures: 0,
-        github_rest_requests: 7,
+        github_rest_requests: 8,
         github_not_modified: 0,
         github_graphql_requests: 1,
         github_core_remaining_min: 4000,
@@ -2425,7 +2588,7 @@ describe("native monitor feed", () => {
       expect(poll.status).toBe(202);
       await Promise.all(pending.splice(0));
       expect(fixture.reads).toEqual({ body: 1, comment: 1 });
-      expect(storage.putKeys).toEqual([]);
+      expect(snapshotWrites(storage.putKeys)).toEqual([]);
     } finally {
       vi.unstubAllGlobals();
     }

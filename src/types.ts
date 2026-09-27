@@ -171,7 +171,8 @@ export interface PullRequestCheck {
   completedAt: string | null;
   startedAt: string | null;
   url: string | null;
-  kind: "check_run" | "commit_status";
+  /** `check_suite` is a suite waiting on maintainer approval, which has no runs to report. */
+  kind: "check_run" | "commit_status" | "check_suite";
 }
 
 export interface PullRequestThread {
@@ -214,6 +215,14 @@ export interface PullRequestSnapshot {
   reviewComments: PullRequestComment[];
   checks: PullRequestCheck[];
   threads: PullRequestThread[];
+  /**
+   * ETag per GitHub REST request URL, sent back as `If-None-Match` by the next refresh. Each
+   * entry validates exactly the slice of this snapshot its response produced; a 304 reuses
+   * that slice, so an entry is only ever kept beside the content it was issued for.
+   */
+  githubValidators?: Record<string, string>;
+  /** When `threads` was last read from GraphQL; absent means the next refresh reads them. */
+  threadsReadAt?: string;
 }
 
 export interface WatchEvent {
@@ -239,6 +248,12 @@ export interface WatchEvent {
 export interface StoredWatchState {
   snapshot: PullRequestSnapshot | null;
   events: WatchEvent[];
+}
+
+/** A full watch read: the stored state and when GitHub was last read successfully for it. */
+export interface WatchReadState extends StoredWatchState {
+  /** Separate from `snapshot.fetchedAt`, which only moves when the stored snapshot does. */
+  polledAt: string | null;
 }
 
 /**
@@ -270,6 +285,11 @@ export function legacyWatchStorageKey(repository: string, number: number): strin
 
 export function watchSidecarIndexKey(storageKey: string): string {
   return `${storageKey}:sidecar`;
+}
+
+/** Fetch time of the latest successful GitHub read, kept apart so a quiet poll is one row. */
+export function watchPolledKey(storageKey: string): string {
+  return `${storageKey}:polled`;
 }
 
 export function watchSidecarSnapshotKey(storageKey: string, sequence: number): string {

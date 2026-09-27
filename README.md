@@ -15,12 +15,14 @@ Authenticate with the OAuth 2.0 authorization-code flow advertised at `/.well-kn
 - `watch_pr`: Subscribe to `repository` (`owner/name`) and `number` and create its revocable, read-only SSE capability in one call. The JSON result adds `monitor: { monitorUrl, cursor, terminalState }`.
 - `unwatch_pr`: Remove a subscription for the current GitHub account.
 - `list_watched_prs`: List the current account's subscriptions.
-- `get_pr`: Read the latest durable pull request snapshot.
+- `get_pr`: Read the latest durable pull request snapshot and when GitHub was last read.
 - `list_pr_events`: Read up to 100 recent webhook and snapshot events.
 
-Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the exact latest snapshot (or `null`), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records. Tools also advertise MCP behavior hints: `watch_pr` is additive (`destructiveHint: false`), `unwatch_pr` is destructive, and `list_watched_prs`, `get_pr`, and `list_pr_events` are read-only.
+Tool calls return JSON text. `watch_pr` returns the registration object plus its `monitor` capability, `unwatch_pr` returns `{ repository, number, removed }`, `list_watched_prs` returns an array of registration objects, `get_pr` returns the latest snapshot plus a top-level `polledAt` (or `null` before the first snapshot), and `list_pr_events` returns `{ repository, number, events }`. There is no output mode parameter; callers that need lifecycle details can use the monitor feed or the full snapshot and event records. Tools also advertise MCP behavior hints: `watch_pr` is additive (`destructiveHint: false`), `unwatch_pr` is destructive, and `list_watched_prs`, `get_pr`, and `list_pr_events` are read-only.
 
-Resource reads always return the full stored watch state. Snapshot and event payloads are not abbreviated by the MCP tool layer.
+Resource reads always return the full stored watch state as `{ snapshot, events, polledAt }`. Snapshot and event payloads are not abbreviated by the MCP tool layer.
+
+A snapshot's `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt`. `polledAt` is when GitHub was last read successfully for the watch and that read was stored, by a poll, a webhook, or a watch or read; a read whose result could not be stored does not advance it, so `polledAt` never vouches for data the snapshot lacks; it is `null` until the first successful read. `get_pr` omits the snapshot's `githubValidators`, which are request bookkeeping rather than pull request state.
 
 
 ## Resources
@@ -43,7 +45,9 @@ The feed sends an SSE `retry: 60000` directive for EventSource-compatible client
 
 ## Snapshots
 
-Snapshots include PR lifecycle and mergeability, base and head refs, checks and commit statuses, reviews, top-level and inline comments, GraphQL review-thread resolution state, and reactions.
+Snapshots include PR lifecycle and mergeability, base and head refs, checks and commit statuses, reviews, top-level and inline comments, GraphQL review-thread resolution state, and reactions. A check suite that concluded `action_required` without creating any check run, such as a workflow from a fork waiting for a maintainer's approval, appears as a check of kind `check_suite` linking to the PR's checks page; monitor feeds link it and announce the transition like a failure.
+
+Refreshes send each REST request with the ETag of the response the stored snapshot came from. GitHub answers `304 Not Modified` for an unchanged resource, which does not count against the rate limit, so polling an unchanged pull request costs no rate limit apart from the review-thread GraphQL read, which runs only when review comments changed or the last read is at least 15 minutes old. A list longer than one page has no single ETag and is always read in full.
 
 ## GitHub integration
 

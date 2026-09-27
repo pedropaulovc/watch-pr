@@ -3,7 +3,7 @@ import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validatio
 import { ReadResourceRequestSchema, SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import { parseResourceUri, watchKey } from "./events";
-import type { GithubUser, PrMonitorRegistration, PullRequestSnapshot, StoredWatchState } from "./types";
+import type { GithubUser, PrMonitorRegistration, PullRequestSnapshot, WatchReadState } from "./types";
 
 /**
  * One watched pull request as `list_watched_prs` reports it: session-scoped identity, its
@@ -27,7 +27,7 @@ export interface McpSessionContext {
   unwatch(repository: string, number: number): Promise<boolean>;
   listWatches(): Promise<WatchRegistration[]>;
   openMonitor(repository: string, number: number): Promise<PrMonitorRegistration>;
-  readWatch(repository: string, number: number): Promise<StoredWatchState>;
+  readWatch(repository: string, number: number): Promise<WatchReadState>;
   subscribe(repository: string, number: number): Promise<void>;
   unsubscribe(repository: string, number: number): Promise<void>;
 }
@@ -122,7 +122,7 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     "get_pr",
     {
       title: "Get pull request state",
-      description: "Read the latest durable pull request snapshot. A refresh is scheduled after webhook or timer events.",
+      description: "Read the latest durable pull request snapshot, or null before the first one. `polledAt` is when GitHub was last read successfully and stored; `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt` while `polledAt` advances. A refresh is scheduled after webhook or timer events.",
       annotations: {
         readOnlyHint: true,
       },
@@ -130,10 +130,13 @@ export function createMcpServer(context: McpSessionContext): McpServer {
     },
     async ({ repository, number }) => {
       const state = await context.readWatch(repository, number);
+      if (!state.snapshot) return { content: [{ type: "text" as const, text: "null" }] };
+      // Validators are request bookkeeping for the next refresh, not pull request state.
+      const { githubValidators: _validators, ...snapshot } = state.snapshot;
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify(state.snapshot),
+          text: JSON.stringify({ ...snapshot, polledAt: state.polledAt }),
         }],
       };
     },

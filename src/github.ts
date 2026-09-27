@@ -101,39 +101,75 @@ interface Observed<T> {
   observedAt: string;
 }
 
-async function githubJsonObserved<T>(
-  auth: GithubAuth,
-  path: string,
-  init: RequestInit = {},
-): Promise<Observed<T>> {
-  const response = await githubResponse(auth, path, init);
-  const text = await response.text();
-  const observedAt = new Date().toISOString();
-  if (!response.ok) throw new GithubApiError(response.status, text, path);
-  return { value: text ? JSON.parse(text) as T : {} as T, observedAt };
-}
-
 async function githubJson<T>(
   auth: GithubAuth,
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
-  return (await githubJsonObserved<T>(auth, path, init)).value;
+  const response = await githubResponse(auth, path, init);
+  const text = await response.text();
+  if (!response.ok) throw new GithubApiError(response.status, text, path);
+  return text ? JSON.parse(text) as T : {} as T;
+}
+
+/** ETags by request URL, as a snapshot stores them. */
+type GithubValidators = Record<string, string>;
+
+/**
+ * One conditional REST read. `not_modified` means GitHub confirmed, as of `observedAt`, that
+ * the response the sent validator was issued for is still current. `etag` is null whenever the
+ * response cannot be revalidated as a whole: GitHub sent none, or the list ran past one page.
+ */
+type Revalidated<T> =
+  | { status: "not_modified"; observedAt: string }
+  | { status: "fetched"; value: T; observedAt: string; etag: string | null };
+
+/** The first page URL of a list, which is also the key its validator is stored under. */
+function firstPageUrl(path: string): string {
+  return `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
+}
+
+async function githubObjectRead(
+  auth: GithubAuth,
+  path: string,
+  validators: GithubValidators,
+): Promise<Revalidated<GithubRecord>> {
+  const etag = validators[apiUrl(path)];
+  const response = await githubResponse(auth, path, { headers: etag ? { "if-none-match": etag } : {} });
+  const text = await response.text();
+  const observedAt = new Date().toISOString();
+  if (response.status === 304 && etag) return { status: "not_modified", observedAt };
+  if (!response.ok) throw new GithubApiError(response.status, text, path);
+  const value = text ? JSON.parse(text) as GithubRecord : {};
+  return { status: "fetched", value, observedAt, etag: response.headers.get("etag") };
 }
 
 /**
  * Each page separately, with the time it returned. A list response dates every summary it
  * carries - including the reaction counts riding on each comment - and pages of one list can
  * be minutes apart on a wide PR, so a record is only ever as fresh as its own page.
+ *
+ * Only the first page is sent conditionally. A validator describes one page, so a list that
+ * runs past it has no single ETag for the whole and is always read in full.
  */
-async function githubPages<T>(auth: GithubAuth, path: string, field?: string): Promise<Observed<T[]>[]> {
+async function githubListRead<T>(
+  auth: GithubAuth,
+  path: string,
+  validators: GithubValidators,
+  field?: string,
+): Promise<Revalidated<Observed<T[]>[]>> {
   const pages: Observed<T[]>[] = [];
-  let nextUrl: string | null = `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
+  const firstUrl = firstPageUrl(path);
+  const etag = validators[firstUrl];
+  let firstEtag: string | null = null;
+  let nextUrl: string | null = firstUrl;
 
   while (nextUrl) {
-    const response = await githubResponse(auth, nextUrl);
+    const first = pages.length === 0;
+    const response = await githubResponse(auth, nextUrl, { headers: first && etag ? { "if-none-match": etag } : {} });
     const text = await response.text();
     const observedAt = new Date().toISOString();
+    if (first && response.status === 304 && etag) return { status: "not_modified", observedAt };
     if (!response.ok) throw new GithubApiError(response.status, text, path);
     const payload: unknown = text ? JSON.parse(text) : [];
     const page = field
@@ -144,16 +180,17 @@ async function githubPages<T>(auth: GithubAuth, path: string, field?: string): P
         ? payload as T[]
         : null;
     if (!page) throw new Error(`GitHub returned a non-array page for ${path}`);
+    if (first) firstEtag = response.headers.get("etag");
     pages.push({ value: page, observedAt });
     nextUrl = nextLink(response.headers.get("link"));
   }
 
-  return pages;
-}
-
-async function githubPaginated<T>(auth: GithubAuth, path: string, field?: string): Promise<T[]> {
-  const pages = await githubPages<T>(auth, path, field);
-  return pages.flatMap((page) => page.value);
+  return {
+    status: "fetched",
+    value: pages,
+    observedAt: pages[pages.length - 1].observedAt,
+    etag: pages.length === 1 ? firstEtag : null,
+  };
 }
 
 function nextLink(linkHeader: string | null): string | null {
@@ -289,8 +326,7 @@ async function reactionRecords(
 ): Promise<ReactionPageResult> {
   const records = progress ? [...progress.records] : [];
   let readAt: string | undefined;
-  let nextUrl: string | null = progress?.nextUrl ??
-    `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
+  let nextUrl: string | null = progress?.nextUrl ?? firstPageUrl(path);
   while (nextUrl) {
     if (budget.remaining === 0) {
       return { reactionProgress: { records, nextUrl }, reactionDetailsReadAt: readAt };
@@ -598,6 +634,30 @@ function latestCommitStatuses(records: GithubRecord[]): PullRequestCheck[] {
   return [...latestByContext.values()];
 }
 
+/**
+ * Fork CI waiting for a maintainer to approve it: GitHub creates the suite as
+ * `action_required` with no check runs and no statuses, so without this the snapshot would
+ * show no checks at all. A suite that has runs is already represented by them.
+ */
+function awaitingApprovalSuites(records: GithubRecord[], pullUrl: string): PullRequestCheck[] {
+  return records
+    .filter((record) => stringValue(record, "conclusion") === "action_required" && record.latest_check_runs_count === 0)
+    .map((record) => {
+      const app = record.app && typeof record.app === "object" ? record.app as GithubRecord : {};
+      return {
+        id: numberValue(record, "id"),
+        name: stringValue(app, "name") ?? "check suite",
+        status: stringValue(record, "status"),
+        conclusion: "action_required",
+        completedAt: stringValue(record, "updated_at"),
+        startedAt: stringValue(record, "created_at"),
+        url: `${pullUrl}/checks`,
+        kind: "check_suite",
+      };
+    });
+}
+
+/** Throws on any failure, so the caller keeps the threads it already knows. */
 async function reviewThreads(
   auth: GithubAuth,
   repository: string,
@@ -608,43 +668,39 @@ async function reviewThreads(
   const threads: PullRequestThread[] = [];
   let cursor: string | null = null;
 
-  try {
-    while (true) {
-      const response = await githubJson<GithubRecord>(auth, "/graphql", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ query, variables: { owner, repo, number, cursor } }),
+  while (true) {
+    const response = await githubJson<GithubRecord>(auth, "/graphql", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query, variables: { owner, repo, number, cursor } }),
+    });
+    const errors = response.errors;
+    if (Array.isArray(errors) && errors.length > 0) throw new Error("GitHub GraphQL review thread query failed");
+    const pullRequest = (((response.data as GithubRecord)?.repository as GithubRecord)?.pullRequest as GithubRecord | null);
+    const connection = pullRequest?.reviewThreads as GithubRecord | undefined;
+    if (!connection) return threads;
+    const nodes = Array.isArray(connection.nodes) ? connection.nodes : [];
+    for (const node of nodes) {
+      if (!node || typeof node !== "object") continue;
+      const item = node as GithubRecord;
+      const comments = item.comments;
+      const commentNodes: unknown[] = comments && typeof comments === "object" && Array.isArray((comments as GithubRecord).nodes)
+        ? (comments as GithubRecord).nodes as unknown[]
+        : [];
+      threads.push({
+        id: stringValue(item, "id") ?? "",
+        isResolved: booleanValue(item, "isResolved"),
+        commentIds: commentNodes
+          .filter((comment): comment is GithubRecord => Boolean(comment && typeof comment === "object"))
+          .map((comment: GithubRecord) => numberValue(comment, "databaseId"))
+          .filter((id: number) => id > 0),
       });
-      const errors = response.errors;
-      if (Array.isArray(errors) && errors.length > 0) throw new Error("GitHub GraphQL review thread query failed");
-      const pullRequest = (((response.data as GithubRecord)?.repository as GithubRecord)?.pullRequest as GithubRecord | null);
-      const connection = pullRequest?.reviewThreads as GithubRecord | undefined;
-      if (!connection) return threads;
-      const nodes = Array.isArray(connection.nodes) ? connection.nodes : [];
-      for (const node of nodes) {
-        if (!node || typeof node !== "object") continue;
-        const item = node as GithubRecord;
-        const comments = item.comments;
-        const commentNodes: unknown[] = comments && typeof comments === "object" && Array.isArray((comments as GithubRecord).nodes)
-          ? (comments as GithubRecord).nodes as unknown[]
-          : [];
-        threads.push({
-          id: stringValue(item, "id") ?? "",
-          isResolved: booleanValue(item, "isResolved"),
-          commentIds: commentNodes
-            .filter((comment): comment is GithubRecord => Boolean(comment && typeof comment === "object"))
-            .map((comment: GithubRecord) => numberValue(comment, "databaseId"))
-            .filter((id: number) => id > 0),
-        });
-      }
-      const pageInfo = connection.pageInfo as GithubRecord | undefined;
-      if (!pageInfo || pageInfo.hasNextPage !== true) return threads;
-      const nextCursor = stringValue(pageInfo, "endCursor");
-      if (!nextCursor) return threads;
-      cursor = nextCursor;
     }
-  } catch {
-    return [];
+    const pageInfo = connection.pageInfo as GithubRecord | undefined;
+    if (!pageInfo || pageInfo.hasNextPage !== true) return threads;
+    const nextCursor = stringValue(pageInfo, "endCursor");
+    if (!nextCursor) return threads;
+    cursor = nextCursor;
   }
 }
 
@@ -721,6 +777,9 @@ export async function refreshGithubToken(
   };
 }
 
+/** Review threads are read at least this often, even while the review comments answer 304. */
+const THREADS_MAX_AGE_MS = 15 * 60 * 1000;
+
 /**
  * `Promise.all` that waits for every request before rejecting. A wave that fails fast would
  * leave peers still counting into the caller's usage after the caller has reported it.
@@ -733,58 +792,41 @@ async function settleWave<T extends readonly unknown[]>(wave: { [K in keyof T]: 
 }
 
 /**
- * `previous` is the caller's last stored snapshot for this PR, and it only saves requests:
- * a reaction target whose aggregate counts are unchanged keeps the details already stored
- * instead of being read again every minute.
+ * How a refresh treats review threads, which GraphQL cannot revalidate. `when_stale` reuses
+ * the stored threads while the review comments are unchanged and the last read is recent;
+ * `refetch` always reads them, for a delivery that is itself about a thread.
  */
-export async function pullRequestSnapshot(
-  token: string,
-  repository: string,
-  number: number,
-  previous: PullRequestSnapshot | null = null,
-  usage?: GithubUsage,
-): Promise<PullRequestSnapshot> {
-  const auth: GithubAuth = { token, usage };
-  const [pull, issue] = await settleWave([
-    githubJson<GithubRecord>(auth, `/repos/${repository}/pulls/${number}`),
-    // The body's reaction summary is only as fresh as the response that carried it, which is
-    // also where the wave's slowest work has not happened yet.
-    githubJsonObserved<GithubRecord>(auth, `/repos/${repository}/issues/${number}`),
-  ]);
+export type ThreadsRead = "when_stale" | "refetch";
+
+/** Whether a snapshot's threads were never read or are too old to reuse. */
+export function threadsStale(snapshot: PullRequestSnapshot, now: number): boolean {
+  const readAt = Date.parse(snapshot.threadsReadAt ?? "");
+  return !Number.isFinite(readAt) || now - readAt >= THREADS_MAX_AGE_MS;
+}
+
+/** The snapshot fields the pull request response alone produces. */
+type PullFields = Pick<
+  PullRequestSnapshot,
+  | "url"
+  | "title"
+  | "body"
+  | "state"
+  | "draft"
+  | "merged"
+  | "mergedAt"
+  | "mergeable"
+  | "mergeableState"
+  | "baseRefName"
+  | "headRefName"
+  | "headRepository"
+  | "headSha"
+  | "author"
+>;
+
+function pullFields(pull: GithubRecord, repository: string, number: number): PullFields {
   const head = pull.head && typeof pull.head === "object" ? pull.head as GithubRecord : {};
   const base = pull.base && typeof pull.base === "object" ? pull.base as GithubRecord : {};
-  const headSha = stringValue(head, "sha");
-  const [commentPages, reviews, reviewCommentPages, checkRuns, statuses, threads] = await settleWave([
-    githubPages<GithubRecord>(auth, `/repos/${repository}/issues/${number}/comments`),
-    githubPaginated<GithubRecord>(auth, `/repos/${repository}/pulls/${number}/reviews`),
-    githubPages<GithubRecord>(auth, `/repos/${repository}/pulls/${number}/comments`),
-    headSha ? githubPaginated<GithubRecord>(auth, `/repos/${repository}/commits/${headSha}/check-runs`, "check_runs") : Promise.resolve([]),
-    headSha ? githubPaginated<GithubRecord>(auth, `/repos/${repository}/commits/${headSha}/statuses`) : Promise.resolve([]),
-    reviewThreads(auth, repository, number),
-  ]);
-  const observedComments = (pages: Observed<GithubRecord[]>[]): Observed<PullRequestComment>[] =>
-    pages.flatMap((page) => page.value.map((record) => ({
-      value: normalizeComment(record),
-      observedAt: page.observedAt,
-    })));
-  const comments = observedComments(commentPages);
-  const reviewComments = observedComments(reviewCommentPages);
-
-  // Individual reactions need the comment IDs from the first wave. A target whose read fails
-  // keeps its previous counts too, so the next refresh sees the same delta and retries.
-  const reactions = await snapshotReactions(
-    auth,
-    repository,
-    number,
-    { value: reactionCounts(issue.value.reactions), observedAt: issue.observedAt },
-    comments,
-    reviewComments,
-    previous,
-  );
-
   return {
-    repository,
-    number,
     url: stringValue(pull, "html_url") ?? `https://github.com/${repository}/pull/${number}`,
     title: stringValue(pull, "title") ?? "",
     body: stringValue(pull, "body") ?? "",
@@ -797,8 +839,277 @@ export async function pullRequestSnapshot(
     baseRefName: stringValue(base, "ref"),
     headRefName: stringValue(head, "ref"),
     headRepository: repositoryFullName(head.repo),
-    headSha,
+    headSha: stringValue(head, "sha"),
     author: userLogin(pull, "user"),
+  };
+}
+
+function storedPullFields(snapshot: PullRequestSnapshot): PullFields {
+  return {
+    url: snapshot.url,
+    title: snapshot.title,
+    body: snapshot.body,
+    state: snapshot.state,
+    draft: snapshot.draft,
+    merged: snapshot.merged,
+    mergedAt: snapshot.mergedAt,
+    mergeable: snapshot.mergeable,
+    mergeableState: snapshot.mergeableState,
+    baseRefName: snapshot.baseRefName,
+    headRefName: snapshot.headRefName,
+    headRepository: snapshot.headRepository,
+    headSha: snapshot.headSha,
+    author: snapshot.author,
+  };
+}
+
+/** A stored comment as its list response carried it, without what reaction reads added. */
+function listedComment(comment: PullRequestComment): PullRequestComment {
+  return {
+    id: comment.id,
+    author: comment.author,
+    body: comment.body,
+    createdAt: comment.createdAt,
+    updatedAt: comment.updatedAt,
+    reactions: comment.reactions,
+    path: comment.path,
+    line: comment.line,
+    startLine: comment.startLine,
+    diffHunk: comment.diffHunk,
+    inReplyToId: comment.inReplyToId,
+    htmlUrl: comment.htmlUrl,
+  };
+}
+
+function snapshotRequestPaths(repository: string, number: number) {
+  return {
+    pull: `/repos/${repository}/pulls/${number}`,
+    issue: `/repos/${repository}/issues/${number}`,
+    comments: `/repos/${repository}/issues/${number}/comments`,
+    reviews: `/repos/${repository}/pulls/${number}/reviews`,
+    reviewComments: `/repos/${repository}/pulls/${number}/comments`,
+    checkRuns: (sha: string) => `/repos/${repository}/commits/${sha}/check-runs`,
+    statuses: (sha: string) => `/repos/${repository}/commits/${sha}/statuses`,
+    checkSuites: (sha: string) => `/repos/${repository}/commits/${sha}/check-suites`,
+  };
+}
+
+type SliceOf = (snapshot: PullRequestSnapshot) => unknown;
+
+/**
+ * The part of a snapshot each conditional request produced, keyed by the URL its validator is
+ * stored under. Check URLs carry the head revision, so they exist only for `snapshot`'s head.
+ */
+function requestSlices(snapshot: PullRequestSnapshot): Map<string, SliceOf> {
+  const paths = snapshotRequestPaths(snapshot.repository, snapshot.number);
+  const checksOf = (kind: PullRequestCheck["kind"]): SliceOf =>
+    (candidate) => candidate.checks.filter((check) => check.kind === kind);
+  const slices = new Map<string, SliceOf>([
+    [apiUrl(paths.pull), storedPullFields],
+    [apiUrl(paths.issue), (candidate) => candidate.bodyReactions],
+    [firstPageUrl(paths.comments), (candidate) => candidate.comments.map(listedComment)],
+    [firstPageUrl(paths.reviews), (candidate) => candidate.reviews],
+    [firstPageUrl(paths.reviewComments), (candidate) => candidate.reviewComments.map(listedComment)],
+  ]);
+  if (!snapshot.headSha) return slices;
+  slices.set(firstPageUrl(paths.checkRuns(snapshot.headSha)), checksOf("check_run"));
+  slices.set(firstPageUrl(paths.statuses(snapshot.headSha)), checksOf("commit_status"));
+  slices.set(firstPageUrl(paths.checkSuites(snapshot.headSha)), checksOf("check_suite"));
+  return slices;
+}
+
+type RequestKnowledge = Pick<PullRequestSnapshot, "githubValidators" | "threadsReadAt">;
+
+/**
+ * The validators and threads read time that still describe `content` once the hub has
+ * assembled it from more than one snapshot. A validator is taken from the first candidate
+ * whose slice for that URL is identical to `content`'s, because a 304 hands that slice back
+ * verbatim; any other validator is dropped, which only costs the next refresh a full read.
+ * The threads read time is the latest among candidates holding the same threads.
+ */
+export function coherentRequestKnowledge(
+  content: PullRequestSnapshot,
+  candidates: readonly (PullRequestSnapshot | null)[],
+): RequestKnowledge {
+  const slices = requestSlices(content);
+  const contentSlices = new Map<string, string>();
+  const validators: GithubValidators = {};
+  for (const candidate of candidates) {
+    for (const [url, etag] of Object.entries(candidate?.githubValidators ?? {})) {
+      const slice = slices.get(url);
+      if (!candidate || !slice || Object.hasOwn(validators, url)) continue;
+      let expected = contentSlices.get(url);
+      if (expected === undefined) {
+        expected = JSON.stringify(slice(content));
+        contentSlices.set(url, expected);
+      }
+      if (JSON.stringify(slice(candidate)) === expected) validators[url] = etag;
+    }
+  }
+  const threads = JSON.stringify(content.threads);
+  let threadsReadAt: string | undefined;
+  for (const candidate of candidates) {
+    if (!candidate?.threadsReadAt || JSON.stringify(candidate.threads) !== threads) continue;
+    if (threadsReadAt === undefined || Date.parse(candidate.threadsReadAt) > Date.parse(threadsReadAt)) {
+      threadsReadAt = candidate.threadsReadAt;
+    }
+  }
+  return {
+    githubValidators: Object.keys(validators).length > 0 ? validators : undefined,
+    threadsReadAt,
+  };
+}
+
+function sameValidators(left: GithubValidators | undefined, right: GithubValidators | undefined): boolean {
+  const leftEntries = Object.entries(left ?? {});
+  if (leftEntries.length !== Object.keys(right ?? {}).length) return false;
+  return leftEntries.every(([url, etag]) => right?.[url] === etag);
+}
+
+/**
+ * Whether `next` knows something about its requests worth a silent write over `stored`: a
+ * validator the next refresh can send, or a threads read that saves the next refresh one
+ * because the stored read has gone stale. A fresher read over a still-fresh one is not worth
+ * a write, or a watch whose review comments cannot be revalidated would store every poll.
+ */
+export function requestKnowledgeAdvanced(stored: PullRequestSnapshot, next: PullRequestSnapshot, now: number): boolean {
+  if (!sameValidators(stored.githubValidators, next.githubValidators)) return true;
+  return next.threadsReadAt !== undefined &&
+    next.threadsReadAt !== stored.threadsReadAt &&
+    threadsStale(stored, now);
+}
+
+/** A 304 hands back the stored slice; the one-to-one validator guarantees `previous` exists. */
+function settle<T, R>(
+  read: Revalidated<T>,
+  previous: PullRequestSnapshot | null,
+  fresh: (value: T) => R,
+  stored: (snapshot: PullRequestSnapshot) => R,
+): R {
+  if (read.status === "fetched") return fresh(read.value);
+  if (!previous) throw new Error("GitHub answered 304 to a request sent without a validator");
+  return stored(previous);
+}
+
+function records(pages: Observed<unknown[]>[]): GithubRecord[] {
+  return pages
+    .flatMap((page) => page.value)
+    .filter((record): record is GithubRecord => Boolean(record && typeof record === "object"));
+}
+
+/**
+ * `previous` is the caller's last stored snapshot for this PR, and it only saves requests.
+ * Each REST request carries the ETag `previous` stored for its URL; a 304 costs no primary
+ * rate limit and hands back the slice of `previous` that ETag was issued for. A reaction
+ * target whose aggregate counts are unchanged keeps the details already stored instead of
+ * being read again every minute, and review threads are reused while the review comments
+ * answer 304 and the last threads read is under fifteen minutes old.
+ */
+export async function pullRequestSnapshot(
+  token: string,
+  repository: string,
+  number: number,
+  previous: PullRequestSnapshot | null = null,
+  usage?: GithubUsage,
+  threadsRead: ThreadsRead = "when_stale",
+): Promise<PullRequestSnapshot> {
+  const auth: GithubAuth = { token, usage };
+  const prior = previous?.githubValidators ?? {};
+  const validators: GithubValidators = {};
+  // The ETag that now describes a URL's slice: the fresh one, or the one a 304 confirmed.
+  const keep = (url: string, read: Revalidated<unknown>): void => {
+    const etag = read.status === "not_modified" ? prior[url] : read.etag;
+    if (etag) validators[url] = etag;
+  };
+  const paths = snapshotRequestPaths(repository, number);
+  const [pullRead, issueRead] = await settleWave([
+    githubObjectRead(auth, paths.pull, prior),
+    // The body's reaction summary is only as fresh as the response that carried it, which is
+    // also where the wave's slowest work has not happened yet.
+    githubObjectRead(auth, paths.issue, prior),
+  ]);
+  keep(apiUrl(paths.pull), pullRead);
+  keep(apiUrl(paths.issue), issueRead);
+  const pull = settle(pullRead, previous, (record) => pullFields(record, repository, number), storedPullFields);
+  const headSha = pull.headSha;
+
+  const listRead = (path: string, field?: string) => githubListRead<unknown>(auth, path, prior, field);
+  const checkRead = (path: ((sha: string) => string), field?: string) =>
+    headSha ? listRead(path(headSha), field) : Promise.resolve(null);
+  const reviewCommentsRead = listRead(paths.reviewComments);
+  const threadsKnowledge = reviewCommentsRead.then(async (read): Promise<Pick<PullRequestSnapshot, "threads" | "threadsReadAt">> => {
+    if (
+      threadsRead === "when_stale" &&
+      read.status === "not_modified" &&
+      previous &&
+      !threadsStale(previous, Date.now())
+    ) return { threads: previous.threads, threadsReadAt: previous.threadsReadAt };
+    try {
+      const threads = await reviewThreads(auth, repository, number);
+      return { threads, threadsReadAt: new Date().toISOString() };
+    } catch {
+      // A failed read says nothing about the threads, so the known ones stand rather than
+      // being announced as removed. No read time goes with them: the next refresh reads
+      // them again even if the review comments it would otherwise wait on answer 304.
+      return { threads: previous?.threads ?? [], threadsReadAt: undefined };
+    }
+  });
+  const [commentsRead, reviewsRead, reviewComments, checkRunsRead, statusesRead, checkSuitesRead, threads] = await settleWave([
+    listRead(paths.comments),
+    listRead(paths.reviews),
+    reviewCommentsRead,
+    checkRead(paths.checkRuns, "check_runs"),
+    checkRead(paths.statuses),
+    checkRead(paths.checkSuites, "check_suites"),
+    threadsKnowledge,
+  ]);
+  keep(firstPageUrl(paths.comments), commentsRead);
+  keep(firstPageUrl(paths.reviews), reviewsRead);
+  keep(firstPageUrl(paths.reviewComments), reviewComments);
+  if (headSha && checkRunsRead) keep(firstPageUrl(paths.checkRuns(headSha)), checkRunsRead);
+  if (headSha && statusesRead) keep(firstPageUrl(paths.statuses(headSha)), statusesRead);
+  if (headSha && checkSuitesRead) keep(firstPageUrl(paths.checkSuites(headSha)), checkSuitesRead);
+
+  // A 304 dates the stored comments, and the reaction counts riding on them, at its own return.
+  const observedComments = (
+    read: Revalidated<Observed<unknown[]>[]>,
+    stored: (snapshot: PullRequestSnapshot) => PullRequestComment[],
+  ): Observed<PullRequestComment>[] => settle(
+    read,
+    previous,
+    (pages) => pages.flatMap((page) => records([page]).map((record) => ({
+      value: normalizeComment(record),
+      observedAt: page.observedAt,
+    }))),
+    (snapshot) => stored(snapshot).map((comment) => ({ value: listedComment(comment), observedAt: read.observedAt })),
+  );
+  const checksOfKind = (
+    read: Revalidated<Observed<unknown[]>[]> | null,
+    kind: PullRequestCheck["kind"],
+    fresh: (checks: GithubRecord[]) => PullRequestCheck[],
+  ): PullRequestCheck[] => read
+    ? settle(read, previous, (pages) => fresh(records(pages)), (snapshot) => snapshot.checks.filter((check) => check.kind === kind))
+    : [];
+
+  // Individual reactions need the comment IDs from the first wave. A target whose read fails
+  // keeps its previous counts too, so the next refresh sees the same delta and retries.
+  const reactions = await snapshotReactions(
+    auth,
+    repository,
+    number,
+    {
+      value: settle(issueRead, previous, (record) => reactionCounts(record.reactions), (snapshot) => snapshot.bodyReactions),
+      observedAt: issueRead.observedAt,
+    },
+    observedComments(commentsRead, (snapshot) => snapshot.comments),
+    observedComments(reviewComments, (snapshot) => snapshot.reviewComments),
+    previous,
+  );
+
+  return {
+    repository,
+    number,
+    ...pull,
     fetchedAt: new Date().toISOString(),
     bodyReactions: reactions.bodyReactions,
     bodyReactionsObservedAt: reactions.bodyReactionsObservedAt,
@@ -807,16 +1118,15 @@ export async function pullRequestSnapshot(
     bodyReactionDetailsReadAt: reactions.bodyReactionDetailsReadAt,
     bodyReactionProgress: reactions.bodyReactionProgress,
     comments: reactions.comments,
-    reviews: reviews.map(normalizeReview),
+    reviews: settle(reviewsRead, previous, (pages) => records(pages).map(normalizeReview), (snapshot) => snapshot.reviews),
     reviewComments: reactions.reviewComments,
     checks: [
-      ...checkRuns
-        .filter((check): check is GithubRecord => Boolean(check && typeof check === "object"))
-        .map(normalizeCheckRun),
-      ...latestCommitStatuses(
-        statuses.filter((status): status is GithubRecord => Boolean(status && typeof status === "object")),
-      ),
+      ...checksOfKind(checkRunsRead, "check_run", (runs) => runs.map(normalizeCheckRun)),
+      ...checksOfKind(statusesRead, "commit_status", latestCommitStatuses),
+      ...checksOfKind(checkSuitesRead, "check_suite", (suites) => awaitingApprovalSuites(suites, pull.url)),
     ],
-    threads,
+    threads: threads.threads,
+    ...(threads.threadsReadAt === undefined ? {} : { threadsReadAt: threads.threadsReadAt }),
+    ...(Object.keys(validators).length === 0 ? {} : { githubValidators: validators }),
   };
 }
