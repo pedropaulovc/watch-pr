@@ -23,6 +23,43 @@ interface RequestBudget {
   remaining: number;
 }
 
+/**
+ * GitHub requests one snapshot spent. A `304 Not Modified` does not count against the
+ * primary rate limit, and GraphQL draws from a separate point budget, so each is kept apart.
+ */
+export interface GithubUsage {
+  /** REST responses other than 304, which consume the caller's primary rate limit. */
+  restRequests: number;
+  notModified: number;
+  graphqlRequests: number;
+  /** Lowest `x-ratelimit-remaining` the REST `core` resource reported, if any response did. */
+  coreRateLimitRemaining: number | null;
+}
+
+export function createGithubUsage(): GithubUsage {
+  return { restRequests: 0, notModified: 0, graphqlRequests: 0, coreRateLimitRemaining: null };
+}
+
+interface GithubAuth {
+  token: string;
+  usage?: GithubUsage;
+}
+
+function recordGithubUsage(usage: GithubUsage, path: string, response: Response): void {
+  if (apiUrl(path) === `${API_ROOT}/graphql`) {
+    usage.graphqlRequests += 1;
+    return;
+  }
+  if (response.status === 304) usage.notModified += 1;
+  else usage.restRequests += 1;
+  if (response.headers.get("x-ratelimit-resource") !== "core") return;
+  const remaining = Number.parseInt(response.headers.get("x-ratelimit-remaining") ?? "", 10);
+  if (!Number.isSafeInteger(remaining)) return;
+  usage.coreRateLimitRemaining = usage.coreRateLimitRemaining === null
+    ? remaining
+    : Math.min(usage.coreRateLimitRemaining, remaining);
+}
+
 
 type GithubRecord = Record<string, unknown>;
 
@@ -44,7 +81,7 @@ function apiUrl(path: string): string {
 }
 
 async function githubResponse(
-  token: string,
+  auth: GithubAuth,
   path: string,
   init: RequestInit = {},
 ): Promise<Response> {
@@ -52,8 +89,10 @@ async function githubResponse(
   headers.set("accept", "application/vnd.github+json");
   headers.set("x-github-api-version", API_VERSION);
   headers.set("user-agent", "watch-pr-mcp/0.1");
-  headers.set("authorization", `Bearer ${token}`);
-  return fetch(apiUrl(path), { ...init, headers });
+  headers.set("authorization", `Bearer ${auth.token}`);
+  const response = await fetch(apiUrl(path), { ...init, headers });
+  if (auth.usage) recordGithubUsage(auth.usage, path, response);
+  return response;
 }
 
 /** A GitHub response and the moment it actually returned, which dates what it says. */
@@ -63,23 +102,23 @@ interface Observed<T> {
 }
 
 async function githubJsonObserved<T>(
-  token: string,
+  auth: GithubAuth,
   path: string,
   init: RequestInit = {},
 ): Promise<Observed<T>> {
-  const response = await githubResponse(token, path, init);
+  const response = await githubResponse(auth, path, init);
   const text = await response.text();
   const observedAt = new Date().toISOString();
   if (!response.ok) throw new GithubApiError(response.status, text, path);
   return { value: text ? JSON.parse(text) as T : {} as T, observedAt };
 }
 
-export async function githubJson<T>(
-  token: string,
+async function githubJson<T>(
+  auth: GithubAuth,
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
-  return (await githubJsonObserved<T>(token, path, init)).value;
+  return (await githubJsonObserved<T>(auth, path, init)).value;
 }
 
 /**
@@ -87,12 +126,12 @@ export async function githubJson<T>(
  * carries - including the reaction counts riding on each comment - and pages of one list can
  * be minutes apart on a wide PR, so a record is only ever as fresh as its own page.
  */
-async function githubPages<T>(token: string, path: string, field?: string): Promise<Observed<T[]>[]> {
+async function githubPages<T>(auth: GithubAuth, path: string, field?: string): Promise<Observed<T[]>[]> {
   const pages: Observed<T[]>[] = [];
   let nextUrl: string | null = `${apiUrl(path)}${path.includes("?") ? "&" : "?"}per_page=100`;
 
   while (nextUrl) {
-    const response = await githubResponse(token, nextUrl);
+    const response = await githubResponse(auth, nextUrl);
     const text = await response.text();
     const observedAt = new Date().toISOString();
     if (!response.ok) throw new GithubApiError(response.status, text, path);
@@ -112,8 +151,8 @@ async function githubPages<T>(token: string, path: string, field?: string): Prom
   return pages;
 }
 
-async function githubPaginated<T>(token: string, path: string, field?: string): Promise<T[]> {
-  const pages = await githubPages<T>(token, path, field);
+async function githubPaginated<T>(auth: GithubAuth, path: string, field?: string): Promise<T[]> {
+  const pages = await githubPages<T>(auth, path, field);
   return pages.flatMap((page) => page.value);
 }
 
@@ -243,7 +282,7 @@ interface ReactionPageResult {
 }
 
 async function reactionRecords(
-  token: string,
+  auth: GithubAuth,
   path: string,
   budget: RequestBudget,
   progress?: ReactionReadProgress,
@@ -259,7 +298,7 @@ async function reactionRecords(
     budget.remaining -= 1;
     const pageUrl: string = nextUrl;
     try {
-      const response = await githubResponse(token, pageUrl);
+      const response = await githubResponse(auth, pageUrl);
       const text = await response.text();
       if (!response.ok) throw new GithubApiError(response.status, text, path);
       const payload: unknown = text ? JSON.parse(text) : [];
@@ -345,7 +384,7 @@ interface SnapshotReactions {
  * target and the newer one of another; only a per-target time can order them.
  */
 async function snapshotReactions(
-  token: string,
+  auth: GithubAuth,
   repository: string,
   number: number,
   bodyReactions: Observed<ReactionCounts>,
@@ -413,7 +452,7 @@ async function snapshotReactions(
     const { reactions, reactionsObservedAt } = slots[read.slot];
     try {
       const page = await reactionRecords(
-        token,
+        auth,
         read.path,
         budget,
         resumed,
@@ -560,7 +599,7 @@ function latestCommitStatuses(records: GithubRecord[]): PullRequestCheck[] {
 }
 
 async function reviewThreads(
-  token: string,
+  auth: GithubAuth,
   repository: string,
   number: number,
 ): Promise<PullRequestThread[]> {
@@ -571,7 +610,7 @@ async function reviewThreads(
 
   try {
     while (true) {
-      const response = await githubJson<GithubRecord>(token, "/graphql", {
+      const response = await githubJson<GithubRecord>(auth, "/graphql", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ query, variables: { owner, repo, number, cursor } }),
@@ -610,7 +649,7 @@ async function reviewThreads(
 }
 
 export async function githubUser(token: string): Promise<GithubUser> {
-  const record = await githubJson<GithubRecord>(token, "/user");
+  const record = await githubJson<GithubRecord>({ token }, "/user");
   return {
     login: stringValue(record, "login") ?? "",
     id: numberValue(record, "id"),
@@ -683,6 +722,17 @@ export async function refreshGithubToken(
 }
 
 /**
+ * `Promise.all` that waits for every request before rejecting. A wave that fails fast would
+ * leave peers still counting into the caller's usage after the caller has reported it.
+ */
+async function settleWave<T extends readonly unknown[]>(wave: { [K in keyof T]: Promise<T[K]> }): Promise<T> {
+  const results = await Promise.allSettled(wave);
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (rejected) throw rejected.reason;
+  return results.map((result) => (result as PromiseFulfilledResult<unknown>).value) as unknown as T;
+}
+
+/**
  * `previous` is the caller's last stored snapshot for this PR, and it only saves requests:
  * a reaction target whose aggregate counts are unchanged keeps the details already stored
  * instead of being read again every minute.
@@ -692,23 +742,25 @@ export async function pullRequestSnapshot(
   repository: string,
   number: number,
   previous: PullRequestSnapshot | null = null,
+  usage?: GithubUsage,
 ): Promise<PullRequestSnapshot> {
-  const [pull, issue] = await Promise.all([
-    githubJson<GithubRecord>(token, `/repos/${repository}/pulls/${number}`),
+  const auth: GithubAuth = { token, usage };
+  const [pull, issue] = await settleWave([
+    githubJson<GithubRecord>(auth, `/repos/${repository}/pulls/${number}`),
     // The body's reaction summary is only as fresh as the response that carried it, which is
     // also where the wave's slowest work has not happened yet.
-    githubJsonObserved<GithubRecord>(token, `/repos/${repository}/issues/${number}`),
+    githubJsonObserved<GithubRecord>(auth, `/repos/${repository}/issues/${number}`),
   ]);
   const head = pull.head && typeof pull.head === "object" ? pull.head as GithubRecord : {};
   const base = pull.base && typeof pull.base === "object" ? pull.base as GithubRecord : {};
   const headSha = stringValue(head, "sha");
-  const [commentPages, reviews, reviewCommentPages, checkRuns, statuses, threads] = await Promise.all([
-    githubPages<GithubRecord>(token, `/repos/${repository}/issues/${number}/comments`),
-    githubPaginated<GithubRecord>(token, `/repos/${repository}/pulls/${number}/reviews`),
-    githubPages<GithubRecord>(token, `/repos/${repository}/pulls/${number}/comments`),
-    headSha ? githubPaginated<GithubRecord>(token, `/repos/${repository}/commits/${headSha}/check-runs`, "check_runs") : Promise.resolve([]),
-    headSha ? githubPaginated<GithubRecord>(token, `/repos/${repository}/commits/${headSha}/statuses`) : Promise.resolve([]),
-    reviewThreads(token, repository, number),
+  const [commentPages, reviews, reviewCommentPages, checkRuns, statuses, threads] = await settleWave([
+    githubPages<GithubRecord>(auth, `/repos/${repository}/issues/${number}/comments`),
+    githubPaginated<GithubRecord>(auth, `/repos/${repository}/pulls/${number}/reviews`),
+    githubPages<GithubRecord>(auth, `/repos/${repository}/pulls/${number}/comments`),
+    headSha ? githubPaginated<GithubRecord>(auth, `/repos/${repository}/commits/${headSha}/check-runs`, "check_runs") : Promise.resolve([]),
+    headSha ? githubPaginated<GithubRecord>(auth, `/repos/${repository}/commits/${headSha}/statuses`) : Promise.resolve([]),
+    reviewThreads(auth, repository, number),
   ]);
   const observedComments = (pages: Observed<GithubRecord[]>[]): Observed<PullRequestComment>[] =>
     pages.flatMap((page) => page.value.map((record) => ({
@@ -721,7 +773,7 @@ export async function pullRequestSnapshot(
   // Individual reactions need the comment IDs from the first wave. A target whose read fails
   // keeps its previous counts too, so the next refresh sees the same delta and retries.
   const reactions = await snapshotReactions(
-    token,
+    auth,
     repository,
     number,
     { value: reactionCounts(issue.value.reactions), observedAt: issue.observedAt },

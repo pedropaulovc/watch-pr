@@ -15,7 +15,15 @@ import {
   terminalState,
   watchKey,
 } from "./events";
-import { exchangeGithubCode, GithubApiError, githubUser, pullRequestSnapshot, refreshGithubToken } from "./github";
+import {
+  createGithubUsage,
+  exchangeGithubCode,
+  GithubApiError,
+  githubUser,
+  pullRequestSnapshot,
+  refreshGithubToken,
+  type GithubUsage,
+} from "./github";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "./mcp";
 import type {
   GithubUser,
@@ -194,6 +202,8 @@ interface WebhookProcessStats {
   chunkedWrites: number;
   largestStateBytes: number;
   largestStateChunkCount: number;
+  snapshotFailures: number;
+  githubUsage: GithubUsage;
 }
 
 function createWebhookProcessStats(): WebhookProcessStats {
@@ -209,6 +219,8 @@ function createWebhookProcessStats(): WebhookProcessStats {
     chunkedWrites: 0,
     largestStateBytes: 0,
     largestStateChunkCount: 0,
+    snapshotFailures: 0,
+    githubUsage: createGithubUsage(),
   };
 }
 
@@ -1373,6 +1385,51 @@ function logWebhookFanout(eventName: string, outcome: "completed" | "failed", st
     chunked_writes: stats.chunkedWrites,
     largest_state_bytes: stats.largestStateBytes,
     largest_state_chunk_count: stats.largestStateChunkCount,
+    snapshot_failures: stats.snapshotFailures,
+    ...githubUsageFields(stats.githubUsage),
+  }));
+}
+
+function githubUsageFields(usage: GithubUsage): Record<string, number> {
+  return {
+    github_rest_requests: usage.restRequests,
+    github_not_modified: usage.notModified,
+    github_graphql_requests: usage.graphqlRequests,
+    ...(usage.coreRateLimitRemaining === null ? {} : { github_core_remaining_min: usage.coreRateLimitRemaining }),
+  };
+}
+
+/**
+ * Refresh work finished since the previous `watch_pr.poll` record in this object instance.
+ * Reads share `githubUsage` directly, so a request that settles after its snapshot already
+ * failed still counts; the poll therefore resets these fields in place, never replaces them.
+ */
+interface RefreshTotals {
+  completed: number;
+  failed: number;
+  readonly githubUsage: GithubUsage;
+}
+
+function createRefreshTotals(): RefreshTotals {
+  return { completed: 0, failed: 0, githubUsage: createGithubUsage() };
+}
+
+/** One record per failed snapshot read; the read keeps the previous snapshot and retries later. */
+function logSnapshotFailure(source: string, error: unknown): void {
+  const githubStatus = error instanceof GithubApiError ? error.status : undefined;
+  console.log(JSON.stringify({
+    event: "watch_pr.snapshot_failure",
+    schema_version: 1,
+    sample_rate: 1,
+    sample_reason: "all",
+    source,
+    error_kind: error instanceof GithubApiError
+      ? "github_api"
+      : error instanceof TypeError
+        ? "network_or_runtime"
+        : "unexpected",
+    error_name: error instanceof Error ? error.name : typeof error,
+    ...(githubStatus === undefined ? {} : { github_status: githubStatus }),
   }));
 }
 
@@ -1432,6 +1489,7 @@ export class WatchPrHub {
   private readonly activeSessions = new Map<string, ActiveSession>();
   private readonly activeMonitorFeeds = new Map<string, Set<ActiveMonitorFeed>>();
   private readonly refreshes = new Set<string>();
+  private readonly refreshTotals = createRefreshTotals();
   private readonly sessionOperations = new Map<string, Promise<void>>();
   private readonly recentDeliveries = new Set<string>();
 
@@ -2334,8 +2392,10 @@ export class WatchPrHub {
       }
       let snapshot = previous.snapshot;
       try {
-        snapshot = await pullRequestSnapshot(githubToken, targetRepository, number, previous.snapshot);
+        snapshot = await pullRequestSnapshot(githubToken, targetRepository, number, previous.snapshot, stats.githubUsage);
       } catch (error) {
+        stats.snapshotFailures += 1;
+        logSnapshotFailure("webhook", error);
         if (isGithubAuthorizationError(error)) {
           invalidSessionTokens.add(sessionToken);
           stats.storageKeyDeletes += await this.invalidateSession(sessionToken, githubToken);
@@ -2397,11 +2457,24 @@ export class WatchPrHub {
     const parsed = parseWatchKey(key);
     let snapshot;
     try {
-      snapshot = await pullRequestSnapshot(githubToken, parsed.repository, parsed.number, initialState.snapshot);
+      snapshot = await pullRequestSnapshot(githubToken, parsed.repository, parsed.number, initialState.snapshot, this.refreshTotals.githubUsage);
     } catch (error) {
+      this.refreshTotals.failed += 1;
+      logSnapshotFailure(reason, error);
       if (isGithubAuthorizationError(error)) await this.invalidateSession(sessionToken, githubToken);
       return;
     }
+    try {
+      await this.storeRefresh(userId, key, snapshot, reason);
+    } catch (error) {
+      this.refreshTotals.failed += 1;
+      throw error;
+    }
+    this.refreshTotals.completed += 1;
+  }
+
+  private async storeRefresh(userId: number, key: string, snapshot: PullRequestSnapshot, reason: string): Promise<void> {
+    const parsed = parseWatchKey(key);
     const current = await this.watchStateMetadata(userId, key);
     const currentTerminalState = terminalState(current.snapshot);
     if (currentTerminalState === "merged" || (currentTerminalState === "closed" && reason !== "watch")) return;
@@ -2454,12 +2527,20 @@ export class WatchPrHub {
         if (this.scheduleRefresh(record.user.id, key, record.githubAccessToken, sessionToken, "poll")) refreshesStarted += 1;
       }
     }
+    const refreshTotals = { ...this.refreshTotals, githubUsage: { ...this.refreshTotals.githubUsage } };
+    this.refreshTotals.completed = 0;
+    this.refreshTotals.failed = 0;
+    Object.assign(this.refreshTotals.githubUsage, createGithubUsage());
     console.log(JSON.stringify({
       event: "watch_pr.poll",
       active_sessions: sessions.size,
       scheduled_watches: scheduled,
       refreshes_started: refreshesStarted,
       expired_monitors_revoked: expiredMonitorsRevoked,
+      // Refreshes that finished since the previous tick, from every source, not just polls.
+      refreshes_completed: refreshTotals.completed,
+      refresh_failures: refreshTotals.failed,
+      ...githubUsageFields(refreshTotals.githubUsage),
     }));
     return this.accepted({ accepted: true, scheduled });
   }

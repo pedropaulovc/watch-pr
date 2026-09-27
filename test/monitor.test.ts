@@ -2311,6 +2311,86 @@ describe("native monitor feed", () => {
     }
   });
 
+  it("reports GitHub usage and failed refreshes on the next poll tick", async () => {
+    const { hub, pending, storage } = hubFixture();
+    const current = snapshot({ headSha: "reopened" });
+    await storeMonitor(storage, { snapshot: current, events: [event("event-1", current)] });
+    const upstream = openPullRequestFetch();
+    let pullStatus = 200;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/7") && pullStatus !== 200) {
+        return new Response("bad gateway", { status: pullStatus, headers: { "x-ratelimit-resource": "core", "x-ratelimit-remaining": "3999" } });
+      }
+      const response = await upstream(input);
+      const headers = new Headers(response.headers);
+      if (url.endsWith("/graphql")) {
+        // GraphQL draws on its own budget; its remaining count must not lower the core minimum.
+        headers.set("x-ratelimit-resource", "graphql");
+        headers.set("x-ratelimit-remaining", "10");
+      } else {
+        headers.set("x-ratelimit-resource", "core");
+        headers.set("x-ratelimit-remaining", url.endsWith("/pulls/7") ? "4000" : "4990");
+      }
+      return new Response(response.body, { status: response.status, headers });
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", fetchMock);
+    const poll = async () => {
+      expect((await hub.fetch(new Request("https://watch-pr.test/internal/poll", { method: "POST" }))).status).toBe(202);
+      await Promise.all(pending.splice(0));
+    };
+    try {
+      await poll();
+      const storedAfterSuccess = (await readStoredWatchState(
+        storage as unknown as DurableObjectStorage,
+        watchStorageKey(userId, repository, number),
+      )).snapshot?.fetchedAt;
+      pullStatus = 502;
+      await poll();
+      await poll();
+
+      const records = log.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>);
+      const [first, second, third] = records.filter((entry) => entry.event === "watch_pr.poll");
+      // A tick reports refreshes that finished since the previous tick, not the ones it starts.
+      expect(first).toMatchObject({ refreshes_started: 1, refreshes_completed: 0, refresh_failures: 0, github_rest_requests: 0 });
+      expect(first).not.toHaveProperty("github_core_remaining_min");
+      expect(second).toMatchObject({
+        refreshes_completed: 1,
+        refresh_failures: 0,
+        github_rest_requests: 7,
+        github_not_modified: 0,
+        github_graphql_requests: 1,
+        github_core_remaining_min: 4000,
+      });
+      // The failed pull read still spent its request, and the issue read in the same wave ran too.
+      expect(third).toMatchObject({
+        refreshes_completed: 0,
+        refresh_failures: 1,
+        github_rest_requests: 2,
+        github_core_remaining_min: 3999,
+      });
+      // The second and third ticks each started a refresh that failed on the pull read.
+      const failure = {
+        event: "watch_pr.snapshot_failure",
+        schema_version: 1,
+        sample_rate: 1,
+        sample_reason: "all",
+        source: "poll",
+        error_kind: "github_api",
+        error_name: "GithubApiError",
+        github_status: 502,
+      };
+      expect(records.filter((entry) => entry.event === "watch_pr.snapshot_failure")).toEqual([failure, failure]);
+      // Failed refreshes leave the snapshot the successful one stored.
+      const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, watchStorageKey(userId, repository, number));
+      expect(stored.snapshot?.fetchedAt).toBe(storedAfterSuccess);
+    } finally {
+      vi.unstubAllGlobals();
+      log.mockRestore();
+    }
+  });
+
   it("merges a concurrently stored reaction read into an ordinary published event", async () => {
     const { hub, pending, storage } = hubFixture();
     const storageKey = watchStorageKey(userId, repository, number);

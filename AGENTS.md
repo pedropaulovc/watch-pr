@@ -67,11 +67,13 @@ The gateway has bounded request and forwarding timeouts, accepts at most two ing
 
 ### Operational telemetry
 
-- `watch_pr.poll` records each cron tick with `active_sessions`, `scheduled_watches`, and `refreshes_started`.
+- `watch_pr.poll` records each cron tick with `active_sessions`, `scheduled_watches`, `refreshes_started`, and `expired_monitors_revoked`. It also reports refresh work finished since the previous tick in the same object instance, from every refresh source: `refreshes_completed`, `refresh_failures`, and GitHub usage fields. Totals held in memory are lost when the object is evicted, so they are a lower bound.
 - Every authenticated webhook delivery emits one `watch_pr.webhook_admission` record. Its `outcome` is accepted, duplicate, unsupported, invalid-JSON, or admission-error. It contains no delivery ID or payload. Unsupported events omit `github_event`, which prevents an unrecognized request header from creating an Azure label.
-- Every accepted, nonduplicate delivery emits one `watch_pr.webhook_fanout` record after processing, including a zero-route delivery. Its `outcome` is `completed` or `failed`.
+- Every accepted, nonduplicate delivery emits one `watch_pr.webhook_fanout` record after processing, including a zero-route delivery. Its `outcome` is `completed` or `failed`. It includes `snapshot_failures` and the GitHub usage fields for that delivery's snapshot reads.
+- Every failed snapshot read emits one `watch_pr.snapshot_failure` record with `source` (`poll`, `watch`, `read`, or `webhook`), `error_kind`, `error_name`, and `github_status` for GitHub API errors. The watch keeps its previous snapshot, and a later refresh retries it.
+- The GitHub usage fields are `github_rest_requests` (REST responses other than `304`; these consume the user's primary rate limit), `github_not_modified` (`304` responses, which do not), `github_graphql_requests` (separate point budget), and `github_core_remaining_min` (the lowest `core` rate-limit remaining observed; omitted when no response reported it).
 - Every successful persisted watch-state append emits `watch_pr.do_storage`.
-- `watch_pr.webhook_fanout` and `watch_pr.do_storage` use `sample_rate: 1` and `sample_reason: "all"`.
+- `watch_pr.webhook_fanout`, `watch_pr.do_storage`, and `watch_pr.snapshot_failure` use `sample_rate: 1` and `sample_reason: "all"`.
 
 A fanout record counts target-state writes, including writes completed before a later append failure, the delivery marker, and session or monitor deletes caused by an invalid GitHub token. It excludes session-record refreshes and legacy-state migration performed during session reconciliation. State records include the per-watch serialized size, chunk count, event window, and predecessor-payload references.
 

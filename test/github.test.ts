@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mergeReactionKnowledge, monitorEventDetails } from "../src/events";
-import { githubUser, pullRequestSnapshot } from "../src/github";
+import { createGithubUsage, githubUser, pullRequestSnapshot, type GithubUsage } from "../src/github";
 
 /** A PR with no comments, reviews, or checks, so only its body carries reactions. */
 function stubPullRequest(options: {
@@ -47,6 +47,35 @@ afterEach(() => {
 });
 
 describe("GitHub API adapter", () => {
+  it("rejects a failed request wave only after its peers have counted their responses", async () => {
+    // The project's lib target predates Promise.withResolvers.
+    let releaseIssue!: () => void;
+    const issueHeld = new Promise<void>((resolve) => {
+      releaseIssue = resolve;
+    });
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/pulls/7")) return new Response("bad gateway", { status: 502 });
+      if (url.endsWith("/issues/7")) {
+        await issueHeld;
+        return Response.json({ reactions: {} }, { headers: { "x-ratelimit-resource": "core", "x-ratelimit-remaining": "42" } });
+      }
+      throw new Error(`unexpected GitHub URL ${url}`);
+    });
+    const usage = createGithubUsage();
+    let usageAtRejection: GithubUsage | undefined;
+    const snapshot = pullRequestSnapshot("token", "owner/repo", 7, null, usage).catch((error: unknown) => {
+      usageAtRejection = { ...usage };
+      throw error;
+    });
+    // Let the failed pull read propagate as far as it can while the issue read is held.
+    for (let turn = 0; turn < 100; turn += 1) await Promise.resolve();
+    releaseIssue();
+
+    await expect(snapshot).rejects.toMatchObject({ name: "GithubApiError", status: 502 });
+    expect(usageAtRejection).toEqual({ restRequests: 2, notModified: 0, graphqlRequests: 0, coreRateLimitRemaining: 42 });
+  });
+
   it("normalizes pull state, comments, reviews, checks, reactions, and threads", async () => {
     const requested: string[] = [];
     let graphqlCalls = 0;
