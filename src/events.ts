@@ -755,7 +755,11 @@ export function snapshotChanges(
   if (commentsKey(previous.comments) !== commentsKey(current.comments)) changes.push("comments");
   if (JSON.stringify(previous.reviews) !== JSON.stringify(current.reviews)) changes.push("reviews");
   if (commentsKey(previous.reviewComments) !== commentsKey(current.reviewComments)) changes.push("review_comments");
-  if (JSON.stringify(previous.checks) !== JSON.stringify(current.checks)) changes.push("checks");
+  // GitHub's list order carries no meaning, and a webhook appends a check wherever the next
+  // full read may list it, so checks compare in one canonical order.
+  const [previousChecks, currentChecks] = [previous.checks, current.checks].map((checks) =>
+    JSON.stringify([...checks].sort((left, right) => checkKey(left).localeCompare(checkKey(right)))));
+  if (previousChecks !== currentChecks) changes.push("checks");
   if (
     JSON.stringify(previous.bodyReactions) !== JSON.stringify(current.bodyReactions) ||
     reactionDetailsChanged(previous.bodyReactionDetails, current.bodyReactionDetails) ||
@@ -1177,7 +1181,7 @@ function activeCommentDetails(
   return [`active comments: ${delta > 0 ? "+" : ""}${delta}, now ${currentCount}`];
 }
 
-function recordValue(value: unknown): Record<string, unknown> | null {
+export function recordValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? value as Record<string, unknown> : null;
 }
 

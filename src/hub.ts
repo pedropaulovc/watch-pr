@@ -10,6 +10,7 @@ import {
   monitorReconciliationDetails,
   parseWatchKey,
   reactionKnowledgeAdvanced,
+  recordValue,
   resourceUri,
   snapshotChanges,
   terminalState,
@@ -27,6 +28,7 @@ import {
   type GithubUsage,
 } from "./github";
 import { createMcpServer, type McpSessionContext, type WatchRegistration } from "./mcp";
+import { applyWebhook, type WebhookOutcome } from "./reducers";
 import type {
   GithubUser,
   MonitorCapabilityRecord,
@@ -207,6 +209,8 @@ interface WebhookProcessStats {
   largestStateBytes: number;
   largestStateChunkCount: number;
   snapshotFailures: number;
+  /** Per routed, nonduplicate watch: what the delivery's reducer did with its payload. */
+  reducerOutcomes: Record<WebhookOutcome, number>;
   githubUsage: GithubUsage;
 }
 
@@ -224,6 +228,7 @@ function createWebhookProcessStats(): WebhookProcessStats {
     largestStateBytes: 0,
     largestStateChunkCount: 0,
     snapshotFailures: 0,
+    reducerOutcomes: { applied: 0, applied_mergeability_unknown: 0, refetch: 0, ignored: 0 },
     githubUsage: createGithubUsage(),
   };
 }
@@ -1400,6 +1405,10 @@ function logWebhookFanout(eventName: string, outcome: "completed" | "failed", st
     largest_state_bytes: stats.largestStateBytes,
     largest_state_chunk_count: stats.largestStateChunkCount,
     snapshot_failures: stats.snapshotFailures,
+    reducer_applied: stats.reducerOutcomes.applied,
+    reducer_applied_mergeability_unknown: stats.reducerOutcomes.applied_mergeability_unknown,
+    reducer_refetch: stats.reducerOutcomes.refetch,
+    reducer_ignored: stats.reducerOutcomes.ignored,
     ...githubUsageFields(stats.githubUsage),
   }));
 }
@@ -2400,11 +2409,39 @@ export class WatchPrHub {
     }
     // A thread delivery is about exactly what a 304 on the review comments cannot vouch for.
     const threadsRead = eventName === "pull_request_review_thread" ? "refetch" : "when_stale";
+    const countWrites = (writes: WatchStorageWrites): void => {
+      stats.storageKeyPuts += writes.puts;
+      stats.storageKeyDeletes += writes.deletes;
+    };
+    const countPublished = (result: PublishResult): void => {
+      if (!result.published || !result.write) return;
+      stats.publishedWatches += 1;
+      stats.largestStateBytes = Math.max(stats.largestStateBytes, result.write.encodedBytes);
+      stats.largestStateChunkCount = Math.max(stats.largestStateChunkCount, result.write.chunkCount);
+      if (result.write.format === "compact") stats.compactWrites += 1;
+      if (result.write.format === "chunked") stats.chunkedWrites += 1;
+    };
     for (const target of targets) {
       const { githubToken, key, number, previous, repository: targetRepository, sessionToken, userId } = target;
       if (invalidSessionTokens.has(sessionToken)) continue;
       if (previous.events.some((event) => event.deliveryId === deliveryId)) {
         stats.duplicateWatches += 1;
+        continue;
+      }
+      const delivery = createWatchEvent({
+        deliveryId,
+        githubEvent: eventName,
+        action: webhookAction,
+        repository: targetRepository,
+        pullRequestNumber: number,
+        payload,
+        snapshot: null,
+      });
+      // The payload itself is the data whenever a reducer can apply it: no GitHub request.
+      const reduced = await this.applyWebhookDelivery(userId, key, delivery, countWrites);
+      stats.reducerOutcomes[reduced.outcome] += 1;
+      if (reduced.outcome !== "refetch") {
+        countPublished(reduced.result);
         continue;
       }
       let snapshot = previous.snapshot;
@@ -2430,29 +2467,11 @@ export class WatchPrHub {
         snapshot = previous.snapshot;
       }
       const changes = snapshot && previous.snapshot ? snapshotChanges(previous.snapshot, snapshot) : snapshot ? ["initial_snapshot"] : [];
-      const event = createWatchEvent({
-        deliveryId,
-        githubEvent: eventName,
-        action: webhookAction,
-        repository: targetRepository,
-        pullRequestNumber: number,
-        payload,
-        snapshot,
-        changes,
-      });
-      const result = await this.publishEvent(userId, key, event, { snapshot }, (writes) => {
-        stats.storageKeyPuts += writes.puts;
-        stats.storageKeyDeletes += writes.deletes;
-      });
+      const result = await this.publishEvent(userId, key, { ...delivery, snapshot, changes }, { snapshot }, countWrites);
       if (polledAt !== null) {
         stats.storageKeyPuts += await this.recordPolled(watchStorageKey(userId, targetRepository, number), polledAt);
       }
-      if (!result.published || !result.write) continue;
-      stats.publishedWatches += 1;
-      stats.largestStateBytes = Math.max(stats.largestStateBytes, result.write.encodedBytes);
-      stats.largestStateChunkCount = Math.max(stats.largestStateChunkCount, result.write.chunkCount);
-      if (result.write.format === "compact") stats.compactWrites += 1;
-      if (result.write.format === "chunked") stats.chunkedWrites += 1;
+      countPublished(result);
     }
     const deliveryKey = `delivery:${deliveryId}`;
     await this.state.storage.put(deliveryKey, Date.now());
@@ -2708,6 +2727,65 @@ export class WatchPrHub {
       if (writes && onWatchStorageWrites) onWatchStorageWrites(writes);
     }
     if (!published || !write) return { published: false, write: null };
+    await this.announceEvent(userId, key, deliveredEvent, write);
+    return { published: true, write };
+  }
+
+  /**
+   * Applies a delivery's payload to the stored snapshot in one transaction, so the reducer
+   * builds on whatever is committed when it runs and no GitHub request is made. A change it
+   * announces is appended as this delivery's event, exactly like a refetched one; a change it
+   * does not announce, such as a moved `updatedAt` or a dropped validator, is stored silently
+   * like a refresh with nothing to report. `refetch` and `ignored` write nothing.
+   */
+  private async applyWebhookDelivery(
+    userId: number,
+    key: string,
+    event: WatchEvent,
+    onWatchStorageWrites: (writes: WatchStorageWrites) => void,
+  ): Promise<{ outcome: WebhookOutcome; result: PublishResult }> {
+    const storageKey = watchStorageKey(userId, event.repository, event.pullRequestNumber);
+    const writes = { puts: 0, deletes: 0 };
+    let outcome: WebhookOutcome = "ignored";
+    let deliveredEvent = event;
+    let write: WatchAppendStats | null = null;
+    try {
+      await this.state.storage.transaction(async (storage) => {
+        const mutation = await openWatchStateMutation(countWatchStorageWrites(storage, writes), storageKey);
+        const current = mutation.metadata;
+        if (current.events.some((storedEvent) => storedEvent.deliveryId === event.deliveryId)) return;
+        if (!current.snapshot) {
+          outcome = "refetch";
+          return;
+        }
+        const currentTerminalState = terminalState(current.snapshot);
+        if (currentTerminalState === "merged") return;
+        const reduction = applyWebhook(current.snapshot, event.githubEvent, recordValue(event.payload) ?? {}, event.receivedAt);
+        if (reduction.outcome === "refetch" || reduction.outcome === "ignored") {
+          outcome = reduction.outcome;
+          return;
+        }
+        const snapshot = reduction.snapshot;
+        if (currentTerminalState === "closed" && !resumesClosedWatch(event, snapshot)) return;
+        outcome = reduction.outcome;
+        const changes = snapshotChanges(current.snapshot, snapshot);
+        if (changes.length === 0) {
+          await mutation.replaceSnapshot(snapshot);
+          return;
+        }
+        deliveredEvent = { ...event, snapshot, changes, details: monitorEventDetails(current.snapshot, snapshot, event) };
+        write = await mutation.append(deliveredEvent, snapshot);
+      });
+    } finally {
+      onWatchStorageWrites(writes);
+    }
+    if (!write) return { outcome, result: { published: false, write: null } };
+    await this.announceEvent(userId, key, deliveredEvent, write);
+    return { outcome, result: { published: true, write } };
+  }
+
+  /** Everything a stored event reaches: its storage record, monitor feeds, and MCP sessions. */
+  private async announceEvent(userId: number, key: string, deliveredEvent: WatchEvent, write: WatchAppendStats): Promise<void> {
     logWatchStateWrite(deliveredEvent, write);
     this.publishMonitorEvent(
       userId,
@@ -2748,7 +2826,6 @@ export class WatchPrHub {
         // Resource updates remain the interoperable push channel.
       }
     }));
-    return { published: true, write };
   }
 
   private syncActiveSessions(token: string, record: SessionRecord, caller?: ActiveSession): void {

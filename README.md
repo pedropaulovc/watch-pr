@@ -2,7 +2,7 @@
 
 `watch-pr` is a hosted MCP server for monitoring GitHub pull requests. Its Streamable HTTP endpoint is `https://watch-pr.vza.net/mcp`.
 
-The server combines GitHub App webhooks with a once-per-minute refresh. The refresh covers state without a dedicated webhook, including reactions, review-thread resolution, check rollups, and changes to `mergeable` and `mergeable_state`.
+The server combines GitHub App webhooks with a once-per-minute refresh. A webhook's payload is applied to the stored snapshot directly, without a GitHub API request; only a payload the server cannot apply triggers a read. The refresh covers state without a dedicated webhook, including reactions, check rollups, and changes to `mergeable` and `mergeable_state`.
 
 ## Connect
 
@@ -22,12 +22,12 @@ Tool calls return JSON text. `watch_pr` returns the registration object plus its
 
 Resource reads always return the full stored watch state as `{ snapshot, events, polledAt }`. Snapshot and event payloads are not abbreviated by the MCP tool layer.
 
-A snapshot's `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt`. `polledAt` is when GitHub was last read successfully for the watch and that read was stored, by a poll, a webhook, or a watch or read; a read whose result could not be stored does not advance it, so `polledAt` never vouches for data the snapshot lacks; it is `null` until the first successful read. `get_pr` omits the snapshot's `githubValidators`, which are request bookkeeping rather than pull request state.
+A snapshot's `fetchedAt` is when the stored snapshot last changed, so a quiet pull request keeps an old `fetchedAt`. `polledAt` is when GitHub was last read successfully for the watch and that read was stored, by a poll, a watch or read, or a webhook whose payload could not be applied directly; a read whose result could not be stored does not advance it, so `polledAt` never vouches for data the snapshot lacks; it is `null` until the first successful read. A webhook applied from its payload changes `fetchedAt` without a read, so `fetchedAt` can be newer than `polledAt`. `updatedAt` is GitHub's `updated_at` for the pull request, and orders pull request deliveries. After a push delivery, `mergeableState` is `unknown` until the next refresh reads GitHub's computed mergeability, and `checks` starts empty and fills as the new head's check deliveries arrive. `get_pr` omits the snapshot's `githubValidators`, which are request bookkeeping rather than pull request state.
 
 
 ## Resources
 
-Each watched PR is available at `watch-pr://owner/repository/pull/NUMBER`. A webhook or changed snapshot sends `notifications/resources/updated`, after which clients can call `resources/read`. Clients that support logging notifications also receive a compact event summary through `notifications/message`.
+Each watched PR is available at `watch-pr://owner/repository/pull/NUMBER`. A webhook or changed snapshot sends `notifications/resources/updated`, after which clients can call `resources/read`. A webhook applied from its payload notifies only when it changes announced state; an out-of-order delivery older than the stored state, a check for a previous head, or a payload the snapshot already reflects produces no event or notification. Clients that support logging notifications also receive a compact event summary through `notifications/message`.
 
 ## Monitor feeds
 
@@ -57,7 +57,7 @@ Refreshes send each REST request with the ETag of the response the stored snapsh
 - Request read-only access to repository metadata, pull requests, issues, checks, commit statuses, deployments, and merge queues.
 - Subscribe to `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issue_comment`, `check_run`, `check_suite`, `status`, `push`, `deployment`, `deployment_status`, `merge_group`, and `commit_comment`.
 
-The webhook handler verifies `X-Hub-Signature-256`. A manual GitHub redelivery resumes a partial fanout without duplicating completed watches. GitHub does not automatically redeliver a fanout failure that occurs after the handler returns `202`, so scheduled polling reconciles the snapshot. Reactions have no dedicated webhook, so the scheduled refresh supplies them.
+The webhook handler verifies `X-Hub-Signature-256`. A manual GitHub redelivery resumes a partial fanout without duplicating completed watches. GitHub does not automatically redeliver a fanout failure that occurs after the handler returns `202`, so scheduled polling reconciles the snapshot. Reactions have no dedicated webhook, so the scheduled refresh supplies them; a comment delivery updates only the comment's reaction counts, and the refresh that follows reads and reports the individual reactions.
 
 ## Cloudflare environments
 

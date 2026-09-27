@@ -22,11 +22,27 @@ The webhook handler verifies `X-Hub-Signature-256` and deduplicates `X-GitHub-De
 
 Per-watch delivery IDs allow a manual GitHub redelivery to resume partial fanout without duplicating completed watches. GitHub receives the asynchronous handler's `202` before fanout finishes and will not automatically redeliver a later failure, so scheduled polling reconciles the snapshot. Delivery IDs that match no watch are not persisted. GitHub has no reaction-specific webhook; the scheduled refresh provides reaction parity.
 
+Webhook payloads are data, not just triggers. For each routed watch, `applyWebhook` (`src/reducers.ts`) applies the delivery to the committed snapshot inside the watch's storage transaction, with no GitHub request. Payload objects have the REST shapes, so the reducers reuse the normalizers in `src/github.ts`. Each call returns one outcome:
+
+- `applied`: the snapshot changed. A change `snapshotChanges` announces is appended as the delivery's event, exactly like a refetched one. A change nothing announces, such as a moved `updatedAt`, is stored silently.
+- `applied_mergeability_unknown`: a `pull_request` delivery moved the head or base but carried no mergeability. GitHub computes it asynchronously, so the snapshot stores `mergeable: null` and `mergeableState: "unknown"`, and the next scheduled poll learns the result. A dropped pull validator makes that read a `200`. No extra refresh is scheduled, because an immediate read usually finds the computation still pending.
+- `refetch`: the reducer cannot apply the payload. This covers an event without a reducer, a payload missing the fields the reducer needs, a review thread the snapshot does not know, a watch without a stored snapshot, and every event other than resolve or unresolve for threads. The conditional `pullRequestSnapshot` read runs as before.
+- `ignored`: nothing is written, and no event or monitor frame is produced. Examples are an out-of-order delivery older than the stored item (`updated_at` for pulls and comments, `submitted_at` for reviews, `completed_at` for checks, newest-per-context for statuses), a dismissed review that a stale submission would revive, checks for a head SHA other than the stored one, and a payload the snapshot already reflects.
+
+Reducer rules:
+
+- A `pull_request` delivery that keeps the head and base keeps the stored mergeability unless the payload computed it.
+- A new head clears `checks`. The new head's checks arrive through their own `check_run`, `check_suite`, and `status` deliveries.
+- A deleted comment is removed whatever its timestamps.
+- A `check_run` removes the awaiting-approval placeholder of its own suite.
+- A reduced snapshot's `fetchedAt` is the delivery's receipt time.
+- Every REST slice the delivery changed loses its validator through `coherentRequestKnowledge`, so the next conditional read of that slice returns `200` and reconciles anything the payload could not express. Untouched slices keep their validators, and `threadsReadAt` is kept.
+
 ### Reaction snapshots
 
 Each reaction record contains the GitHub reaction ID, content, actor login, actor user ID, and creation time. Records cover the PR body, top-level comments, and inline review comments. GitHub's aggregate counts are stored beside each target and decide whether to read it.
 
-All reaction detail reads for one snapshot run in one wave under a shared concurrency budget. A target is read only when its aggregate counts change. A quiet PR with unchanged counts spends no requests rereading known details.
+All reaction detail reads for one snapshot run in one wave under a shared concurrency budget. A target is read only when its aggregate counts change. A quiet PR with unchanged counts spends no requests rereading known details. A comment webhook moves only a comment's aggregate counts and keeps its stored details. A refresh borrows stored details only when they still add up to the new counts, so the next refresh reads that comment's reactions and announces the difference.
 
 Aggregate counts cannot detect a swap that leaves every count unchanged, such as one actor's `heart` replacing another actor's `heart` between refreshes. That change is detected only after the target's counts move again.
 
@@ -44,9 +60,9 @@ A snapshot's `githubValidators` maps each REST request URL to the ETag of the re
 
 A validator is only as good as the content it describes. Whenever the hub stores a snapshot assembled from more than one source, such as a silent enrichment on the stored snapshot or a published event that merges stored reaction knowledge, `coherentRequestKnowledge` keeps a validator only when the stored content holds exactly the slice (compared as JSON) that the validator's source snapshot held for that URL. Comment slices are compared without reaction bookkeeping, which the list response does not carry. A dropped validator costs the next refresh one full read. It never makes a `304` return content that GitHub did not send.
 
-GraphQL review threads cannot be revalidated. A refresh reuses the stored `threads` only when the review comments returned `304` and `threadsReadAt` is less than 15 minutes old. Otherwise, or when a `pull_request_review_thread` webhook triggered the refresh, it reads the threads again. A failed threads read keeps the stored threads and drops `threadsReadAt`, so the next refresh retries.
+GraphQL review threads cannot be revalidated. A refresh reuses the stored `threads` only when the review comments returned `304` and `threadsReadAt` is less than 15 minutes old. Otherwise, or when a `pull_request_review_thread` webhook the reducer could not apply triggered the refresh, it reads the threads again. A failed threads read keeps the stored threads and drops `threadsReadAt`, so the next refresh retries.
 
-A refresh that announces nothing but carries different validators, or a threads read that replaces a stale one, is stored silently like a reaction enrichment: no event, monitor frame, or notification, and a newer stored `fetchedAt` wins. `snapshotChanges` ignores both fields. `fetchedAt` therefore records the last stored change. `watch:<user-id>:<repository>:<number>:polled` records the last successful GitHub read from any source (poll, watch, read, or webhook). It is written in its own transaction only when newer, and webhook fanout counts it in `storage_key_puts`. `get_pr` adds it as `polledAt` and omits `githubValidators`. Resource reads return `{ snapshot, events, polledAt }`.
+A refresh that announces nothing but carries different validators, or a threads read that replaces a stale one, is stored silently like a reaction enrichment: no event, monitor frame, or notification, and a newer stored `fetchedAt` wins. `snapshotChanges` ignores both fields. `fetchedAt` therefore records the last stored change, whether it came from a GitHub read or a reduced webhook. `watch:<user-id>:<repository>:<number>:polled` records the last successful GitHub read from any source (poll, watch, read, or a webhook the reducer could not apply). A reduced webhook makes no read and does not advance it. It is written in its own transaction only when newer, and webhook fanout counts it in `storage_key_puts`. `get_pr` adds it as `polledAt` and omits `githubValidators`. Resource reads return `{ snapshot, events, polledAt }`.
 
 ### Event storage
 
@@ -79,7 +95,7 @@ The gateway has bounded request and forwarding timeouts, accepts at most two ing
 
 - `watch_pr.poll` records each cron tick with `active_sessions`, `scheduled_watches`, `refreshes_started`, and `expired_monitors_revoked`. It also reports refresh work finished since the previous tick in the same object instance, from every refresh source: `refreshes_completed`, `refresh_failures`, and GitHub usage fields. Totals held in memory are lost when the object is evicted, so they are a lower bound.
 - Every authenticated webhook delivery emits one `watch_pr.webhook_admission` record. Its `outcome` is accepted, duplicate, unsupported, invalid-JSON, or admission-error. It contains no delivery ID or payload. Unsupported events omit `github_event`, which prevents an unrecognized request header from creating an Azure label.
-- Every accepted, nonduplicate delivery emits one `watch_pr.webhook_fanout` record after processing, including a zero-route delivery. Its `outcome` is `completed` or `failed`. It includes `snapshot_failures` and the GitHub usage fields for that delivery's snapshot reads.
+- Every accepted, nonduplicate delivery emits one `watch_pr.webhook_fanout` record after processing, including a zero-route delivery. Its `outcome` is `completed` or `failed`. It includes `snapshot_failures` and the GitHub usage fields for that delivery's snapshot reads. `reducer_applied`, `reducer_applied_mergeability_unknown`, `reducer_refetch`, and `reducer_ignored` count the routed, nonduplicate watches by reducer outcome. Only `reducer_refetch` watches spend GitHub requests.
 - Every failed snapshot read emits one `watch_pr.snapshot_failure` record with `source` (`poll`, `watch`, `read`, or `webhook`), `error_kind`, `error_name`, and `github_status` for GitHub API errors. The watch keeps its previous snapshot, and a later refresh retries it.
 - The GitHub usage fields are `github_rest_requests` (REST responses other than `304`; these consume the user's primary rate limit), `github_not_modified` (`304` responses, which do not), `github_graphql_requests` (separate point budget), and `github_core_remaining_min` (the lowest `core` rate-limit remaining observed; omitted when no response reported it).
 - Every successful persisted watch-state append emits `watch_pr.do_storage`.
