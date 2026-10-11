@@ -126,3 +126,7 @@ Replacing a preview service removes its legacy preview secrets. Preview Workers 
 curl -fsS https://watch-pr.vza.net/health
 curl -fsS https://watch-pr.vza.net/.well-known/oauth-protected-resource
 ```
+
+## License
+
+Original project code and documentation owned by Pedro Paulo Vezza Campos are licensed under [MIT](LICENSE). Third-party dependencies and any third-party or generated material with separate notices retain their respective licenses; this grant does not replace those notices or grant rights the project does not own.
