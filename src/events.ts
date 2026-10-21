@@ -245,6 +245,31 @@ function pushTargetsWatch(
   return false;
 }
 
+function deploymentTargetsWatch(
+  payload: Record<string, unknown>,
+  deployedRepository: string,
+  watchedRepository: string,
+  snapshot: PullRequestSnapshot | null,
+): boolean {
+  if (!snapshot) return false;
+  if (deployedRepository !== watchedRepository && deployedRepository !== snapshot.headRepository) return false;
+  const deployment = recordValue(payload.deployment);
+  if (!deployment) return false;
+
+  // GitHub resolves the deployment ref to a commit. That commit is authoritative,
+  // even when its branch name still matches a watch whose head has moved on.
+  if ("sha" in deployment) {
+    return typeof deployment.sha === "string" && deployment.sha.length > 0 && deployment.sha === snapshot.headSha;
+  }
+  const ref = deployment.ref;
+  if (typeof ref !== "string" || ref.length === 0) return false;
+  if (ref === snapshot.headSha) return true;
+  if (/^[a-f0-9]{40}$/iu.test(ref)) return false;
+
+  const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
+  return branch.length > 0 && branch === snapshot.headRefName && deployedRepository === snapshot.headRepository;
+}
+
 export function eventPullRequestNumbers(
   eventName: string,
   payload: Record<string, unknown>,
@@ -261,7 +286,7 @@ export function eventPullRequestNumbers(
     hasExplicitTargets = addNumber(numbers, payload.issue) || hasExplicitTargets;
   }
   hasExplicitTargets = addNumber(numbers, payload.merge_group) || hasExplicitTargets;
-  for (const field of ["check_run", "check_suite", "deployment", "deployment_status", "merge_group", "status"]) {
+  for (const field of ["check_run", "check_suite", "deployment", "deployment_status", "workflow_run", "merge_group", "status"]) {
     const value = payload[field];
     if (!value || typeof value !== "object") continue;
     const pullRequests = (value as Record<string, unknown>).pull_requests;
@@ -273,8 +298,8 @@ export function eventPullRequestNumbers(
   const matching = [...numbers].filter((number) => watchedKeys.has(`${repository}#${number}`));
   if (matching.length > 0 || hasExplicitTargets) return matching.sort((left, right) => left - right);
 
-  // These deliveries can omit pull_requests. Non-push events still refresh every
-  // repository watch; pushes are narrowed below to the affected head/base branches.
+  // Deliveries without explicit PR associations use repository-wide routing,
+  // except pushes (head/direct base) and deployments (current head only).
   if (["check_run", "check_suite", "commit_comment", "deployment", "deployment_status", "merge_group", "push", "status"].includes(eventName)) {
     const repositoryNumbers = new Set<number>();
     for (const watch of watched) {
@@ -282,6 +307,8 @@ export function eventPullRequestNumbers(
         const parsed = parseWatchKey(watch.key);
         if (eventName === "push") {
           if (!pushTargetsWatch(payload, repository, parsed.repository, watch.snapshot)) continue;
+        } else if (eventName === "deployment" || eventName === "deployment_status") {
+          if (!deploymentTargetsWatch(payload, repository, parsed.repository, watch.snapshot)) continue;
         } else if (parsed.repository !== repository) {
           continue;
         }
