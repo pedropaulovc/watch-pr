@@ -1370,6 +1370,316 @@ describe("native monitor feed", () => {
     expect(acknowledged.status).toBe(204);
   });
 
+  describe.each(["deployment", "deployment_status"])("%s webhook isolation", (eventName) => {
+    it("delivers unchanged deployment details only to the matching watch live and after restart", async () => {
+      const { hub, storage, restart } = hubFixture();
+      const internals = hub as unknown as HubInternals;
+      const current = snapshot();
+      const initial = event("event-before-deployment", current);
+      const matchingRecord = sessionRecord({ subscriptions: [watch] });
+      await storeMonitor(storage, { snapshot: current, events: [initial] }, matchingRecord);
+
+      const unrelatedNumber = 8;
+      const unrelatedWatch = `${repository}#${unrelatedNumber}`;
+      const unrelatedToken = `${sessionToken}-unrelated`;
+      const unrelatedCapability = `${capability}-unrelated`;
+      const unrelatedKey = watchStorageKey(userId, repository, unrelatedNumber);
+      const unrelatedSnapshot = snapshot({
+        number: unrelatedNumber,
+        url: `https://github.com/${repository}/pull/${unrelatedNumber}`,
+        headRefName: "other-feature",
+        headSha: "other-sha",
+        baseRefName: "feature",
+      });
+      const unrelatedInitial = event("event-unrelated-before-deployment", unrelatedSnapshot, {
+        pullRequestNumber: unrelatedNumber,
+        resourceUri: `watch-pr://${repository}/pull/${unrelatedNumber}`,
+      });
+      const unrelatedRecord = sessionRecord({ watches: [unrelatedWatch], subscriptions: [unrelatedWatch] });
+      await storage.put(sessionStorageKey(unrelatedToken), unrelatedRecord);
+      await storage.put(monitorCapabilityStorageKey(unrelatedCapability), {
+        sessionToken: unrelatedToken,
+        userId,
+        repository,
+        pullRequestNumber: unrelatedNumber,
+        createdAt: Date.now(),
+        expiresAt: unrelatedRecord.expiresAt,
+      } satisfies MonitorCapabilityRecord);
+      await writeStoredWatchState(storage as unknown as DurableObjectStorage, unrelatedKey, {
+        snapshot: unrelatedSnapshot,
+        events: [unrelatedInitial],
+      });
+
+      const matchingNotifications = { sendResourceUpdated: vi.fn(), notification: vi.fn() };
+      const unrelatedNotifications = { sendResourceUpdated: vi.fn(), notification: vi.fn() };
+      for (const [token, record, notifications] of [
+        [sessionToken, matchingRecord, matchingNotifications],
+        [unrelatedToken, unrelatedRecord, unrelatedNotifications],
+      ] as const) {
+        const active = Object.assign(internals.newActiveSession(token, record, "stateful"), {
+          server: { server: notifications },
+        });
+        internals.activeSessions.set(token, active);
+      }
+
+      const matchingResponse = await hub.fetch(new Request(
+        `https://watch-pr.test/monitor/${capability}?cursor=${initial.id}`,
+      ));
+      const unrelatedResponse = await hub.fetch(new Request(
+        `https://watch-pr.test/monitor/${unrelatedCapability}?cursor=${unrelatedInitial.id}`,
+      ));
+      expect(matchingResponse.status).toBe(200);
+      expect(unrelatedResponse.status).toBe(200);
+      const matchingFeed = feedReader(matchingResponse);
+      const unrelatedFeed = feedReader(unrelatedResponse);
+      const fetchMock = stackedPullRequestFetch({
+        [number]: { head: "feature", headRepository: repository, base: "main", sha: "abc" },
+        [unrelatedNumber]: { head: "other-feature", headRepository: repository, base: "feature", sha: "other-sha" },
+      });
+      const payload = {
+        action: "created",
+        repository: { full_name: repository },
+        deployment: { environment: "preview", sha: "abc", ref: "feature" },
+        ...(eventName === "deployment_status" ? {
+          deployment_status: { state: "success", environment_url: "https://example.test/deployments/7" },
+        } : {}),
+      };
+      const detail = eventName === "deployment_status"
+        ? "deployment: preview (feature) -> success https://example.test/deployments/7"
+        : "deployment: preview (feature) -> created";
+      const deliveryId = `delivery-${eventName}-isolated`;
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        await matchingFeed.reader.read();
+        await unrelatedFeed.reader.read();
+        storage.putKeys.length = 0;
+        await internals.processWebhook(eventName, deliveryId, payload);
+
+        const stored = await readStoredWatchState(
+          storage as unknown as DurableObjectStorage,
+          watchStorageKey(userId, repository, number),
+        );
+        expect(stored.events).toHaveLength(2);
+        expect(stored.events[1]).toMatchObject({ deliveryId, githubEvent: eventName, changes: [], payload });
+        const unrelatedStored = await readStoredWatchState(storage as unknown as DurableObjectStorage, unrelatedKey);
+        expect(unrelatedStored.events).toEqual([unrelatedInitial]);
+        expect(unrelatedStored.snapshot).toEqual(unrelatedSnapshot);
+        expect(storage.putKeys.filter((key) => key === unrelatedKey || key.startsWith(`${unrelatedKey}:`))).toEqual([]);
+        await expect(storage.get(watchSidecarIndexKey(unrelatedKey))).resolves.toBeUndefined();
+        expect(fetchMock.mock.calls.some(([input]) => String(input).includes(`/pulls/${unrelatedNumber}`))).toBe(false);
+        expect(matchingNotifications.sendResourceUpdated).toHaveBeenCalledTimes(1);
+        expect(matchingNotifications.sendResourceUpdated).toHaveBeenCalledWith({
+          uri: `watch-pr://${repository}/pull/${number}`,
+        });
+        expect(matchingNotifications.notification).toHaveBeenCalledTimes(1);
+        expect(matchingNotifications.notification).toHaveBeenCalledWith({
+          method: "notifications/message",
+          params: expect.objectContaining({
+            data: expect.objectContaining({ githubEvent: eventName, changes: [] }),
+          }),
+        });
+        expect(unrelatedNotifications.sendResourceUpdated).not.toHaveBeenCalled();
+        expect(unrelatedNotifications.notification).not.toHaveBeenCalled();
+        const delivered = await nextMonitorEvent(matchingFeed);
+        expect(delivered).toMatchObject({
+          id: stored.events[1].id,
+          githubEvent: eventName,
+          repository,
+          pullRequestNumber: number,
+          changes: [],
+          details: [detail],
+        });
+        // A pending read completes only on cancellation; any wrongly queued frame makes it nonempty.
+        const unrelatedRead = unrelatedFeed.reader.read();
+        await unrelatedFeed.reader.cancel();
+        await expect(unrelatedRead).resolves.toMatchObject({ done: true });
+        await matchingFeed.reader.cancel();
+
+        const replayResponse = await restart().fetch(new Request(
+          `https://watch-pr.test/monitor/${capability}?cursor=${initial.id}`,
+        ));
+        expect(replayResponse.status).toBe(200);
+        const replayFeed = feedReader(replayResponse);
+        try {
+          await expect(nextMonitorEvent(replayFeed)).resolves.toEqual(delivered);
+        } finally {
+          await replayFeed.reader.cancel();
+        }
+      } finally {
+        await matchingFeed.reader.cancel();
+        await unrelatedFeed.reader.cancel();
+        vi.unstubAllGlobals();
+      }
+    });
+
+    const headSha = "a".repeat(40);
+    const otherSha = "b".repeat(40);
+    const cases: {
+      name: string;
+      deployment?: Record<string, unknown>;
+      snapshotOverrides?: Partial<PullRequestSnapshot>;
+      missingSnapshot?: boolean;
+      webhookRepository?: string;
+      explicitPullRequest?: number;
+      statusAssociations?: { number: number }[];
+      matches: boolean;
+    }[] = [
+      { name: "matches a plain head branch", deployment: { ref: "feature" }, matches: true },
+      { name: "matches a qualified head branch", deployment: { ref: "refs/heads/feature" }, matches: true },
+      { name: "matches a SHA-valued ref without sha", deployment: { ref: headSha }, matches: true },
+      { name: "matches authoritative sha despite a different ref", deployment: { sha: headSha, ref: "main" }, matches: true },
+      { name: "rejects mismatched sha despite a matching ref", deployment: { sha: otherSha, ref: "feature" }, matches: false },
+      { name: "rejects mismatched sha despite a matching SHA-valued ref", deployment: { sha: otherSha, ref: headSha }, matches: false },
+      { name: "rejects a main branch deployment", deployment: { ref: "main" }, matches: false },
+      {
+        name: "rejects a direct-base deployment",
+        deployment: { ref: "refs/heads/upstream-feature" },
+        snapshotOverrides: { baseRefName: "upstream-feature" },
+        matches: false,
+      },
+      {
+        name: "rejects a fork branch collision in the base repository",
+        deployment: { ref: "feature" },
+        snapshotOverrides: { headRepository: "contributor/repo" },
+        matches: false,
+      },
+      {
+        name: "matches a current fork-head SHA deployed by the base repository",
+        deployment: { sha: headSha },
+        snapshotOverrides: { headRepository: "contributor/repo" },
+        matches: true,
+      },
+      {
+        name: "matches a deployment from the fork head branch",
+        deployment: { ref: "feature" },
+        snapshotOverrides: { headRepository: "contributor/repo" },
+        webhookRepository: "contributor/repo",
+        matches: true,
+      },
+      {
+        name: "matches a deployment from the fork head SHA",
+        deployment: { sha: headSha },
+        snapshotOverrides: { headRepository: "contributor/repo" },
+        webhookRepository: "contributor/repo",
+        matches: true,
+      },
+      {
+        name: "rejects an unrelated repository with the same SHA",
+        deployment: { sha: headSha },
+        webhookRepository: "unrelated/repo",
+        matches: false,
+      },
+      { name: "rejects a missing stored snapshot", deployment: { sha: headSha, ref: "feature" }, missingSnapshot: true, matches: false },
+      { name: "rejects a missing deployment object", matches: false },
+      { name: "rejects missing deployment identifiers", deployment: { environment: "preview" }, matches: false },
+      {
+        name: "rejects branch fallback with a missing head repository",
+        deployment: { ref: "feature" },
+        snapshotOverrides: { headRepository: null },
+        matches: false,
+      },
+      {
+        name: "rejects a missing head SHA when sha is supplied",
+        deployment: { sha: headSha, ref: "feature" },
+        snapshotOverrides: { headSha: null },
+        matches: false,
+      },
+      {
+        name: "rejects a missing head branch without sha",
+        deployment: { ref: "feature" },
+        snapshotOverrides: { headRefName: null },
+        matches: false,
+      },
+      {
+        name: "honors a matching explicit association over conflicting sha",
+        deployment: { sha: otherSha, pull_requests: [{ number }] },
+        matches: true,
+      },
+      {
+        name: "honors a matching explicit PR number without snapshot or deployment",
+        explicitPullRequest: number,
+        missingSnapshot: true,
+        matches: true,
+      },
+      {
+        name: "does not fall back from an unwatched explicit association",
+        deployment: { sha: headSha, ref: "feature", pull_requests: [{ number: 999 }] },
+        matches: false,
+      },
+      {
+        name: "does not fall back from an empty explicit association",
+        deployment: { sha: headSha, ref: "feature", pull_requests: [] },
+        matches: false,
+      },
+    ];
+    if (eventName === "deployment_status") {
+      cases.push(
+        {
+          name: "honors a matching explicit status association over conflicting sha",
+          deployment: { sha: otherSha },
+          statusAssociations: [{ number }],
+          matches: true,
+        },
+        {
+          name: "does not fall back from an unwatched explicit status association",
+          deployment: { sha: headSha },
+          statusAssociations: [{ number: 999 }],
+          matches: false,
+        },
+        {
+          name: "does not fall back from an empty explicit status association",
+          deployment: { sha: headSha },
+          statusAssociations: [],
+          matches: false,
+        },
+      );
+    }
+
+    it.each(cases)("$name", async (scenario) => {
+      const { hub, storage } = hubFixture();
+      const current = snapshot({ headSha, ...scenario.snapshotOverrides });
+      await storeMonitor(storage, { snapshot: scenario.missingSnapshot ? null : current, events: [] });
+      const storageKey = watchStorageKey(userId, repository, number);
+      const fetchMock = stackedPullRequestFetch({
+        [number]: {
+          head: current.headRefName ?? "feature",
+          headRepository: current.headRepository ?? repository,
+          base: current.baseRefName ?? "main",
+          sha: current.headSha ?? headSha,
+        },
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        storage.putKeys.length = 0;
+        await (hub as unknown as HubInternals).processWebhook(eventName, "deployment-routing-case", {
+          action: "created",
+          repository: { full_name: scenario.webhookRepository ?? repository },
+          ...(scenario.deployment ? { deployment: scenario.deployment } : {}),
+          ...(scenario.explicitPullRequest ? { pull_request: { number: scenario.explicitPullRequest } } : {}),
+          ...(eventName === "deployment_status" ? {
+            deployment_status: {
+              state: "success",
+              ...(scenario.statusAssociations ? { pull_requests: scenario.statusAssociations } : {}),
+            },
+          } : {}),
+        });
+        const stored = await readStoredWatchState(storage as unknown as DurableObjectStorage, storageKey);
+        expect(stored.events.map((storedEvent) => storedEvent.deliveryId)).toEqual(
+          scenario.matches ? ["deployment-routing-case"] : [],
+        );
+        if (scenario.matches) {
+          expect(fetchMock).toHaveBeenCalled();
+        } else {
+          expect(fetchMock).not.toHaveBeenCalled();
+          expect(storage.putKeys.filter((key) => key === storageKey || key.startsWith(`${storageKey}:`))).toEqual([]);
+          await expect(storage.get("delivery:deployment-routing-case")).resolves.toBeUndefined();
+        }
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+  });
+
   it("publishes stack pushes only to watches whose head or direct base matches", async () => {
     const { hub, storage } = hubFixture();
     const stack = [

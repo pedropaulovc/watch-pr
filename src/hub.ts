@@ -2464,6 +2464,7 @@ export class WatchPrHub {
     const webhookAction = actionFromPayload(payload);
     const movesMergeability = eventName === "pull_request" && MERGEABILITY_ACTIONS[webhookAction ?? ""] === true;
     const mergeabilityFollowUps: string[] = [];
+    const needsRoutingSnapshot = eventName === "push" || eventName === "deployment" || eventName === "deployment_status";
     const targets: WebhookTarget[] = [];
     for (const watcher of watchers.values()) {
       let parsed;
@@ -2472,9 +2473,9 @@ export class WatchPrHub {
       } catch {
         continue;
       }
-      if (eventName !== "push" && parsed.repository !== repository) continue;
+      if (!needsRoutingSnapshot && parsed.repository !== repository) continue;
       let previous: WatchStateMetadata | undefined;
-      if (eventName === "push") previous = await this.watchStateMetadata(watcher.userId, watcher.key);
+      if (needsRoutingSnapshot) previous = await this.watchStateMetadata(watcher.userId, watcher.key);
       const targetNumbers = eventPullRequestNumbers(eventName, payload, [{
         key: watcher.key,
         snapshot: previous?.snapshot ?? null,

@@ -40,6 +40,13 @@ Reducer rules:
 - A reduced snapshot's `fetchedAt` is the delivery's receipt time.
 - Every REST slice the delivery changed loses its validator through `coherentRequestKnowledge`, so the next conditional read of that slice returns `200` and reconciles anything the payload could not express. Untouched slices keep their validators, and `threadsReadAt` is kept.
 
+Deployment routing is narrower than push routing. Explicit PR associations win, including an explicitly empty `pull_requests` array (no implicit targets). Without associations, `deployment` and `deployment_status` require a stored snapshot and positive current-head evidence from `payload.deployment`:
+
+- A supplied `sha` must equal the snapshot's `headSha`; a matching branch cannot override a different or invalid SHA.
+- With no `sha`, a SHA-valued `ref` must equal `headSha`. A branch-only `ref` (plain or `refs/heads/`-qualified) must equal `headRefName`, and the webhook repository must equal `headRepository`. The PR's base branch is not deployment evidence.
+- The webhook repository must be the watched repository or its recorded head repository. This allows fork-head deployments without confusing same-named branches in the base repository, and rejects unrelated repositories even if a SHA happens to match.
+- Missing snapshots or the identifiers needed for that evidence fail closed rather than broadcasting. A relevant deployment still publishes its payload-derived monitor detail when the refetched PR snapshot has no announced changes.
+
 ### Poll schedule and webhook coverage
 
 The GitHub App is installed per account, so a watched repository owned by someone who has not installed it (for example `can1357/oh-my-pi`) never produces deliveries and depends entirely on reads. The Worker holds no App private key, so it cannot ask GitHub which installations exist; coverage is learned instead (`src/schedule.ts`).
