@@ -51,14 +51,14 @@ jobs:
           TELEMETRY_OIDC_PUBLIC_JWK: ${{ vars.TELEMETRY_OIDC_PUBLIC_JWK }}
           TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK: ${{ vars.TELEMETRY_OIDC_PREVIOUS_PUBLIC_JWK }}
         run: node scripts/render-telemetry-config.mjs --environment production
-      - name: Verify production telemetry bearer rotation
+      - name: Prepare observability destinations for gateway bearer rotation
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
           TELEMETRY_GATEWAY_ORIGIN: ${{ vars.TELEMETRY_GATEWAY_ORIGIN }}
           TELEMETRY_GATEWAY_INGEST_BEARER: ${{ secrets.TELEMETRY_GATEWAY_INGEST_BEARER }}
           TELEMETRY_GATEWAY_PREVIOUS_INGEST_BEARER: ${{ secrets.TELEMETRY_GATEWAY_PREVIOUS_INGEST_BEARER }}
-        run: node scripts/configure-observability.mjs --verify-bearer-rotation
+        run: node scripts/configure-observability.mjs --prepare-bearer-rotation
       - name: Deploy production telemetry gateway bootstrap
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
