@@ -222,6 +222,69 @@ describe("watch-pr event contracts", () => {
         pull_request: { number: 10 },
       }, deploymentWatches)).toEqual([10]);
     });
+
+    const workflowPullRequest = (pullRequestNumber: number) => ({
+      url: `https://api.github.com/repos/owner/repo/pulls/${pullRequestNumber}`,
+      id: pullRequestNumber,
+      number: pullRequestNumber,
+      head: {
+        ref: "feature",
+        sha: headSha,
+        repo: { id: 1, name: "repo", url: "https://api.github.com/repos/owner/repo" },
+      },
+      base: {
+        ref: "main",
+        sha: otherSha,
+        repo: { id: 1, name: "repo", url: "https://api.github.com/repos/owner/repo" },
+      },
+    });
+
+    it("honors workflow PR associations for a synthetic merge SHA different from the head", () => {
+      const mergeSha = "d".repeat(40);
+      expect(mergeSha).not.toBe(headSha);
+      expect(eventPullRequestNumbers(eventName, {
+        repository: { full_name: "owner/repo" },
+        deployment: { sha: mergeSha, ref: "refs/pull/7/merge" },
+        workflow_run: {
+          event: "pull_request",
+          head_sha: headSha,
+          pull_requests: [workflowPullRequest(7)],
+        },
+      }, deploymentWatches)).toEqual([7]);
+    });
+
+    it.each([
+      { name: "empty", pullRequests: [] },
+      { name: "unwatched", pullRequests: [workflowPullRequest(99)] },
+    ])("does not fall back from $name workflow PR associations to matching head evidence", ({ pullRequests }) => {
+      expect(eventPullRequestNumbers(eventName, {
+        repository: { full_name: "owner/repo" },
+        deployment: { sha: headSha, ref: "feature" },
+        workflow_run: { pull_requests: pullRequests },
+      }, deploymentWatches)).toEqual([]);
+    });
+
+    it("scopes workflow PR associations to the webhook repository despite identical PR numbers", () => {
+      const sameNumberWatches = [
+        deploymentWatches[0],
+        {
+          key: "other/repo#7",
+          snapshot: snapshot({ repository: "other/repo", headRepository: "other/repo", headSha }),
+        },
+      ];
+      const payload = {
+        repository: { full_name: "Owner/Repo" },
+        deployment: { sha: headSha, ref: "feature" },
+        workflow_run: { pull_requests: [workflowPullRequest(7)] },
+      };
+      expect(sameNumberWatches
+        .filter((watch) => eventPullRequestNumbers(eventName, payload, [watch]).includes(7))
+        .map((watch) => watch.key)).toEqual(["owner/repo#7"]);
+      expect(eventPullRequestNumbers(eventName, {
+        ...payload,
+        repository: { full_name: "unrelated/repo" },
+      }, sameNumberWatches)).toEqual([]);
+    });
   });
 
   it("routes a stacked-PR push only to watches whose head or direct base changed", () => {

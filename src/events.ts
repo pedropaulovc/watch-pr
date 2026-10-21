@@ -286,7 +286,7 @@ export function eventPullRequestNumbers(
     hasExplicitTargets = addNumber(numbers, payload.issue) || hasExplicitTargets;
   }
   hasExplicitTargets = addNumber(numbers, payload.merge_group) || hasExplicitTargets;
-  for (const field of ["check_run", "check_suite", "deployment", "deployment_status", "merge_group", "status"]) {
+  for (const field of ["check_run", "check_suite", "deployment", "deployment_status", "workflow_run", "merge_group", "status"]) {
     const value = payload[field];
     if (!value || typeof value !== "object") continue;
     const pullRequests = (value as Record<string, unknown>).pull_requests;

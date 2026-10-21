@@ -40,7 +40,7 @@ Reducer rules:
 - A reduced snapshot's `fetchedAt` is the delivery's receipt time.
 - Every REST slice the delivery changed loses its validator through `coherentRequestKnowledge`, so the next conditional read of that slice returns `200` and reconciles anything the payload could not express. Untouched slices keep their validators, and `threadsReadAt` is kept.
 
-Deployment routing is narrower than push routing. Explicit PR associations win, including an explicitly empty `pull_requests` array (no implicit targets). Without associations, `deployment` and `deployment_status` require a stored snapshot and positive current-head evidence from `payload.deployment`:
+Deployment routing is narrower than push routing. Explicit PR associations win, including `workflow_run.pull_requests` on deployment status deliveries and an explicitly empty `pull_requests` array (no implicit targets). These associations stay scoped to the webhook repository; an associated workflow may deploy a synthetic PR merge commit whose SHA differs from the PR head. Without associations, `deployment` and `deployment_status` require a stored snapshot and positive current-head evidence from `payload.deployment`:
 
 - A supplied `sha` must equal the snapshot's `headSha`; a matching branch cannot override a different or invalid SHA.
 - With no `sha`, a SHA-valued `ref` must equal `headSha`. A branch-only `ref` (plain or `refs/heads/`-qualified) must equal `headRefName`, and the webhook repository must equal `headRepository`. The PR's base branch is not deployment evidence.

@@ -1371,36 +1371,73 @@ describe("native monitor feed", () => {
   });
 
   describe.each(["deployment", "deployment_status"])("%s webhook isolation", (eventName) => {
-    it("delivers unchanged deployment details only to the matching watch live and after restart", async () => {
+    interface WorkflowBranch {
+      ref: string;
+      sha: string;
+      repo: { id: number; url: string; name: string };
+    }
+    interface WorkflowPullRequestAssociation {
+      url: string;
+      id: number;
+      number: number;
+      head: WorkflowBranch;
+      base: WorkflowBranch;
+    }
+    const workflowAssociation = (pullRequestNumber: number): WorkflowPullRequestAssociation => ({
+      url: `https://api.github.com/repos/${repository}/pulls/${pullRequestNumber}`,
+      id: pullRequestNumber,
+      number: pullRequestNumber,
+      head: {
+        ref: "feature",
+        sha: "a".repeat(40),
+        repo: { id: 1, url: `https://api.github.com/repos/${repository}`, name: "repo" },
+      },
+      base: {
+        ref: "main",
+        sha: "c".repeat(40),
+        repo: { id: 1, url: `https://api.github.com/repos/${repository}`, name: "repo" },
+      },
+    });
+    it.each([
+      { name: "delivers unchanged deployment details only to the matching watch live and after restart", workflow: false },
+      ...(eventName === "deployment_status" ? [{
+        name: "delivers workflow merge-SHA deployment details only to the matching repository watch live and after restart",
+        workflow: true,
+      }] : []),
+    ])("$name", async ({ workflow }) => {
       const { hub, storage, restart } = hubFixture();
       const internals = hub as unknown as HubInternals;
-      const current = snapshot();
+      const current = snapshot({ headSha: workflow ? "a".repeat(40) : "abc" });
       const initial = event("event-before-deployment", current);
       const matchingRecord = sessionRecord({ subscriptions: [watch] });
       await storeMonitor(storage, { snapshot: current, events: [initial] }, matchingRecord);
 
-      const unrelatedNumber = 8;
-      const unrelatedWatch = `${repository}#${unrelatedNumber}`;
+      const unrelatedNumber = workflow ? number : 8;
+      const unrelatedRepository = workflow ? "other/repo" : repository;
+      const unrelatedWatch = `${unrelatedRepository}#${unrelatedNumber}`;
       const unrelatedToken = `${sessionToken}-unrelated`;
       const unrelatedCapability = `${capability}-unrelated`;
-      const unrelatedKey = watchStorageKey(userId, repository, unrelatedNumber);
+      const unrelatedKey = watchStorageKey(userId, unrelatedRepository, unrelatedNumber);
       const unrelatedSnapshot = snapshot({
+        repository: unrelatedRepository,
+        headRepository: unrelatedRepository,
         number: unrelatedNumber,
-        url: `https://github.com/${repository}/pull/${unrelatedNumber}`,
+        url: `https://github.com/${unrelatedRepository}/pull/${unrelatedNumber}`,
         headRefName: "other-feature",
         headSha: "other-sha",
         baseRefName: "feature",
       });
       const unrelatedInitial = event("event-unrelated-before-deployment", unrelatedSnapshot, {
+        repository: unrelatedRepository,
         pullRequestNumber: unrelatedNumber,
-        resourceUri: `watch-pr://${repository}/pull/${unrelatedNumber}`,
+        resourceUri: `watch-pr://${unrelatedRepository}/pull/${unrelatedNumber}`,
       });
       const unrelatedRecord = sessionRecord({ watches: [unrelatedWatch], subscriptions: [unrelatedWatch] });
       await storage.put(sessionStorageKey(unrelatedToken), unrelatedRecord);
       await storage.put(monitorCapabilityStorageKey(unrelatedCapability), {
         sessionToken: unrelatedToken,
         userId,
-        repository,
+        repository: unrelatedRepository,
         pullRequestNumber: unrelatedNumber,
         createdAt: Date.now(),
         expiresAt: unrelatedRecord.expiresAt,
@@ -1433,13 +1470,16 @@ describe("native monitor feed", () => {
       const matchingFeed = feedReader(matchingResponse);
       const unrelatedFeed = feedReader(unrelatedResponse);
       const fetchMock = stackedPullRequestFetch({
-        [number]: { head: "feature", headRepository: repository, base: "main", sha: "abc" },
-        [unrelatedNumber]: { head: "other-feature", headRepository: repository, base: "feature", sha: "other-sha" },
+        [number]: { head: "feature", headRepository: repository, base: "main", sha: current.headSha! },
+        ...(!workflow ? {
+          [unrelatedNumber]: { head: "other-feature", headRepository: repository, base: "feature", sha: "other-sha" },
+        } : {}),
       });
       const payload = {
         action: "created",
         repository: { full_name: repository },
-        deployment: { environment: "preview", sha: "abc", ref: "feature" },
+        deployment: { environment: "preview", sha: workflow ? "b".repeat(40) : "abc", ref: "feature" },
+        ...(workflow ? { workflow_run: { pull_requests: [workflowAssociation(number)] } } : {}),
         ...(eventName === "deployment_status" ? {
           deployment_status: { state: "success", environment_url: "https://example.test/deployments/7" },
         } : {}),
@@ -1466,7 +1506,9 @@ describe("native monitor feed", () => {
         expect(unrelatedStored.snapshot).toEqual(unrelatedSnapshot);
         expect(storage.putKeys.filter((key) => key === unrelatedKey || key.startsWith(`${unrelatedKey}:`))).toEqual([]);
         await expect(storage.get(watchSidecarIndexKey(unrelatedKey))).resolves.toBeUndefined();
-        expect(fetchMock.mock.calls.some(([input]) => String(input).includes(`/pulls/${unrelatedNumber}`))).toBe(false);
+        expect(fetchMock.mock.calls.some(([input]) => String(input).includes(
+          `/repos/${unrelatedRepository}/pulls/${unrelatedNumber}`,
+        ))).toBe(false);
         expect(matchingNotifications.sendResourceUpdated).toHaveBeenCalledTimes(1);
         expect(matchingNotifications.sendResourceUpdated).toHaveBeenCalledWith({
           uri: `watch-pr://${repository}/pull/${number}`,
@@ -1522,6 +1564,7 @@ describe("native monitor feed", () => {
       webhookRepository?: string;
       explicitPullRequest?: number;
       statusAssociations?: { number: number }[];
+      workflowAssociations?: WorkflowPullRequestAssociation[];
       matches: boolean;
     }[] = [
       { name: "matches a plain head branch", deployment: { ref: "feature" }, matches: true },
@@ -1632,6 +1675,31 @@ describe("native monitor feed", () => {
           statusAssociations: [],
           matches: false,
         },
+        {
+          name: "honors a matching workflow association over a synthetic merge sha",
+          deployment: { sha: otherSha },
+          workflowAssociations: [workflowAssociation(number)],
+          matches: true,
+        },
+        {
+          name: "does not fall back from an unwatched workflow association",
+          deployment: { sha: headSha },
+          workflowAssociations: [workflowAssociation(999)],
+          matches: false,
+        },
+        {
+          name: "does not fall back from an empty workflow association",
+          deployment: { sha: headSha },
+          workflowAssociations: [],
+          matches: false,
+        },
+        {
+          name: "does not route a workflow association from an unrelated repository",
+          deployment: { sha: headSha },
+          webhookRepository: "unrelated/repo",
+          workflowAssociations: [workflowAssociation(number)],
+          matches: false,
+        },
       );
     }
 
@@ -1656,6 +1724,9 @@ describe("native monitor feed", () => {
           repository: { full_name: scenario.webhookRepository ?? repository },
           ...(scenario.deployment ? { deployment: scenario.deployment } : {}),
           ...(scenario.explicitPullRequest ? { pull_request: { number: scenario.explicitPullRequest } } : {}),
+          ...(scenario.workflowAssociations ? {
+            workflow_run: { pull_requests: scenario.workflowAssociations },
+          } : {}),
           ...(eventName === "deployment_status" ? {
             deployment_status: {
               state: "success",
