@@ -154,6 +154,31 @@ describe("telemetry gateway", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it.each(["/v1/logs", "/v1/traces"])("distinguishes rejected 200 from accepted 413 for the same oversized %s auth probe", async (path) => {
+    const fetchMock = vi.fn();
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", fetchMock);
+    const body = new Uint8Array(1024 * 1024 + 1);
+    const statuses = [];
+    for (const bearer of ["invalid-probe-fixture", currentBearer, previousBearer]) {
+      const request = new Request(`https://gateway.example.test${path}`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
+        body,
+      });
+      request.headers.delete("Content-Length");
+      statuses.push((await gateway.fetch(request, env)).status);
+    }
+
+    expect(statuses).toEqual([200, 413, 413]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(consoleLog).toHaveBeenCalledTimes(2);
+    expect(consoleLog).toHaveBeenCalledWith(JSON.stringify({
+      event: "watch_pr.telemetry_gateway_payload_too_large",
+      signal: path === "/v1/logs" ? "logs" : "traces",
+    }));
+  });
+
   it("coalesces a cold token exchange across overlapping bearer rotation", async () => {
     let azureRequest: Request | undefined;
     let releaseToken: () => void;

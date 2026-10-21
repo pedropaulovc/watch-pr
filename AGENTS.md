@@ -125,6 +125,20 @@ Before forwarding, the gateway applies a schema-aware, drop-by-default filter to
 
 The gateway has bounded request and forwarding timeouts, accepts at most two ingest bearers during rotation, and rejects oversized payloads.
 
+### Observability destination rotation
+
+`scripts/configure-observability.mjs` exports `configureObservability({ command, source, fetchImpl, write })` for orchestration tests and `destinationPayload` for the shared destination shape. The CLI defaults to configure; `--prepare-bearer-rotation` explicitly selects the mutating preparation phase. Both deployment workflows prepare before gateway bootstrap or secrets, and configure after replacing `INGEST_BEARERS`.
+
+Before gateway probes or destination writes, preflight validates the complete paginated destination listing (at most 50 pages of 1,000), its shape, and uniqueness of target names and slugs. Each existing target must have a nonempty slug matching `^[A-Za-z0-9_-]+$`, `logpush` type, the configured gateway URL at exactly `/v1/logs` or `/v1/traces`, the expected `logpushDataset`, and a boolean `enabled`. Headers must consist of exactly one own, case-insensitive Authorization property: either `null` (Cloudflare's expected secret redaction), or a nonempty readable Bearer token matching current or the explicitly supplied previous bearer. Input bearers are bounded to 1–4,096 printable, nonspace ASCII characters. Malformed headers and readable mismatches still fail closed; redaction is not permission to ignore config drift. Final readback requires enabled destinations. Workflow rendering pins the environment gateway hostname; the core accepts only an exact HTTPS origin without credentials, path, query, fragment, or nondefault port. Tests route transport to localhost without replacing the configured trusted origin.
+
+Gateway authentication is tested without forwarding telemetry: each POST to `/v1/logs` and `/v1/traces` sends a bounded `Uint8Array(1024 * 1024 + 1)` body with JSON content type. A fresh random invalid-bearer control must return `200` on both paths; a candidate returning `413` on both is accepted, while `200` on both means rejected. Mixed statuses, other statuses, redirects, network failures, and timeouts fail closed. Probes prohibit redirects and time out after 10 seconds; Cloudflare API requests prohibit redirects and time out after 30 seconds. Errors must not expose credentials. The running gateway needs a valid signing-key configuration shape for this discriminator: configuration failure is not evidence that a bearer was rejected.
+
+Prepare returns without probes or writes when neither target exists, so bootstrap needs no old gateway. Otherwise it proves current first and uses explicit previous only if current was cleanly rejected. If neither is accepted, no destinations are mutated. It PATCHes only existing redacted targets with the proven staging bearer, verifies nonsecret readback (and the staging bearer if readable; `null` remains allowed), and repeats runtime authentication after writes. Readable matching targets need no preparation PATCH.
+
+Cloudflare PATCHes are nontransactional. A partial failure stops the workflow before gateway redeployment, leaving any completed writes on a bearer accepted by the old gateway; no automatic rollback runs. Do not infer atomicity from an unsuccessful command. Configure revalidates before mutation and proves current without previous fallback, then PATCHes or creates both targets with current. Its final listing must contain both exact enabled nonsecret configurations and current readable authorization or redacted `null`, followed by another successful current-bearer runtime probe.
+
+These checks prove gateway runtime acceptance and verify nonsecret destination state. A successful API write plus redacted readback cannot prove the exact secret behind `null`, nor that Cloudflare's exporter sends that secret or delivers telemetry. Confirm end-to-end arrival in both `OTelLogs` and `OTelSpans` over a multi-minute interval after an application request.
+
 ### Operational telemetry
 
 - `watch_pr.poll` records each cron tick with `active_sessions`, `scheduled_watches` (watches the due index still schedules, neither merged nor closed), `due_watches` (watches this tick refreshes, including ones skipped because a refresh is already in flight), `coverage_webhook` and `coverage_polling` (scheduled watches by repository coverage), `refreshes_started`, and `expired_monitors_revoked`. It also reports refresh work finished since the previous tick in the same object instance, from every refresh source: `refreshes_completed`, `refresh_failures`, and GitHub usage fields. Totals held in memory are lost when the object is evicted, so they are a lower bound.
@@ -149,4 +163,26 @@ npm ci
 npm test
 npm run typecheck
 ```
+
+Focused destination-rotation and real gateway discriminator coverage:
+
+```sh
+npm test -- test/configure-observability.test.mjs test/telemetry-gateway.test.ts
+```
+
+Standalone orchestration smoke (local HTTP transport, no live Cloudflare credentials or real secrets):
+
+```sh
+node scripts/smoke-observability-rotation.mjs
+```
+
+The optional positional argument selects the source module for a historical control and resolves from the current working directory. Set `CONTROL_REV` to the exact earlier revision to compare:
+
+```sh
+git show "${CONTROL_REV:?Set CONTROL_REV to the historical revision}:scripts/configure-observability.mjs" > scripts/.configure-observability-control.mjs
+node scripts/smoke-observability-rotation.mjs ./scripts/.configure-observability-control.mjs
+rm -f scripts/.configure-observability-control.mjs
+```
+
+For historical controls, materialize the exact earlier script revision and inject its path into the smoke helper rather than hand-reverting predicates. When `configureObservability` is absent but legacy `verifyExistingBearerRotation` exists, the smoke calls that guard with otherwise valid `Authorization: null` fixtures and both supplied bearers. A rejection reports `HISTORICAL_REDACTED_AUTH_REJECTED` and exits `1`: this isolates the legacy guard's redaction rejection, not the new orchestration behavior. If no such guard failure is demonstrated and orchestration is absent, it reports `UNSUPPORTED_FEATURE` and exits `2`; that is feature absence, not proof of a targeted regression. A supported orchestration API's behavioral failure also exits `1`; read the reported assertion to distinguish it from the legacy redaction control. Remove the temporary control module even if the smoke fails. The local smoke uses HTTP simulation and fixture-only tokens; it proves orchestration and the HTTP discriminator, not Cloudflare exporter delivery or Azure arrival. The focused gateway suite separately exercises the actual gateway handler.
 
